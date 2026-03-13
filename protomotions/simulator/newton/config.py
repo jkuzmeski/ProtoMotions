@@ -14,6 +14,7 @@
 # limitations under the License.
 #
 from dataclasses import dataclass, field
+from typing import Literal
 from protomotions.simulator.base_simulator.config import SimParams, SimulatorConfig
 
 
@@ -66,3 +67,11 @@ class NewtonSimulatorConfig(SimulatorConfig):
     _target_: str = "protomotions.simulator.newton.simulator.NewtonSimulator"
     sim: NewtonSimParams = field(default_factory=NewtonSimParams)  # Override sim type
     w_last: bool = True  # Newton uses xyzw quaternions
+    viewer_backend: Literal["gl", "viser"] = field(
+        default="gl",
+        metadata={"help": "Newton viewer backend to use when not headless."}
+    )
+    viewer_port: int = field(
+        default=8097,
+        metadata={"help": "Port for the Newton viser viewer server.", "min": 1}
+    )

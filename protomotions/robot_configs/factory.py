@@ -29,7 +29,13 @@ def robot_config(robot_name: str, **updates) -> RobotConfig:
     Raises:
         ValueError: If robot_name is not recognized
     """
-    if robot_name == "smpl":
+    if robot_name.startswith("smpl_lower_body"):
+        from protomotions.robot_configs.smpl_lower_body import (
+            SmplLowerBodyConfigFactory,
+        )
+
+        config = SmplLowerBodyConfigFactory.from_robot_name(robot_name)
+    elif robot_name == "smpl":
         from protomotions.robot_configs.smpl import SmplRobotConfig
 
         config = SmplRobotConfig()

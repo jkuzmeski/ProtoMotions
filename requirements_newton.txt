@@ -21,3 +21,4 @@ dm_control>=1.0
 pandas
 openmesh==1.2.1
 tensorboardX
+viser

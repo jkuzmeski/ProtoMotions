@@ -14,6 +14,7 @@
 # limitations under the License.
 #
 import os
+import socket
 import torch
 import numpy as np
 from rich.progress import Progress
@@ -45,11 +46,25 @@ from newton.selection import ArticulationView
 from newton import Contacts
 from newton.sensors import SensorContact, populate_contacts
 from newton.solvers import SolverNotifyFlags
+from newton.utils import create_plane_mesh
 import copy
 
+from protomotions.simulator.newton.opengl_compat import (
+    prepare_gl_viewer_compat,
+)
 
 wp.config.enable_backward = False
 wp.config.quiet = True
+
+
+def _get_primary_local_ip() -> Optional[str]:
+    """Best-effort resolution of the primary local IPv4 address."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+    except OSError:
+        return None
 
 
 @wp.kernel
@@ -153,6 +168,7 @@ class NewtonSimulator(Simulator):
         self._contact_forces = {}  # Store contact forces per body
         self.contacts = Contacts(0, 0)  # Initialize contacts storage
         self._camera_initialized = False
+        self._viewer_camera_pos = None
 
     def _create_simulation(self) -> None:
         """Create the Newton simulation environment."""
@@ -597,9 +613,27 @@ class NewtonSimulator(Simulator):
 
         self.viewer = None
         if not self.headless:
-            self.viewer = newton.viewer.ViewerGL()
+            if self.config.viewer_backend == "gl":
+                prepare_gl_viewer_compat()
+                self.viewer = newton.viewer.ViewerGL()
+                self.viewer.vsync = True
+            elif self.config.viewer_backend == "viser":
+                self.viewer = newton.viewer.ViewerViser(port=self.config.viewer_port)
+                self.viewer.show_static = True
+                self._setup_viser_ground_visual()
+                local_ip = _get_primary_local_ip()
+                print(
+                    f"[INFO] Newton viser URL inside WSL: http://127.0.0.1:{self.config.viewer_port}"
+                )
+                if local_ip is not None:
+                    print(
+                        f"[INFO] Newton viser URL from Windows/LAN: http://{local_ip}:{self.config.viewer_port}"
+                    )
+            else:
+                raise ValueError(
+                    f"Unsupported Newton viewer backend: {self.config.viewer_backend}"
+                )
             self.viewer.set_model(self.model)
-            self.viewer.vsync = True
 
         self.state_temp = self.model.state()
         self.state_0 = self.model.state()
@@ -607,6 +641,31 @@ class NewtonSimulator(Simulator):
         self.control = self.model.control()
 
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+
+    def _setup_viser_ground_visual(self) -> None:
+        """Add a viewer-only ground reference for the viser backend."""
+        if self.config.viewer_backend != "viser":
+            return
+
+        server = getattr(self.viewer, "_server", None)
+        if server is None:
+            return
+
+        server.scene.add_grid(
+            "/protomotions_ground",
+            plane="xy",
+            infinite_grid=True,
+            cell_color=(170, 170, 170),
+            cell_thickness=1.0,
+            cell_size=0.5,
+            section_color=(120, 120, 120),
+            section_thickness=1.5,
+            section_size=2.0,
+            fade_distance=80.0,
+            shadow_opacity=0.2,
+            plane_color=(245, 245, 245),
+            plane_opacity=0.12,
+        )
 
     def _apply_domain_randomization_if_needed(self) -> None:
         """Apply friction and center of mass domain randomization.
@@ -783,7 +842,18 @@ class NewtonSimulator(Simulator):
             sum(self.terrain.config.terrain_proportions[:-1]) == 0
             and self.terrain.config.terrain_proportions[-1] == 1.0
         ):
-            builder.add_ground_plane(cfg=ground_cfg)
+            if self.config.viewer_backend == "viser":
+                # ViewerViser does not reliably display Newton's special plane primitive.
+                # Use a large explicit mesh instead for flat-ground scenes.
+                plane_vertices, plane_indices = create_plane_mesh(400.0, 400.0)
+                ground_mesh = newton.Mesh(
+                    vertices=plane_vertices[:, 0:3], indices=plane_indices
+                )
+                builder.add_shape_mesh(
+                    body=-1, mesh=ground_mesh, cfg=ground_cfg, key="ground_plane"
+                )
+            else:
+                builder.add_ground_plane(cfg=ground_cfg)
         else:
             points, indices = convert_to_indexed_mesh(
                 self.terrain.vertices, self.terrain.triangles
@@ -1268,7 +1338,7 @@ class NewtonSimulator(Simulator):
             np.arctan2(normalized_vector_to_target[1], normalized_vector_to_target[0])
         )
 
-        self.viewer.set_camera(wp.vec3(cam_pos.tolist()), pitch, yaw)
+        self._set_viewer_camera(cam_pos, camera_target, pitch, yaw)
         self._cam_prev_char_pos = char_root_pos
 
     def _init_keyboard(self) -> None:
@@ -1296,7 +1366,7 @@ class NewtonSimulator(Simulator):
             )
             height_offset = 0
 
-        cam_pos = np.array(self.viewer.camera.pos)
+        cam_pos = np.array(self._viewer_camera_pos)
         cam_delta = cam_pos - self._cam_prev_char_pos
 
         new_cam_target = char_root_pos + np.array([0, 0, height_offset])
@@ -1311,8 +1381,32 @@ class NewtonSimulator(Simulator):
             np.arctan2(normalized_vector_to_target[1], normalized_vector_to_target[0])
         )
 
-        self.viewer.set_camera(wp.vec3(new_cam_pos.tolist()), pitch, yaw)
+        self._set_viewer_camera(new_cam_pos, new_cam_target, pitch, yaw)
         self._cam_prev_char_pos = char_root_pos
+
+    def _set_viewer_camera(
+        self,
+        cam_pos: np.ndarray,
+        cam_target: np.ndarray,
+        pitch: float,
+        yaw: float,
+    ) -> None:
+        """Track camera state locally and forward it to the active viewer backend."""
+        self._viewer_camera_pos = np.array(cam_pos, dtype=np.float32)
+        if self.config.viewer_backend == "viser":
+            server = getattr(self.viewer, "_server", None)
+            if server is not None:
+                server.initial_camera.position = tuple(self._viewer_camera_pos.tolist())
+                server.initial_camera.look_at = tuple(np.asarray(cam_target).tolist())
+                server.initial_camera.up = (0.0, 0.0, 1.0)
+
+                for client in server.get_clients().values():
+                    client.camera.position = self._viewer_camera_pos
+                    client.camera.look_at = np.asarray(cam_target, dtype=np.float64)
+                    client.camera.up_direction = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            return
+
+        self.viewer.set_camera(wp.vec3(self._viewer_camera_pos.tolist()), pitch, yaw)
 
     def close(self) -> None:
         """Closes the simulator and cleans up resources."""
@@ -1375,6 +1469,10 @@ class NewtonSimulator(Simulator):
     def _write_viewport_to_file(self, file_name: str) -> None:
         import matplotlib.pyplot as plt
 
+        if self.config.viewer_backend != "gl":
+            raise RuntimeError(
+                "Viewport capture is only supported with the Newton GL viewer backend."
+            )
         viewport = self.viewer.get_frame().numpy()  # [H, W, 3] as uint8
         plt.imsave(file_name, viewport)
 
