@@ -7,6 +7,8 @@ if ! command -v uv >/dev/null 2>&1; then
     exit 1
 fi
 
+export UV_LINK_MODE="${UV_LINK_MODE:-copy}"
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
 VENV_PATH="${VENV_PATH:-$REPO_ROOT/.venv}"
