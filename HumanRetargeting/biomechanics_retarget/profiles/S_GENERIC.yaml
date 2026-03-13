@@ -1,0 +1,15 @@
+subject_id: S_GENERIC
+input_dir: ../treadmill_data/S_GENERIC
+model_variant: adjusted_pd
+fps: 200
+output_fps: 30
+coordinate_transform: y_to_x_forward
+contact_source: heuristic
+trial_glob: "*.txt"
+mass_kg: 70.0
+anthropometry:
+  height_cm: 170
+  pelvis_width_m: 0.19
+  thigh_length_m: 0.3789
+  shank_length_m: 0.3982
+  foot_length_m: 0.1233
