@@ -20,8 +20,8 @@ workspace:
 hooks:
   after_create: |
     git clone --depth 1 https://github.com/jkuzmeski/ProtoMotions.git .
-    python -m pip install -e .
-    python -m pip install pre-commit pytest ruff
+    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+    bash scripts/setup_wsl_newton_env.sh
   before_remove: |
     branch=$(git branch --show-current 2>/dev/null)
     if [ -n "$branch" ] && command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
@@ -33,7 +33,7 @@ agent:
   max_concurrent_agents: 10
   max_turns: 20
 codex:
-  command: codex --config shell_environment_policy.inherit=all --config model_reasoning_effort=xhigh --model gpt-5.3-codex app-server
+  command: "bash -lc 'source .venv/bin/activate && codex --config shell_environment_policy.inherit=all --config model_reasoning_effort=xhigh --model gpt-5.3-codex app-server'"
   approval_policy: never
   thread_sandbox: danger-full-access
   turn_sandbox_policy:
