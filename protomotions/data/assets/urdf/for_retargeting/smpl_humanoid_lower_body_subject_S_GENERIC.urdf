@@ -1,0 +1,196 @@
+<?xml version="1.0"?>
+<robot name="smpl_humanoid_lower_body_subject_S_GENERIC">
+  <link name="Pelvis"/>
+  <link name="L_Hip_x_link"/>
+  <joint name="L_Hip_x" type="revolute">
+    <parent link="Pelvis"/>
+    <child link="L_Hip_x_link"/>
+    <origin xyz="-0.006550 0.095000 -0.091000" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-6.283185" upper="6.283185" effort="500" velocity="100"/>
+  </joint>
+  <link name="L_Hip_y_link"/>
+  <joint name="L_Hip_y" type="revolute">
+    <parent link="L_Hip_x_link"/>
+    <child link="L_Hip_y_link"/>
+    <origin xyz="0.000000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-6.283185" upper="6.283185" effort="500" velocity="100"/>
+  </joint>
+  <link name="L_Hip"/>
+  <joint name="L_Hip_z" type="revolute">
+    <parent link="L_Hip_y_link"/>
+    <child link="L_Hip"/>
+    <origin xyz="0.000000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.283185" upper="6.283185" effort="500" velocity="100"/>
+  </joint>
+  <link name="L_Knee_x_link"/>
+  <joint name="L_Knee_x" type="revolute">
+    <parent link="L_Hip"/>
+    <child link="L_Knee_x_link"/>
+    <origin xyz="-0.006700 0.000000 -0.378900" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-6.283185" upper="6.283185" effort="500" velocity="100"/>
+  </joint>
+  <link name="L_Knee_y_link"/>
+  <joint name="L_Knee_y" type="revolute">
+    <parent link="L_Knee_x_link"/>
+    <child link="L_Knee_y_link"/>
+    <origin xyz="0.000000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-6.283185" upper="6.283185" effort="500" velocity="100"/>
+  </joint>
+  <link name="L_Knee"/>
+  <joint name="L_Knee_z" type="revolute">
+    <parent link="L_Knee_y_link"/>
+    <child link="L_Knee"/>
+    <origin xyz="0.000000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.283185" upper="6.283185" effort="500" velocity="100"/>
+  </joint>
+  <link name="L_Ankle_x_link"/>
+  <joint name="L_Ankle_x" type="revolute">
+    <parent link="L_Knee"/>
+    <child link="L_Ankle_x_link"/>
+    <origin xyz="0.000000 0.000000 -0.398200" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-6.283185" upper="6.283185" effort="500" velocity="100"/>
+  </joint>
+  <link name="L_Ankle_y_link"/>
+  <joint name="L_Ankle_y" type="revolute">
+    <parent link="L_Ankle_x_link"/>
+    <child link="L_Ankle_y_link"/>
+    <origin xyz="0.000000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-6.283185" upper="6.283185" effort="500" velocity="100"/>
+  </joint>
+  <link name="L_Ankle"/>
+  <joint name="L_Ankle_z" type="revolute">
+    <parent link="L_Ankle_y_link"/>
+    <child link="L_Ankle"/>
+    <origin xyz="0.000000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.283185" upper="6.283185" effort="500" velocity="100"/>
+  </joint>
+  <link name="L_Toe_x_link"/>
+  <joint name="L_Toe_x" type="revolute">
+    <parent link="L_Ankle"/>
+    <child link="L_Toe_x_link"/>
+    <origin xyz="0.123300 0.000000 -0.055000" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-6.283185" upper="6.283185" effort="500" velocity="100"/>
+  </joint>
+  <link name="L_Toe_y_link"/>
+  <joint name="L_Toe_y" type="revolute">
+    <parent link="L_Toe_x_link"/>
+    <child link="L_Toe_y_link"/>
+    <origin xyz="0.000000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-6.283185" upper="6.283185" effort="500" velocity="100"/>
+  </joint>
+  <link name="L_Toe"/>
+  <joint name="L_Toe_z" type="revolute">
+    <parent link="L_Toe_y_link"/>
+    <child link="L_Toe"/>
+    <origin xyz="0.000000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.283185" upper="6.283185" effort="500" velocity="100"/>
+  </joint>
+  <link name="R_Hip_x_link"/>
+  <joint name="R_Hip_x" type="revolute">
+    <parent link="Pelvis"/>
+    <child link="R_Hip_x_link"/>
+    <origin xyz="-0.006550 -0.095000 -0.091000" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-6.283185" upper="6.283185" effort="500" velocity="100"/>
+  </joint>
+  <link name="R_Hip_y_link"/>
+  <joint name="R_Hip_y" type="revolute">
+    <parent link="R_Hip_x_link"/>
+    <child link="R_Hip_y_link"/>
+    <origin xyz="0.000000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-6.283185" upper="6.283185" effort="500" velocity="100"/>
+  </joint>
+  <link name="R_Hip"/>
+  <joint name="R_Hip_z" type="revolute">
+    <parent link="R_Hip_y_link"/>
+    <child link="R_Hip"/>
+    <origin xyz="0.000000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.283185" upper="6.283185" effort="500" velocity="100"/>
+  </joint>
+  <link name="R_Knee_x_link"/>
+  <joint name="R_Knee_x" type="revolute">
+    <parent link="R_Hip"/>
+    <child link="R_Knee_x_link"/>
+    <origin xyz="-0.006700 0.000000 -0.378900" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-6.283185" upper="6.283185" effort="500" velocity="100"/>
+  </joint>
+  <link name="R_Knee_y_link"/>
+  <joint name="R_Knee_y" type="revolute">
+    <parent link="R_Knee_x_link"/>
+    <child link="R_Knee_y_link"/>
+    <origin xyz="0.000000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-6.283185" upper="6.283185" effort="500" velocity="100"/>
+  </joint>
+  <link name="R_Knee"/>
+  <joint name="R_Knee_z" type="revolute">
+    <parent link="R_Knee_y_link"/>
+    <child link="R_Knee"/>
+    <origin xyz="0.000000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.283185" upper="6.283185" effort="500" velocity="100"/>
+  </joint>
+  <link name="R_Ankle_x_link"/>
+  <joint name="R_Ankle_x" type="revolute">
+    <parent link="R_Knee"/>
+    <child link="R_Ankle_x_link"/>
+    <origin xyz="0.000000 0.000000 -0.398200" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-6.283185" upper="6.283185" effort="500" velocity="100"/>
+  </joint>
+  <link name="R_Ankle_y_link"/>
+  <joint name="R_Ankle_y" type="revolute">
+    <parent link="R_Ankle_x_link"/>
+    <child link="R_Ankle_y_link"/>
+    <origin xyz="0.000000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-6.283185" upper="6.283185" effort="500" velocity="100"/>
+  </joint>
+  <link name="R_Ankle"/>
+  <joint name="R_Ankle_z" type="revolute">
+    <parent link="R_Ankle_y_link"/>
+    <child link="R_Ankle"/>
+    <origin xyz="0.000000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.283185" upper="6.283185" effort="500" velocity="100"/>
+  </joint>
+  <link name="R_Toe_x_link"/>
+  <joint name="R_Toe_x" type="revolute">
+    <parent link="R_Ankle"/>
+    <child link="R_Toe_x_link"/>
+    <origin xyz="0.123300 0.000000 -0.055000" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-6.283185" upper="6.283185" effort="500" velocity="100"/>
+  </joint>
+  <link name="R_Toe_y_link"/>
+  <joint name="R_Toe_y" type="revolute">
+    <parent link="R_Toe_x_link"/>
+    <child link="R_Toe_y_link"/>
+    <origin xyz="0.000000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-6.283185" upper="6.283185" effort="500" velocity="100"/>
+  </joint>
+  <link name="R_Toe"/>
+  <joint name="R_Toe_z" type="revolute">
+    <parent link="R_Toe_y_link"/>
+    <child link="R_Toe"/>
+    <origin xyz="0.000000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.283185" upper="6.283185" effort="500" velocity="100"/>
+  </joint>
+</robot>

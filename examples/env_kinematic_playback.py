@@ -95,6 +95,31 @@ def create_parser():
     parser.add_argument(
         "--seed", type=int, default=0, help="Random seed for reproducibility"
     )
+    parser.add_argument(
+        "--playback-speed",
+        type=float,
+        default=1.0,
+        help="Playback speed multiplier. 1.0 is real-time, 0.5 is half-speed, 2.0 is double-speed.",
+    )
+    parser.add_argument(
+        "--no-real-time",
+        action="store_true",
+        default=False,
+        help="Disable real-time pacing and run playback as fast as possible.",
+    )
+    parser.add_argument(
+        "--viewer-backend",
+        type=str,
+        choices=["gl", "viser"],
+        default="gl",
+        help="Newton viewer backend to use when running with a GUI",
+    )
+    parser.add_argument(
+        "--viewer-port",
+        type=int,
+        default=8097,
+        help="Port for the Newton viser viewer server",
+    )
 
     return parser
 
@@ -115,6 +140,7 @@ AppLauncher = import_simulator_before_torch(args.simulator)
 from pathlib import Path  # noqa: E402
 import logging  # noqa: E402
 import importlib.util  # noqa: E402
+import time  # noqa: E402
 import torch  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -146,6 +172,10 @@ def main():
     print(f"Scenes file: {args.scenes_file}")
     print(f"Device: {device}")
     print(f"Headless: {args.headless}")
+    print(f"Playback speed: {args.playback_speed}x")
+    print(f"Real-time pacing: {not args.no_real_time}")
+    if args.simulator == "newton":
+        print(f"Newton viewer backend: {args.viewer_backend}")
 
     # Extra simulator parameters
     extra_simulator_params = {}
@@ -201,6 +231,10 @@ def main():
     print(f"Robot config class: {type(robot_config).__name__}")
     print(f"Simulator config class: {type(simulator_config).__name__}")
     print(f"Environment config class: {type(env_config).__name__}")
+
+    if args.simulator == "newton":
+        simulator_config.viewer_backend = args.viewer_backend
+        simulator_config.viewer_port = args.viewer_port
 
     if args.motion_file is not None:
         print(f"Motion library configured from: {args.motion_file}")
@@ -310,6 +344,11 @@ def main():
 
     try:
         step_count = 0
+        control_dt = getattr(env.simulator, "frame_dt", None)
+        if control_dt is None:
+            control_dt = simulator_config.sim.decimation / simulator_config.sim.fps
+        target_step_dt = control_dt / args.playback_speed
+        next_frame_time = time.perf_counter()
         while env.is_simulation_running():
             # In kinematic playback mode, actions are ignored
             # The environment will automatically follow the reference motion
@@ -340,6 +379,14 @@ def main():
                 )
                 print(f"  Rewards: {rewards.mean().item():.4f} (mean)")
                 print(f"  Dones: {dones.sum().item()} environments reset")
+
+            if not args.no_real_time and not args.headless:
+                next_frame_time += target_step_dt
+                sleep_duration = next_frame_time - time.perf_counter()
+                if sleep_duration > 0:
+                    time.sleep(sleep_duration)
+                else:
+                    next_frame_time = time.perf_counter()
 
     except KeyboardInterrupt:
         print("\n\nSimulation stopped by user")
