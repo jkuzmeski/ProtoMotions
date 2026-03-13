@@ -1,0 +1,19 @@
+{
+  "contact_source": "heuristic",
+  "generated_assets": {
+    "default_root_height": 0.95,
+    "metadata": "D:\\Biomotions\\newton\\ProtoMotions\\protomotions\\data\\assets\\subjects\\smpl_humanoid_lower_body_subject_S_GENERIC.yaml",
+    "mjcf": "D:\\Biomotions\\newton\\ProtoMotions\\protomotions\\data\\assets\\mjcf\\smpl_humanoid_lower_body_subject_S_GENERIC.xml",
+    "urdf": "D:\\Biomotions\\newton\\ProtoMotions\\protomotions\\data\\assets\\urdf\\for_retargeting\\smpl_humanoid_lower_body_subject_S_GENERIC.urdf",
+    "usda": "D:\\Biomotions\\newton\\ProtoMotions\\protomotions\\data\\assets\\usd\\smpl_humanoid_lower_body_subject_S_GENERIC.usda"
+  },
+  "input_dir": "D:\\Biomotions\\newton\\ProtoMotions\\HumanRetargeting\\biomechanics_retarget\\treadmill_data\\S_GENERIC",
+  "keypoint_file_count": 8,
+  "model_xml": "D:\\Biomotions\\newton\\ProtoMotions\\protomotions\\data\\assets\\mjcf\\smpl_humanoid_lower_body_subject_S_GENERIC.xml",
+  "motion_file_count": 8,
+  "output_dir": "HumanRetargeting\\biomechanics_retarget\\processed_data\\S_GENERIC_200fps_optimized",
+  "packaged_output": "HumanRetargeting\\biomechanics_retarget\\processed_data\\S_GENERIC_200fps_optimized\\packaged_data\\S_GENERIC.pt",
+  "pyroki_urdf_path": "D:\\Biomotions\\newton\\ProtoMotions\\protomotions\\data\\assets\\urdf\\for_retargeting\\smpl_humanoid_lower_body_subject_S_GENERIC.urdf",
+  "retargeted_file_count": 8,
+  "subject_id": "S_GENERIC"
+}
