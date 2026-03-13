@@ -155,6 +155,7 @@ And you're good to go!
 
 📚 **[Full Documentation](https://protomotions.github.io/)**
 
+- [Repository Common Commands](COMMON_COMMANDS.md)
 - [Installation Guide](https://protomotions.github.io/getting_started/installation.html)
 - [Quick Start](https://protomotions.github.io/getting_started/quickstart.html)
 - [AMASS Data Preparation](https://protomotions.github.io/getting_started/amass_preparation.html)
