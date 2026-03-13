@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "skills": {
+    "commit": {
+      "source": "odysseus0/symphony",
+      "sourceType": "github",
+      "computedHash": "103cf139f2ed1abf5a0447a465822e72fb43ed601147fd6972f6c93648ce4d49"
+    },
+    "debug": {
+      "source": "odysseus0/symphony",
+      "sourceType": "github",
+      "computedHash": "eee526252b13c906c85055967cdc76a68535ed9fb61c8000c1df4df542d7783f"
+    },
+    "land": {
+      "source": "odysseus0/symphony",
+      "sourceType": "github",
+      "computedHash": "4841700693bea2f2ffa132495c2dc851d9c6992fcf1e5e522fa9a2223de94a53"
+    },
+    "linear": {
+      "source": "odysseus0/symphony",
+      "sourceType": "github",
+      "computedHash": "019edf67011a2cad5e1303616304d3f4c5404712be8dbaa1c47a70635e69c7a2"
+    },
+    "pull": {
+      "source": "odysseus0/symphony",
+      "sourceType": "github",
+      "computedHash": "548dc13ca944387457e800a8b2a3993adaf84147127b7d2af2c1f0ca0f60d226"
+    },
+    "push": {
+      "source": "odysseus0/symphony",
+      "sourceType": "github",
+      "computedHash": "f5dfa67e1d586a8b4c9e09b2469ca352244b2a82342961eaea70e53511508343"
+    }
+  }
+}
