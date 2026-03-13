@@ -18,6 +18,7 @@ polling:
 workspace:
   root: ~/code/symphony-workspaces
 hooks:
+  timeout_ms: 600000
   after_create: |
     git clone --depth 1 https://github.com/jkuzmeski/ProtoMotions.git .
     export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
