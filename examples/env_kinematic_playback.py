@@ -120,6 +120,30 @@ def create_parser():
         default=8097,
         help="Port for the Newton viser viewer server",
     )
+    parser.add_argument(
+        "--record",
+        action="store_true",
+        default=False,
+        help="Automatically record the viewer output while running playback.",
+    )
+    parser.add_argument(
+        "--record-start-step",
+        type=int,
+        default=0,
+        help="Simulation step at which automatic recording should start.",
+    )
+    parser.add_argument(
+        "--record-steps",
+        type=int,
+        default=300,
+        help="Number of simulation steps to record before stopping automatically.",
+    )
+    parser.add_argument(
+        "--quit-after-steps",
+        type=int,
+        default=0,
+        help="Exit playback after this many simulation steps. Zero means run until closed manually.",
+    )
 
     return parser
 
@@ -176,6 +200,12 @@ def main():
     print(f"Real-time pacing: {not args.no_real_time}")
     if args.simulator == "newton":
         print(f"Newton viewer backend: {args.viewer_backend}")
+    print(f"Auto-record: {args.record}")
+    if args.record:
+        print(f"  - Record start step: {args.record_start_step}")
+        print(f"  - Record length: {args.record_steps}")
+    if args.quit_after_steps > 0:
+        print(f"Auto-quit after steps: {args.quit_after_steps}")
 
     # Extra simulator parameters
     extra_simulator_params = {}
@@ -344,12 +374,23 @@ def main():
 
     try:
         step_count = 0
+        auto_record_active = False
         control_dt = getattr(env.simulator, "frame_dt", None)
         if control_dt is None:
             control_dt = simulator_config.sim.decimation / simulator_config.sim.fps
         target_step_dt = control_dt / args.playback_speed
         next_frame_time = time.perf_counter()
         while env.is_simulation_running():
+            if (
+                args.record
+                and not args.headless
+                and not auto_record_active
+                and step_count >= args.record_start_step
+            ):
+                env.simulator._toggle_video_record()
+                auto_record_active = True
+                print(f"Started automatic recording at step {step_count}")
+
             # In kinematic playback mode, actions are ignored
             # The environment will automatically follow the reference motion
             actions = torch.zeros(
@@ -380,6 +421,22 @@ def main():
                 print(f"  Rewards: {rewards.mean().item():.4f} (mean)")
                 print(f"  Dones: {dones.sum().item()} environments reset")
 
+            if (
+                auto_record_active
+                and args.record_steps > 0
+                and step_count >= args.record_start_step + args.record_steps
+            ):
+                env.simulator._toggle_video_record()
+                auto_record_active = False
+                env.simulator.render()
+                print(f"Stopped automatic recording at step {step_count}")
+                if args.quit_after_steps == 0:
+                    break
+
+            if args.quit_after_steps > 0 and step_count >= args.quit_after_steps:
+                print(f"Reached quit-after-steps={args.quit_after_steps}")
+                break
+
             if not args.no_real_time and not args.headless:
                 next_frame_time += target_step_dt
                 sleep_duration = next_frame_time - time.perf_counter()
@@ -391,6 +448,9 @@ def main():
     except KeyboardInterrupt:
         print("\n\nSimulation stopped by user")
     finally:
+        if args.record and auto_record_active:
+            env.simulator._toggle_video_record()
+            env.simulator.render()
         env.close()
 
     print("\n=== Playback Complete ===")

@@ -38,6 +38,7 @@ JOINT_NAMES = [
     "R_Ankle",
     "R_Toe",
 ]
+GROUND_CONTACT_JOINT_NAMES = ("L_Ankle", "L_Toe", "R_Ankle", "R_Toe")
 
 # --- Core Functions ---
 
@@ -139,6 +140,20 @@ def detect_stance_phases(
     return stance_mask
 
 
+def estimate_ground_height(joint_centers: np.ndarray) -> float:
+    """Estimate floor height from foot-support joints instead of the global minimum."""
+    ground_indices = [JOINT_NAMES.index(name) for name in GROUND_CONTACT_JOINT_NAMES if name in JOINT_NAMES]
+    if not ground_indices:
+        return float(np.min(joint_centers[:, :, 2]))
+
+    support_heights = joint_centers[:, ground_indices, 2].reshape(-1)
+    if support_heights.size == 0:
+        return float(np.min(joint_centers[:, :, 2]))
+
+    # Use a low percentile so a single bad frame does not define the floor.
+    return float(np.percentile(support_heights, 1.0))
+
+
 def transform_treadmill_to_overground(
     joint_centers: np.ndarray, fps: int, treadmill_speed: float, forward_axis: int
 ) -> np.ndarray:
@@ -209,9 +224,12 @@ def create_motion_from_txt(
 
     joint_centers, forward_axis = apply_position_coordinate_transform(joint_centers, coordinate_transform)
     print("   - Applying ground plane adjustment...")
-    min_z = np.min(joint_centers[:, :, 2])
-    joint_centers[:, :, 2] -= min_z
-    print(f"   - Lowered motion by {-min_z:.3f}m to place on ground plane.")
+    ground_height = estimate_ground_height(joint_centers)
+    joint_centers[:, :, 2] -= ground_height
+    print(
+        "   - Lowered motion by "
+        f"{-ground_height:.3f}m using the 1st percentile of ankle/toe heights."
+    )
 
     if treadmill_speed > 0:
         joint_centers = transform_treadmill_to_overground(joint_centers, mocap_fr, treadmill_speed, forward_axis)

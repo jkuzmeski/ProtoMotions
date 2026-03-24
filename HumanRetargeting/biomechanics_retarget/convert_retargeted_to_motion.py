@@ -4,10 +4,10 @@
 """
 Convert retargeted motion data to ProtoMotions .motion format.
 
-This script converts the output from PyRoki retargeting (NPZ files) to the
+This script converts retargeted motion output (NPZ files) to the
 .motion format used by ProtoMotions for training and inference.
 
-Input format (from PyRoki):
+Input format (from the retarget step):
     - base_frame_pos: (T, 3) - root position XYZ
     - base_frame_wxyz: (T, 4) - root orientation quaternion WXYZ
     - joint_angles: (T, num_dofs) - joint angles in radians
@@ -138,34 +138,71 @@ def load_contact_labels(
 ):
     """Load and format contact labels from NPZ file."""
     contact_data = np.load(contact_file, allow_pickle=True)
-    foot_contacts = contact_data["foot_contacts"]  # [T, 2] - left, right
+    # Preferred format preserves ankle/toe channels separately:
+    #   left_foot_contacts:  [T, 2]  (ankle, toe)
+    #   right_foot_contacts: [T, 2]  (ankle, toe)
+    # Older files only have:
+    #   foot_contacts: [T, 2] (left/right scalar)
+    left_contacts = None
+    right_contacts = None
+    if "left_foot_contacts" in contact_data and "right_foot_contacts" in contact_data:
+        left_contacts = np.asarray(contact_data["left_foot_contacts"])
+        right_contacts = np.asarray(contact_data["right_foot_contacts"])
+    elif "foot_contacts" in contact_data:
+        foot_contacts = np.asarray(contact_data["foot_contacts"])
+        left_contacts = foot_contacts[:, [0]]
+        right_contacts = foot_contacts[:, [1]]
+    else:
+        raise KeyError(
+            f"Unsupported contact file format for {contact_file}. "
+            "Expected left/right foot contact arrays or foot_contacts."
+        )
 
-    # Resample contacts
-    contact_frames = foot_contacts.shape[0]
-    indices = get_resample_indices(contact_frames, input_fps, output_fps)
-    foot_contacts = foot_contacts[indices]
-    
-    # Ensure same length (just in case of slight mismatch due to different duration calcs)
-    contact_length = foot_contacts.shape[0]
-    if contact_length != motion_length:
-        print(f"Warning: Contact length ({contact_length}) != motion length ({motion_length}) after resampling.")
-        if contact_length > motion_length:
-            foot_contacts = foot_contacts[:motion_length]
-        else:
-            padding = np.repeat(foot_contacts[-1:], motion_length - contact_length, axis=0)
-            foot_contacts = np.concatenate([foot_contacts, padding], axis=0)
-    
-    # PyRoki saves smoothed per-foot contact values (for this dataset typically 0.2,
-    # 0.25, 0.4). ProtoMotions smooths contacts on load and currently expects binary
-    # labels as input, so binarize here with a low threshold and copy the resulting
-    # foot state to both ankle and toe bodies.
+    def _resample_and_align(contacts: np.ndarray) -> np.ndarray:
+        contact_frames = contacts.shape[0]
+        indices = get_resample_indices(contact_frames, input_fps, output_fps)
+        contacts = contacts[indices]
+
+        contact_length = contacts.shape[0]
+        if contact_length != motion_length:
+            print(
+                f"Warning: Contact length ({contact_length}) != motion length ({motion_length}) "
+                "after resampling."
+            )
+            if contact_length > motion_length:
+                contacts = contacts[:motion_length]
+            else:
+                padding = np.repeat(contacts[-1:], motion_length - contact_length, axis=0)
+                contacts = np.concatenate([contacts, padding], axis=0)
+        return contacts
+
+    left_contacts = _resample_and_align(left_contacts)
+    right_contacts = _resample_and_align(right_contacts)
+
+    # The sidecar stores smoothed contact values (for this dataset often 0.2, 0.4, ...).
+    # ProtoMotions smooths contacts again on load, so binarize here with a low threshold.
     rigid_body_contacts = np.zeros((motion_length, num_bodies), dtype=bool)
-    left_in_contact = foot_contacts[:, 0] > 0.1
-    right_in_contact = foot_contacts[:, 1] > 0.1
-    for body_idx in left_contact_indices:
-        rigid_body_contacts[:, body_idx] = left_in_contact
-    for body_idx in right_contact_indices:
-        rigid_body_contacts[:, body_idx] = right_in_contact
+
+    def _assign_body_contacts(body_indices: list[int], contact_values: np.ndarray) -> None:
+        if contact_values.ndim == 1:
+            contact_values = contact_values[:, None]
+
+        if len(body_indices) == 0:
+            return
+
+        if contact_values.shape[1] == 1:
+            body_contact_columns = [contact_values[:, 0]] * len(body_indices)
+        else:
+            body_contact_columns = []
+            for idx in range(len(body_indices)):
+                source_col = min(idx, contact_values.shape[1] - 1)
+                body_contact_columns.append(contact_values[:, source_col])
+
+        for body_idx, column in zip(body_indices, body_contact_columns):
+            rigid_body_contacts[:, body_idx] = column > 0.1
+
+    _assign_body_contacts(left_contact_indices, left_contacts)
+    _assign_body_contacts(right_contact_indices, right_contacts)
 
     return torch.from_numpy(rigid_body_contacts).to(device)
 
@@ -187,7 +224,7 @@ def convert_npz_to_motion(
     duration_height_seconds: float = 0.6,
 ) -> bool:
     """
-    Convert a PyRoki retargeted NPZ file to ProtoMotions .motion format.
+    Convert a retargeted NPZ file to ProtoMotions .motion format.
     """
     device = torch.device("cpu")
     dtype = torch.float32
@@ -234,8 +271,8 @@ def convert_npz_to_motion(
         compute_velocities=True,
     )
     
-    # Use the original joint angles directly from PyRoki
-    # PyRoki outputs Euler XYZ angles for each joint, which is exactly what we need.
+    # Use the original joint angles directly from the retarget step.
+    # The lower-body retargeter outputs Euler XYZ angles for each joint, which is exactly what we need.
     # Re-extracting from transforms can cause angle wrapping issues.
     motion.dof_pos = joint_angles
 
@@ -262,7 +299,7 @@ def convert_npz_to_motion(
     num_bodies = motion.rigid_body_pos.shape[1]
     body_names = kinematic_info.body_names
     
-    # Attempt to automatically find ankle/toe contact bodies. PyRoki exports one
+    # Attempt to automatically find ankle/toe contact bodies. The retarget step exports one
     # left and one right foot-contact signal, so apply each signal to both the ankle
     # and toe bodies when they exist.
     left_contact_indices = [
@@ -326,7 +363,7 @@ def convert_npz_to_motion(
 
 @app.command()
 def main(
-    npz_file: Path = typer.Argument(..., exists=True, help="Input NPZ file from PyRoki"),
+    npz_file: Path = typer.Argument(..., exists=True, help="Input retargeted NPZ file"),
     output_file: Path = typer.Argument(..., help="Output .motion file path"),
     model_xml: Path = typer.Option(
         ..., "--model-xml", "-m", exists=True,
@@ -346,7 +383,7 @@ def main(
     ),
 ):
     """
-    Convert a single PyRoki retargeted NPZ file to ProtoMotions .motion format.
+    Convert a single retargeted NPZ file to ProtoMotions .motion format.
     """
     with torch.no_grad():
         convert_npz_to_motion(

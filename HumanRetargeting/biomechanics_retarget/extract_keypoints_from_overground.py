@@ -2,17 +2,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The ProtoMotions Developers
 # SPDX-License-Identifier: Apache-2.0
 """
-Extract keypoints from overground motion data for PyRoki retargeting.
+Extract keypoints from overground motion data for lower-body retargeting.
 
 This script converts the joint position data from treadmill2overground.py
-output into the keypoint format expected by PyRoki's batch retargeting scripts.
+output into the keypoint format expected by the lower-body retargeting scripts.
 
 The lower-body SMPL humanoid has 9 joints:
     - Pelvis (root)
     - L_Hip, L_Knee, L_Ankle, L_Toe
     - R_Hip, R_Knee, R_Ankle, R_Toe
 
-Output format (compatible with PyRoki):
+Output format (compatible with the lower-body retargeter):
     - positions: (T, N_KEYPOINTS, 3) - XYZ coordinates
     - orientations: (T, N_KEYPOINTS, 3, 3) - rotation matrices (estimated)
     - left_foot_contacts: (T, 2) - contact labels for left ankle and toebase
@@ -52,7 +52,7 @@ TREADMILL_JOINT_NAMES = [
     "R_Toe",
 ]
 
-# Mapping to PyRoki keypoint names (9 keypoints for lower body)
+# Mapping to lower-body retargeting keypoint names (9 keypoints for lower body)
 PYROKI_KEYPOINT_NAMES = [
     "pelvis",
     "left_hip",
@@ -245,18 +245,18 @@ def extract_foot_contacts(
     return left_foot_contacts, right_foot_contacts
 
 
-def extract_keypoints_for_pyroki(
+def extract_keypoints_for_retargeting(
     input_file: Path,
     output_file: Path,
     fps: int = 200,
     output_fps: int = 30,
 ) -> None:
     """
-    Extract keypoints from overground motion data for PyRoki retargeting.
+    Extract keypoints from overground motion data for lower-body retargeting.
     
     Args:
         input_file: Path to input .npy file from treadmill2overground.py
-        output_file: Path to output .npy file for PyRoki
+        output_file: Path to output .npy file for retargeting
         fps: Input motion capture frame rate
         output_fps: Output frame rate for retargeting
     """
@@ -296,7 +296,7 @@ def extract_keypoints_for_pyroki(
     left_contacts = left_contacts[:min_len]
     right_contacts = right_contacts[:min_len]
     
-    # Save in PyRoki-compatible format
+    # Save in retargeter-compatible format
     output_data = {
         "fps": output_fps,
         "source_fps": fps,
@@ -315,26 +315,41 @@ def extract_keypoints_for_pyroki(
     np.save(output_file, output_data)
 
 
+def extract_keypoints_for_pyroki(
+    input_file: Path,
+    output_file: Path,
+    fps: int = 200,
+    output_fps: int = 30,
+) -> None:
+    """Backward-compatible alias for the old retarget entrypoint name."""
+    extract_keypoints_for_retargeting(
+        input_file=input_file,
+        output_file=output_file,
+        fps=fps,
+        output_fps=output_fps,
+    )
+
+
 @app.command()
 def main(
     input_file: Path = typer.Argument(
         ..., exists=True, help="Input .npy file from treadmill2overground.py"
     ),
     output_file: Path = typer.Argument(
-        ..., help="Output .npy file for PyRoki retargeting"
+        ..., help="Output .npy file for lower-body retargeting"
     ),
     fps: int = typer.Option(200, "--fps", "-f", help="Input frame rate (Hz)"),
     output_fps: int = typer.Option(30, "--output-fps", help="Output frame rate (Hz)"),
 ):
     """
-    Extract keypoints from overground motion data for PyRoki retargeting.
+    Extract keypoints from overground motion data for lower-body retargeting.
     
     Converts joint position data from treadmill2overground.py into the format
-    expected by PyRoki's batch retargeting scripts.
+    expected by the lower-body retargeting scripts.
     """
     output_file.parent.mkdir(parents=True, exist_ok=True)
     
-    extract_keypoints_for_pyroki(
+    extract_keypoints_for_retargeting(
         input_file=input_file,
         output_file=output_file,
         fps=fps,

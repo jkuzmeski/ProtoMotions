@@ -11,3 +11,6 @@ results/*
 
 output/
 .venv/
+
+.gemini/
+gha-creds-*.json

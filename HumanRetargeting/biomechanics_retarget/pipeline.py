@@ -5,13 +5,14 @@
 Biomechanics Motion Processing Pipeline
 
 This module provides a complete pipeline for processing treadmill motion capture data
-into ProtoMotions-compatible MotionLib format. The pipeline supports lower-body 
-SMPL humanoid models and integrates with PyRoki for trajectory optimization-based retargeting.
+into ProtoMotions-compatible MotionLib format. The pipeline supports lower-body
+SMPL humanoid models and integrates with the local retargeting solver for
+trajectory optimization-based retargeting.
 
 Pipeline Steps:
     1. Treadmill to Overground: Convert treadmill motions to overground locomotion
-    2. Extract Keypoints: Convert positions to PyRoki-compatible keypoint format
-    3. Retarget with PyRoki: Trajectory-level kinematic optimization to target robot
+    2. Extract Keypoints: Convert positions to retargeter-compatible keypoint format
+    3. Retarget Motions: Trajectory-level kinematic optimization to target robot
     4. Convert to ProtoMotions: Generate .motion files from retargeted data
     5. Package MotionLib: Create .pt file for training
 
@@ -90,26 +91,6 @@ class PipelineStep(str, Enum):
     ALL = "all"
 
 
-def _resolve_pyroki_weights_path(
-    output_fps: int,
-    subject_profile: SubjectProfile | None = None,
-) -> Path:
-    """Select the most specific available PyRoki weights file for this run."""
-    candidates: list[Path] = []
-    if subject_profile is not None:
-        candidates.append(
-            REPO_ROOT / "pyroki" / f"optimized_weights_{subject_profile.subject_id}_{output_fps}fps.json"
-        )
-    candidates.append(REPO_ROOT / "pyroki" / f"optimized_weights_{output_fps}fps.json")
-    candidates.append(REPO_ROOT / "pyroki" / "optimized_weights.json")
-
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-
-    return REPO_ROOT / "pyroki" / "optimized_weights.json"
-
-
 @dataclass
 class PipelineConfig:
     """Configuration for the biomechanics pipeline."""
@@ -126,10 +107,8 @@ class PipelineConfig:
     clean_intermediate: bool = False
     subject_height_cm: Optional[int] = None  # Auto model selection
     model_variant: str = "adjusted_pd"  # adjusted_pd or adjusted_torque
-    pyroki_python: Optional[Path] = None  # PyRoki Python interpreter
-    pyroki_urdf_path: Optional[Path] = None  # Optional URDF override for PyRoki
-    pyroki_weights_path: Optional[Path] = REPO_ROOT / "pyroki" / "optimized_weights.json"
-    jax_platform: str = "cuda"  # JAX backend: cuda, rocm, cpu, etc
+    retarget_python: Optional[Path] = None  # Optional interpreter override for the retarget step
+    retarget_urdf_path: Optional[Path] = None  # Optional URDF override for retargeting
     apply_motion_filter: bool = True  # Apply motion quality filter
     filter_config: Optional[Path] = None  # Motion quality filter config
     subject_profile: SubjectProfile | None = None
@@ -319,8 +298,8 @@ class BiomechanicsPipeline:
         self._write_qc_report(f"{keypoint_file.stem}_keypoints_qc", payload)
 
     def step_keypoints(self, overground_files: Optional[List[Path]] = None) -> List[Path]:
-        """Step 2: Convert overground positions to PyRoki-compatible keypoints."""
-        from extract_keypoints_from_overground import extract_keypoints_for_pyroki
+        """Step 2: Convert overground positions to retargeter-compatible keypoints."""
+        from extract_keypoints_from_overground import extract_keypoints_for_retargeting
         
         console.print("\n[bold blue]Step 2: Extracting keypoints for retargeting[/bold blue]")
         
@@ -340,7 +319,7 @@ class BiomechanicsPipeline:
             console.print(f"   Extracting keypoints from {motion_file.name}...")
             
             try:
-                extract_keypoints_for_pyroki(
+                extract_keypoints_for_retargeting(
                     input_file=motion_file,
                     output_file=output_file,
                     fps=self.config.fps,
@@ -356,23 +335,22 @@ class BiomechanicsPipeline:
         console.print(f"\n✅ Keypoint extraction completed. {len(successful_files)} files successful.")
         return successful_files
     
-    def _resolve_pyroki_retarget_script(self, project_root: Path) -> tuple[Path | None, str]:
-        candidates = [
-            (project_root / "pyroki" / "batch_retarget_to_smpl_lower_body.py", "treadmill"),
-            (project_root / "pyroki" / "batch_retarget_to_smpl_from_keypoints.py", "smpl"),
+    def _resolve_retarget_script(self, project_root: Path) -> tuple[Path | None, str]:
+        script_names = [
+            ("batch_retarget_lower_body.py", "treadmill"),
+            ("batch_retarget_to_smpl_from_keypoints.py", "smpl"),
         ]
-        for script_path, source_type in candidates:
-            if script_path.exists():
-                return script_path, source_type
+        for script_name, source_type in script_names:
+            matches = sorted(project_root.rglob(script_name))
+            if matches:
+                return matches[0], source_type
         return None, "smpl"
 
     def step_retarget(self, keypoint_files: Optional[List[Path]] = None) -> List[Path]:
-        """Step 3: Retarget keypoints to target robot using PyRoki."""
+        """Step 3: Retarget keypoints to the target robot."""
         import subprocess
-        import sys
-        from pathlib import Path
-        
-        console.print("\n[bold blue]Step 3: Retargeting motions with PyRoki[/bold blue]")
+
+        console.print("\n[bold blue]Step 3: Retargeting motions[/bold blue]")
         
         # Check for existing retargeted files first
         retargeted_files = list(self.config.retargeted_dir.glob("*_retargeted.npz"))
@@ -382,34 +360,13 @@ class BiomechanicsPipeline:
             console.print(f"✅ Found {len(retargeted_files)} retargeted motion files (skipping).")
             return retargeted_files
         
-        # Try to find PyRoki environment
-        pyroki_python = self._find_pyroki_python()
-        retarget_script, source_type = self._resolve_pyroki_retarget_script(REPO_ROOT)
+        retarget_python = self._resolve_retarget_python()
+        retarget_script, source_type = self._resolve_retarget_script(REPO_ROOT)
         if retarget_script is None:
-            console.print("[red]No PyRoki retarget script found under pyroki/[/red]")
+            console.print("[red]No retarget script found for the lower-body pipeline.[/red]")
             return []
-        
-        if pyroki_python is None:
-            console.print("[yellow]⚠️ PyRoki environment not found. Provide path with --pyroki-python.[/yellow]")
-            console.print(f"Run manually: python {retarget_script.name} \\")
-            console.print(f"    --keypoints-folder-path {self.config.keypoints_dir} \\")
-            console.print(f"    --output-dir {self.config.retargeted_dir} \\")
-            if self.config.pyroki_urdf_path is not None:
-                console.print(f"    --urdf-path {self.config.pyroki_urdf_path} \\")
-            if (
-                self.config.pyroki_weights_path is not None
-                and self.config.pyroki_weights_path.exists()
-            ):
-                console.print(
-                    f"    --weights-path {self.config.pyroki_weights_path} \\"
-                )
-            console.print(f"    --retarget-fps {self.config.output_fps} \\")
-            console.print(f"    --source-type {source_type} \\")
-            console.print(f"    --no-visualize")
-            return []
-        
-        # Run retargeting in PyRoki environment
-        console.print(f"🔄 Running PyRoki with: {pyroki_python}")
+
+        console.print(f"🔄 Running retargeter with: {retarget_python}")
         
         try:
 
@@ -418,21 +375,8 @@ class BiomechanicsPipeline:
                               f"{retarget_script}[/red]")
                 return []
             
-            # Create environment with JAX settings
-            env = os.environ.copy()
-            # Set JAX platform with fallback to CPU on failure
-            jax_platform = self.config.jax_platform
-            env['JAX_PLATFORMS'] = jax_platform
-            console.print(f"⚙️ JAX platform: {jax_platform or 'auto-detect'}")
-            # Enable full traceback for JAX errors
-            env['JAX_TRACEBACK_FILTERING'] = 'off'
-            env['JAX_DEFAULT_PREC'] = 'float32'
-            
-            # Add NVIDIA paths for Windows
-            self._add_nvidia_paths(env, pyroki_python)
-            
             cmd = [
-                str(pyroki_python),
+                str(retarget_python),
                 str(retarget_script),
                 "--keypoints-folder-path", str(self.config.keypoints_dir),
                 "--output-dir", str(self.config.retargeted_dir),
@@ -443,29 +387,12 @@ class BiomechanicsPipeline:
                 "--skip-existing",
             ]
 
-            if self.config.pyroki_urdf_path is not None:
-                cmd.extend(["--urdf-path", str(self.config.pyroki_urdf_path)])
-            if (
-                self.config.pyroki_weights_path is not None
-                and self.config.pyroki_weights_path.exists()
-            ):
-                cmd.extend(["--weights-path", str(self.config.pyroki_weights_path)])
+            if self.config.retarget_urdf_path is not None:
+                cmd.extend(["--urdf-path", str(self.config.retarget_urdf_path)])
             
             console.print("   Running retargeting...")
             console.print(f"   Script: {retarget_script}")
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, env=env)
-            
-            # If CUDA fails, retry with CPU
-            if result.returncode != 0 and \
-               jax_platform == 'cuda' and \
-               'AssertionError' in result.stderr:
-                console.print("[yellow]⚠️ CUDA initialization failed, "
-                              "retrying with CPU...[/yellow]")
-                console.print(f"[red]Error details:[/red]\n{result.stderr}")
-                env['JAX_PLATFORMS'] = 'cpu'
-                result = subprocess.run(
-                    cmd, capture_output=True, text=True, env=env)
+            result = subprocess.run(cmd, capture_output=True, text=True)
             
             if result.returncode != 0:
                 console.print("[red]❌ Retargeting failed:[/red]")
@@ -475,7 +402,7 @@ class BiomechanicsPipeline:
             # Step 2: Extract contact labels
             console.print(f"   Extracting contact labels...")
             cmd = [
-                str(pyroki_python),
+                str(retarget_python),
                 str(retarget_script),
                 "--keypoints-folder-path", str(self.config.keypoints_dir),
                 "--contacts-dir", str(self.config.contacts_dir),
@@ -486,15 +413,10 @@ class BiomechanicsPipeline:
                 "--skip-existing",
             ]
 
-            if self.config.pyroki_urdf_path is not None:
-                cmd.extend(["--urdf-path", str(self.config.pyroki_urdf_path)])
-            if (
-                self.config.pyroki_weights_path is not None
-                and self.config.pyroki_weights_path.exists()
-            ):
-                cmd.extend(["--weights-path", str(self.config.pyroki_weights_path)])
+            if self.config.retarget_urdf_path is not None:
+                cmd.extend(["--urdf-path", str(self.config.retarget_urdf_path)])
             
-            result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+            result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
                 console.print(f"[yellow]⚠️ Contact extraction had issues (continuing):[/yellow]")
                 console.print(result.stderr)
@@ -509,82 +431,14 @@ class BiomechanicsPipeline:
             return retargeted_files
             
         except Exception as e:
-            console.print(f"[red]❌ Error running PyRoki: {e}[/red]")
+            console.print(f"[red]❌ Error running retargeter: {e}[/red]")
             return []
-    
-    def _find_pyroki_python(self) -> Optional[Path]:
-        """Find PyRoki Python interpreter, checking conda environments."""
-        import subprocess
-        import json
-        
-        # Check if pyroki_python was provided via CLI
-        if hasattr(self.config, 'pyroki_python') and self.config.pyroki_python:
-            path = Path(self.config.pyroki_python)
-            if path.exists():
-                return path
 
-        local_candidates = [
-            REPO_ROOT / ".venv-pyroki" / "Scripts" / "python.exe",
-            REPO_ROOT / ".venv-pyroki" / "bin" / "python",
-        ]
-        for candidate in local_candidates:
-            if candidate.exists():
-                return candidate
-        
-        # Try to find pyroki conda environment
-        try:
-            result = subprocess.run(
-                ["conda", "info", "--json"],
-                capture_output=True, text=True
-            )
-            if result.returncode == 0:
-                conda_info = json.loads(result.stdout)
-                envs = conda_info.get("envs", [])
-                
-                for env_path in envs:
-                    python_exe = Path(env_path) / "Scripts" / "python.exe"
-                    if not python_exe.exists():
-                        python_exe = Path(env_path) / "bin" / "python"
-                    
-                    if "pyroki" in env_path.lower() and python_exe.exists():
-                        return python_exe
-        except:
-            pass
-        
-        return None
-
-    def _add_nvidia_paths(self, env: dict, python_exe: Path) -> None:
-        """Add NVIDIA library paths to environment PATH for Windows JAX support."""
-        if sys.platform != "win32":
-            return
-            
-        # Assuming python_exe is in Scripts/ or bin/
-        # site-packages is in Lib/site-packages relative to env root
-        env_root = python_exe.parent.parent
-        site_packages = env_root / "Lib" / "site-packages"
-        
-        if not site_packages.exists():
-            return
-            
-        nvidia_dir = site_packages / "nvidia"
-        if not nvidia_dir.exists():
-            return
-            
-        # List of nvidia packages that might have bin dirs
-        pkgs = [
-            "cudnn", "cublas", "cuda_cupti", "cuda_nvcc", 
-            "cuda_runtime", "cufft", "cusolver", "cusparse", "nvjitlink"
-        ]
-        
-        new_paths = []
-        for pkg in pkgs:
-            bin_dir = nvidia_dir / pkg / "bin"
-            if bin_dir.exists():
-                new_paths.append(str(bin_dir))
-        
-        if new_paths:
-            console.print(f"   Adding {len(new_paths)} NVIDIA paths to PATH for JAX")
-            env["PATH"] = os.pathsep.join(new_paths) + os.pathsep + env.get("PATH", "")
+    def _resolve_retarget_python(self) -> Path:
+        """Resolve the interpreter used for the retarget step."""
+        if self.config.retarget_python is not None:
+            return Path(self.config.retarget_python)
+        return Path(sys.executable)
     
     def step_convert(self, retargeted_files: Optional[List[Path]] = None) -> List[Path]:
         """Step 4: Convert retargeted motions to ProtoMotions .motion format."""
@@ -802,9 +656,9 @@ class BiomechanicsPipeline:
             "input_dir": str(self.config.input_dir),
             "output_dir": str(self.config.output_dir),
             "model_xml": str(self.config.model_xml),
-            "pyroki_urdf_path": (
-                str(self.config.pyroki_urdf_path)
-                if self.config.pyroki_urdf_path is not None
+            "retarget_urdf_path": (
+                str(self.config.retarget_urdf_path)
+                if self.config.retarget_urdf_path is not None
                 else None
             ),
             "contact_source": self.config.contact_source,
@@ -859,11 +713,11 @@ class BiomechanicsPipeline:
                     console.print("❌ No keypoints successfully extracted")
                     return None
                 
-                # Step 3: Retarget (requires separate PyRoki environment)
+                # Step 3: Retarget motions
                 retargeted_files = self.step_retarget(keypoint_files)
-                
+
                 if not retargeted_files:
-                    console.print("\n⚠️ Pipeline paused. Please run PyRoki retargeting manually.")
+                    console.print("\n⚠️ Pipeline paused. Please run the retarget step manually.")
                     console.print("After retargeting, run: python pipeline.py ... --step convert")
                     return None
                 
@@ -1095,27 +949,17 @@ def main(
     clean_intermediate: bool = typer.Option(
         False, "--clean", help="Remove intermediate files"
     ),
-    pyroki_python: Optional[Path] = typer.Option(
-        None, "--pyroki-python", help="Path to PyRoki Python interpreter"
+    retarget_python: Optional[Path] = typer.Option(
+        None, "--retarget-python", help="Path to the Python interpreter used for retargeting"
     ),
-    pyroki_urdf_path: Optional[Path] = typer.Option(
+    retarget_urdf_path: Optional[Path] = typer.Option(
         None,
-        "--pyroki-urdf-path",
+        "--retarget-urdf-path",
         exists=True,
         help=(
-            "Optional URDF to use for PyRoki retargeting (e.g. the contact-pad URDF). "
-            "If omitted, PyRoki's script default is used."
+            "Optional URDF to use for retargeting (e.g. the contact-pad URDF). "
+            "If omitted, the retarget script default is used."
         ),
-    ),
-    pyroki_weights_path: Optional[Path] = typer.Option(
-        None,
-        "--pyroki-weights-path",
-        exists=True,
-        help="Optional JSON weights file for PyRoki retargeting.",
-    ),
-    jax_platform: str = typer.Option(
-        "cuda", "--jax-platform",
-        help="JAX backend: 'cuda', 'rocm', 'cpu', or '' (auto-detect)"
     ),
     subject_profile_path: Optional[Path] = typer.Option(
         None,
@@ -1192,8 +1036,8 @@ def main(
             "default_root_height": assets.default_root_height,
         }
         model_xml = assets.mjcf_path
-        if pyroki_urdf_path is None:
-            pyroki_urdf_path = assets.urdf_path
+        if retarget_urdf_path is None:
+            retarget_urdf_path = assets.urdf_path
         console.print(f"\n📏 Subject profile: {subject_profile.subject_id}")
         console.print(f"🤖 Subject asset bundle: {assets.subject_stem}")
     elif subject_height is not None:
@@ -1213,9 +1057,6 @@ def main(
         console.print("  --model path/to/model.xml (manual model path)")
         raise typer.Exit(1)
 
-    if pyroki_weights_path is None:
-        pyroki_weights_path = _resolve_pyroki_weights_path(output_fps, subject_profile)
-    
     config = PipelineConfig(
         input_dir=input_dir,
         output_dir=output_dir,
@@ -1230,10 +1071,8 @@ def main(
         clean_intermediate=clean_intermediate,
         subject_height_cm=subject_height,
         model_variant=model_variant,
-        pyroki_python=pyroki_python,
-        pyroki_urdf_path=pyroki_urdf_path,
-        pyroki_weights_path=pyroki_weights_path,
-        jax_platform=jax_platform,
+        retarget_python=retarget_python,
+        retarget_urdf_path=retarget_urdf_path,
         subject_profile=subject_profile,
         contact_source=contact_source,
         asset_root=asset_root,
@@ -1250,7 +1089,7 @@ def main(
             "contact_source": contact_source,
             "packaged_output": str(packaged_output) if packaged_output is not None else None,
             "model_xml": str(model_xml),
-            "pyroki_urdf_path": str(pyroki_urdf_path) if pyroki_urdf_path is not None else None,
+            "retarget_urdf_path": str(retarget_urdf_path) if retarget_urdf_path is not None else None,
             "generated_assets": generated_assets,
             "motion_file_count": len(list((output_dir / "motion_files").glob("*.motion"))),
             "retargeted_file_count": len(list((output_dir / "retargeted_motions").glob("*_retargeted.npz"))),

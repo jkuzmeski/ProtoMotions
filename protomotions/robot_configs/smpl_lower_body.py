@@ -171,7 +171,7 @@ class SmplLowerBodyRobotConfig(RobotConfig):
                 ),
             ),
             genesis=GenesisSimParams(fps=60, decimation=2, substeps=2),
-            newton=NewtonSimParams(fps=120, decimation=4),
+            newton=NewtonSimParams(fps=120, decimation=4, ccd_iterations=100),
         )
     )
 

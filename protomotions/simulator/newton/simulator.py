@@ -603,6 +603,23 @@ class NewtonSimulator(Simulator):
             cone=sim_params.cone,
         )
 
+        # MuJoCo exposes CCD iterations as a solver option, but Newton does not yet
+        # forward it through SolverMuJoCo's constructor. Set it explicitly here so
+        # contact-heavy experiments can tune CCD convergence from repo config/CLI.
+        ccd_iterations = getattr(sim_params, "ccd_iterations", None)
+        if ccd_iterations is not None and hasattr(self.solver.mjw_model.opt, "ccd_iterations"):
+            ccd_iterations_opt = self.solver.mjw_model.opt.ccd_iterations
+            if hasattr(ccd_iterations_opt, "fill_"):
+                ccd_iterations_opt.fill_(ccd_iterations)
+            elif isinstance(ccd_iterations_opt, int):
+                self.solver.mjw_model.opt.ccd_iterations = int(ccd_iterations)
+            else:
+                ccd_iterations_torch = wp.to_torch(ccd_iterations_opt)
+                ccd_iterations_torch[:] = ccd_iterations
+                self.solver.mjw_model.opt.ccd_iterations = wp.from_torch(
+                    ccd_iterations_torch, dtype=wp.int32
+                )
+
         geom_margin = wp.to_torch(self.solver.mjw_model.geom_margin)
         geom_margin[:] = 0.01
         self.solver.mjw_model.geom_margin = wp.from_torch(geom_margin, dtype=wp.float32)

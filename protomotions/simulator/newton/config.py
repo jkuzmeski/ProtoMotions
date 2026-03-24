@@ -58,6 +58,10 @@ class NewtonSimParams(SimParams):
         default="pyramidal",
         metadata={"help": "Friction cone: 'pyramidal' or 'elliptic'."}
     )
+    ccd_iterations: int = field(
+        default=35,
+        metadata={"help": "Max CCD iterations for MuJoCo contact resolution.", "min": 1}
+    )
 
 
 @dataclass

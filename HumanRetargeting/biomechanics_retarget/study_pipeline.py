@@ -40,12 +40,11 @@ def main(
     output_root: Path = typer.Option(None, "--output-root", help="Root directory for processed study outputs."),
     step: PipelineStep = typer.Option(PipelineStep.ALL, "--step", help="Pipeline step to run for each subject."),
     force: bool = typer.Option(False, "--force", help="Force subject reprocessing."),
-    pyroki_python: Path | None = typer.Option(
+    retarget_python: Path | None = typer.Option(
         None,
-        "--pyroki-python",
-        help="Optional explicit PyRoki interpreter for every subject.",
+        "--retarget-python",
+        help="Optional explicit interpreter for the retarget step for every subject.",
     ),
-    jax_platform: str = typer.Option("cuda", "--jax-platform", help="JAX backend."),
 ) -> None:
     """Run the single-subject pipeline for every subject in a study manifest."""
     study = load_study_manifest(manifest)
@@ -72,9 +71,8 @@ def main(
             force_remake=force,
             step=step,
             clean_intermediate=False,
-            pyroki_python=pyroki_python,
-            pyroki_urdf_path=None,
-            jax_platform=jax_platform,
+            retarget_python=retarget_python,
+            retarget_urdf_path=None,
             subject_profile_path=subject_profile_path,
             contact_source=profile.contact_source,
             contact_pads=profile.contact_pads,

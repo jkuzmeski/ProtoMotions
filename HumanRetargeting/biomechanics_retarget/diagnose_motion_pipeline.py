@@ -5,7 +5,7 @@ r"""
 Diagnose motion pipeline: compare joint data at every stage.
 
 Compares joint names and values between:
-  1. PyRoki .npz  (retargeted output)
+  1. Retargeted .npz
   2. .motion file (after convert_retargeted_to_motion.py)
   3. .pt file     (after package_motions.py)
 
@@ -98,7 +98,7 @@ def print_joint_comparison(joint_names_a, values_a_deg, label_a,
 # ---------------------------------------------------------------------------
 
 def load_npz(npz_path: Path):
-    """Load PyRoki retargeted .npz file."""
+    """Load a retargeted .npz file."""
     data = np.load(npz_path, allow_pickle=True)
     result = {
         "base_frame_pos": data["base_frame_pos"],
@@ -150,7 +150,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--npz", type=Path, default=None, help="PyRoki retargeted .npz file")
+    parser.add_argument("--npz", type=Path, default=None, help="Retargeted .npz file")
     parser.add_argument("--motion", type=Path, default=None, help=".motion file (after convert)")
     parser.add_argument("--pt", type=Path, default=None, help="Packaged MotionLib .pt file")
     parser.add_argument("--model-xml", type=Path, default=None, help="MJCF model XML file")
@@ -186,12 +186,12 @@ def main():
                 print(f"    [{i:2d}] {name}")
 
     # -----------------------------------------------------------------------
-    # 2. PyRoki .npz
+    # 2. Retargeted .npz
     # -----------------------------------------------------------------------
     npz_data = None
     npz_joint_names = None
     if args.npz and args.npz.exists():
-        print_header("Stage 1: PyRoki Retargeted .npz")
+        print_header("Stage 1: Retargeted .npz")
         npz_data = load_npz(args.npz)
         npz_joint_names = npz_data["joint_names"]
 

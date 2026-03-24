@@ -23,6 +23,10 @@ from lightning import fabric
 from protomotions.utils.hydra_replacement import instantiate
 
 
+def _is_explicit_single_process(value: Union[int, str]) -> bool:
+    return isinstance(value, int) and value == 1
+
+
 @dataclass
 class FabricConfig:
     """Configuration for Lightning Fabric distributed training."""
@@ -61,6 +65,12 @@ class FabricConfig:
             isinstance(self.strategy, dict) or isinstance(self.strategy, DictConfig)
         ):
             self.strategy = instantiate(self.strategy)
+        if (
+            isinstance(self.strategy, fabric.strategies.DDPStrategy)
+            and _is_explicit_single_process(self.devices)
+            and _is_explicit_single_process(self.num_nodes)
+        ):
+            self.strategy = None
         if self.loggers is not None:
             loggers = []
             for logger in self.loggers:
