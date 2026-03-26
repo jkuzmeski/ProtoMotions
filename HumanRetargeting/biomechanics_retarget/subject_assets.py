@@ -19,10 +19,7 @@ if str(RESCALE_DIR) not in sys.path:
 
 from scaling_usda import extract_body_data_from_xml, update_usda_file
 
-try:
-    from .subject_profiles import SubjectProfile
-except ImportError:
-    from subject_profiles import SubjectProfile
+from HumanRetargeting.biomechanics_retarget.subject_profiles import SubjectProfile
 
 
 BASE_HEIGHT_CM = 170.0
@@ -72,6 +69,13 @@ def _find_body(root: ET.Element, name: str) -> ET.Element:
     if body is None:
         raise ValueError(f"expected body {name!r} in lower-body XML")
     return body
+
+
+def _find_joint(root: ET.Element, name: str) -> ET.Element:
+    joint = root.find(f".//joint[@name='{name}']")
+    if joint is None:
+        raise ValueError(f"expected joint {name!r} in lower-body XML")
+    return joint
 
 
 def _find_geom(body: ET.Element) -> ET.Element:
@@ -172,6 +176,23 @@ def _generate_lower_body_urdf(xml_root: ET.Element, subject_stem: str, output_pa
     if root_body is None:
         raise ValueError("expected Pelvis root body in lower-body XML")
 
+    compiler = xml_root.find("./compiler")
+    angle_unit = "degree"
+    if compiler is not None and compiler.get("angle") is not None:
+        angle_unit = compiler.get("angle", "degree").strip().lower()
+
+    def _joint_limits(joint_name: str) -> tuple[float, float]:
+        joint = _find_joint(xml_root, joint_name)
+        range_values = _parse_float_list(joint.get("range"))
+        if len(range_values) != 2:
+            raise ValueError(f"expected two range values for joint {joint_name!r}")
+
+        lower, upper = range_values
+        if angle_unit != "radian":
+            lower = math.radians(lower)
+            upper = math.radians(upper)
+        return lower, upper
+
     lines = [
         '<?xml version="1.0"?>',
         f'<robot name="{subject_stem}">',
@@ -202,7 +223,11 @@ def _generate_lower_body_urdf(xml_root: ET.Element, subject_stem: str, output_pa
             lines.append(f'    <child link="{child}"/>')
             lines.append(f'    <origin xyz="{xyz_str}" rpy="0 0 0"/>')
             lines.append(f'    <axis xyz="{axis_vec}"/>')
-            lines.append('    <limit lower="-6.283185" upper="6.283185" effort="500" velocity="100"/>')
+            lower, upper = _joint_limits(f"{joint_prefix}_{axis_name}")
+            lines.append(
+                f'    <limit lower="{lower:.6f}" upper="{upper:.6f}" '
+                'effort="500" velocity="100"/>'
+            )
             lines.append("  </joint>")
         return z_link
 

@@ -16,14 +16,14 @@ Usage:
     cd D:\Biomotions\newton\ProtoMotions
 
     # Quick check (compare .npz -> .motion -> .pt joint order + first 3 frames):
-    ..\.venv\Scripts\python.exe HumanRetargeting\biomechanics_retarget\diagnose_motion_pipeline.py ^
+    ..\.venv\Scripts\python.exe HumanRetargeting\biomechanics_retarget\tools\debug\diagnose_motion_pipeline.py ^
         --npz HumanRetargeting\biomechanics_retarget\processed_data\S_GENERIC\retargeted_motions\S02_30ms_Long_retargeted.npz ^
         --motion HumanRetargeting\biomechanics_retarget\processed_data\S_GENERIC\motion_files\S02_30ms_Long.motion ^
         --pt HumanRetargeting\biomechanics_retarget\processed_data\S_GENERIC\packaged_data\S_GENERIC.pt ^
         --model-xml HumanRetargeting\rescale\smpl_humanoid_lower_body_adjusted_pd.xml
 
     # Verbose: print per-joint values at specific frames:
-    ..\.venv\Scripts\python.exe HumanRetargeting\biomechanics_retarget\diagnose_motion_pipeline.py ^
+    ..\.venv\Scripts\python.exe HumanRetargeting\biomechanics_retarget\tools\debug\diagnose_motion_pipeline.py ^
         --npz ... --motion ... --pt ... --model-xml ... ^
         --frames 0 10 50 --verbose
 """
@@ -35,9 +35,10 @@ from typing import Optional
 import numpy as np
 import torch
 
-# Add project root to path
-PROJECT_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
+# Add repository root to path so the tool can be launched from anywhere.
+REPO_ROOT = Path(__file__).resolve().parents[4]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 # ---------------------------------------------------------------------------
 # Helpers

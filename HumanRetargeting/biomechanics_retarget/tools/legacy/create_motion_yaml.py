@@ -8,7 +8,7 @@ This script generates a YAML configuration file listing all .motion files
 in a directory, ready for packaging into a MotionLib.
 
 Usage:
-    python create_motion_yaml.py motion_dir output.yaml --fps 30
+    python HumanRetargeting/biomechanics_retarget/tools/legacy/create_motion_yaml.py motion_dir output.yaml --fps 30
 
 Author: BioMotions Team
 """

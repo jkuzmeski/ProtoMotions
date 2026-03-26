@@ -26,7 +26,8 @@ right_foot_width_m: null
 grf_glob: null
 event_glob: null
 contact_pads: false
-profile_path: /mnt/d/Biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/profiles/S_GENERIC.yaml
+profile_path: /mnt/d/Biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/profile.yaml
+profile_mode: file
 asset_stem: smpl_humanoid_lower_body_subject_S_GENERIC
 asset_root: /mnt/d/Biomotions/ProtoMotions/protomotions/data/assets
 mjcf_path: /mnt/d/Biomotions/ProtoMotions/protomotions/data/assets/mjcf/smpl_humanoid_lower_body_subject_S_GENERIC.xml

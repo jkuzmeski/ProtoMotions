@@ -9,7 +9,7 @@ It helps in debugging if the keypoints are correct and not intersecting the grou
 before retargeting.
 
 Usage:
-    python visualize_keypoints.py path/to/keypoints.npy
+    python HumanRetargeting/biomechanics_retarget/tools/visualization/visualize_keypoints.py path/to/keypoints.npy
 """
 
 import sys

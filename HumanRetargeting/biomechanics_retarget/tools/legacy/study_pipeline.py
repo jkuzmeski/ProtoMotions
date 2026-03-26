@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2025 The ProtoMotions Developers
 # SPDX-License-Identifier: Apache-2.0
-"""Batch study runner for subject-aware biomechanics retargeting."""
+"""Legacy batch study runner for subject-aware biomechanics retargeting."""
 
 from __future__ import annotations
 
 import csv
 import json
+import sys
 from pathlib import Path
 
 import typer
 import yaml
 
-try:
-    from .pipeline import PipelineStep, main as run_subject_pipeline
-    from .subject_profiles import SubjectProfile, load_study_manifest
-except ImportError:
-    from pipeline import PipelineStep, main as run_subject_pipeline
-    from subject_profiles import SubjectProfile, load_study_manifest
+# Add repository root to path so the tool can be launched from anywhere.
+REPO_ROOT = Path(__file__).resolve().parents[4]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from HumanRetargeting.biomechanics_retarget.pipeline import PipelineStep, main as run_subject_pipeline
+from HumanRetargeting.biomechanics_retarget.subject_profiles import SubjectProfile, load_study_manifest
 
 
 app = typer.Typer(pretty_exceptions_enable=False)
@@ -43,7 +45,17 @@ def main(
     retarget_python: Path | None = typer.Option(
         None,
         "--retarget-python",
+        "--pyroki-python",
         help="Optional explicit interpreter for the retarget step for every subject.",
+    ),
+    retarget_script: Path | None = typer.Option(
+        None,
+        "--retarget-script",
+        "--pyroki-script",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        help="Optional explicit external PyRoki wrapper script for every subject.",
     ),
 ) -> None:
     """Run the single-subject pipeline for every subject in a study manifest."""
@@ -72,6 +84,7 @@ def main(
             step=step,
             clean_intermediate=False,
             retarget_python=retarget_python,
+            retarget_script=retarget_script,
             retarget_urdf_path=None,
             subject_profile_path=subject_profile_path,
             contact_source=profile.contact_source,

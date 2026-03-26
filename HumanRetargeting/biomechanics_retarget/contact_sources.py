@@ -12,10 +12,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-try:
-    from .subject_profiles import SubjectProfile
-except ImportError:
-    from subject_profiles import SubjectProfile
+from HumanRetargeting.biomechanics_retarget.subject_profiles import SubjectProfile
 
 
 def _load_np_container(path: Path) -> dict[str, np.ndarray]:

@@ -30,8 +30,6 @@ from typing import Optional, Tuple
 import numpy as np
 import typer
 from scipy.ndimage import binary_closing, binary_opening
-from scipy.spatial.transform import Rotation as R
-
 try:
     from .fps_utils import get_resample_indices
 except ImportError:
@@ -82,34 +80,75 @@ def detect_foot_contacts(
     foot_positions: np.ndarray,
     foot_velocities: np.ndarray,
     foot_accelerations: np.ndarray,
-    height_threshold: float = 0.05,
-    vertical_velocity_threshold: float = 0.15,
-    horizontal_acceleration_threshold: float = 0.5,
 ) -> np.ndarray:
     """
-    Detect stance phases (foot contacts) using kinematic thresholds.
-    
+    Detect support phases using adaptive per-joint clearance and speed thresholds.
+
+    The lower-body treadmill dataset keeps ankle joints several centimeters above the
+    floor even during stance, so absolute world-height thresholds are brittle. Detect
+    contact from each joint's own clearance envelope plus low horizontal/vertical
+    speed windows instead.
+
     Returns:
         stance_mask: Boolean array of shape (T,) indicating stance phase
     """
-    # Height condition: foot is close to ground
-    height_condition = foot_positions[:, 2] < height_threshold
-    
-    # Vertical velocity condition: foot is not moving vertically
-    vert_vel_cond = np.abs(foot_velocities[:, 2]) < vertical_velocity_threshold
-    
-    # Horizontal acceleration condition: foot is not accelerating horizontally
-    horiz_accel = np.linalg.norm(foot_accelerations[:, :2], axis=1)
-    horiz_accel_cond = horiz_accel < horizontal_acceleration_threshold
-    
-    # Combine conditions
-    stance_mask = height_condition & vert_vel_cond & horiz_accel_cond
-    
-    # Apply morphological operations to clean up noise
-    stance_mask = binary_closing(stance_mask, structure=np.ones(5))
+    del foot_accelerations
+
+    clearance = foot_positions[:, 2] - np.percentile(foot_positions[:, 2], 1.0)
+    horizontal_speed = np.linalg.norm(foot_velocities[:, :2], axis=1)
+    vertical_speed = np.abs(foot_velocities[:, 2])
+
+    height_threshold = max(
+        0.012,
+        min(0.08, float(np.percentile(clearance, 20.0) + 0.008)),
+    )
+    horizontal_speed_threshold = max(
+        0.2,
+        min(1.0, float(np.percentile(horizontal_speed, 15.0) + 0.15)),
+    )
+    vertical_speed_threshold = max(
+        0.08,
+        min(0.5, float(np.percentile(vertical_speed, 20.0) + 0.05)),
+    )
+
+    stance_mask = (
+        (clearance <= height_threshold)
+        & (horizontal_speed <= horizontal_speed_threshold)
+        & (vertical_speed <= vertical_speed_threshold)
+    )
+
+    # Prefer broad stance windows to isolated spikes; PyRoki treats support as a
+    # trajectory-level constraint rather than an instantaneous event.
+    stance_mask = binary_closing(stance_mask, structure=np.ones(7))
     stance_mask = binary_opening(stance_mask, structure=np.ones(3))
-    
     return stance_mask
+
+
+def _normalize(vector: np.ndarray, fallback: np.ndarray) -> np.ndarray:
+    norm = np.linalg.norm(vector)
+    if norm < 1e-8:
+        return fallback.astype(np.float32, copy=True)
+    return (vector / norm).astype(np.float32, copy=False)
+
+
+def _project_ground(vector: np.ndarray) -> np.ndarray:
+    projected = np.asarray(vector, dtype=np.float32).copy()
+    projected[2] = 0.0
+    return projected
+
+
+def _orthonormalize_basis(
+    x_axis: np.ndarray,
+    y_axis: np.ndarray,
+    z_axis: np.ndarray,
+) -> np.ndarray:
+    x_axis = _normalize(x_axis, np.array([1.0, 0.0, 0.0], dtype=np.float32))
+    y_axis = y_axis - x_axis * np.dot(y_axis, x_axis)
+    y_axis = _normalize(y_axis, np.array([0.0, 1.0, 0.0], dtype=np.float32))
+    z_axis = np.cross(x_axis, y_axis)
+    z_axis = _normalize(z_axis, np.array([0.0, 0.0, 1.0], dtype=np.float32))
+    y_axis = _normalize(np.cross(z_axis, x_axis), y_axis)
+    return np.column_stack([x_axis, y_axis, z_axis]).astype(np.float32, copy=False)
 
 
 def estimate_orientations(
@@ -133,72 +172,91 @@ def estimate_orientations(
         for j in range(n_joints):
             orientations[t, j] = np.eye(3)
     
-    # Estimate pelvis orientation from hip positions
-    # Pelvis x-axis: from right hip to left hip
-    # Pelvis y-axis: forward direction (perpendicular to x, in ground plane)
-    # Pelvis z-axis: up
+    # Canonical source frame:
+    # - x: forward
+    # - y: left
+    # - z: up
     l_hip_idx = TREADMILL_JOINT_NAMES.index("L_Hip")
     r_hip_idx = TREADMILL_JOINT_NAMES.index("R_Hip")
     pelvis_idx = TREADMILL_JOINT_NAMES.index("Pelvis")
-    
-    for t in range(n_frames):
-        l_hip = positions[t, l_hip_idx]
-        r_hip = positions[t, r_hip_idx]
-        
-        # X-axis: right to left hip (lateral)
-        x_axis = l_hip - r_hip
-        x_axis = x_axis / (np.linalg.norm(x_axis) + 1e-6)
-        
-        # Z-axis: up
-        z_axis = np.array([0, 0, 1])
-        
-        # Y-axis: forward (perpendicular to both)
-        y_axis = np.cross(z_axis, x_axis)
-        y_axis = y_axis / (np.linalg.norm(y_axis) + 1e-6)
-        
-        # Recompute z to ensure orthogonality
-        z_axis = np.cross(x_axis, y_axis)
-        
-        rot_matrix = np.column_stack([x_axis, y_axis, z_axis])
-        orientations[t, pelvis_idx] = rot_matrix
-    
-    # Estimate foot orientations from ankle-toe vectors
     l_ankle_idx = TREADMILL_JOINT_NAMES.index("L_Ankle")
     l_toe_idx = TREADMILL_JOINT_NAMES.index("L_Toe")
     r_ankle_idx = TREADMILL_JOINT_NAMES.index("R_Ankle")
     r_toe_idx = TREADMILL_JOINT_NAMES.index("R_Toe")
-    
+
+    pelvis_positions = positions[:, pelvis_idx]
+    pelvis_velocities = np.gradient(pelvis_positions, axis=0)
+
+    prev_pelvis_basis = np.eye(3, dtype=np.float32)
     for t in range(n_frames):
-        # Left foot
+        l_hip = positions[t, l_hip_idx]
+        r_hip = positions[t, r_hip_idx]
+        lateral_axis = _project_ground(l_hip - r_hip)
+        lateral_axis = _normalize(lateral_axis, prev_pelvis_basis[:, 1])
+
+        heading_hint = _project_ground(pelvis_velocities[t])
+        left_foot_heading = _project_ground(positions[t, l_toe_idx] - positions[t, l_ankle_idx])
+        right_foot_heading = _project_ground(positions[t, r_toe_idx] - positions[t, r_ankle_idx])
+        heading_hint = heading_hint + 0.5 * (left_foot_heading + right_foot_heading)
+
+        x_axis = np.cross(lateral_axis, np.array([0.0, 0.0, 1.0], dtype=np.float32))
+        x_axis = _normalize(x_axis, prev_pelvis_basis[:, 0])
+        if np.dot(x_axis, heading_hint) < 0.0:
+            x_axis = -x_axis
+            lateral_axis = -lateral_axis
+
+        rot_matrix = _orthonormalize_basis(
+            x_axis=x_axis,
+            y_axis=lateral_axis,
+            z_axis=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+        )
+        if np.dot(rot_matrix[:, 0], prev_pelvis_basis[:, 0]) < 0.0:
+            rot_matrix[:, :2] *= -1.0
+
+        orientations[t, pelvis_idx] = rot_matrix
+        prev_pelvis_basis = rot_matrix
+
+    # Estimate foot orientations from ankle-toe vectors in the same x-forward frame.
+    prev_left_basis = prev_pelvis_basis.copy()
+    prev_right_basis = prev_pelvis_basis.copy()
+    for t in range(n_frames):
         l_ankle = positions[t, l_ankle_idx]
         l_toe = positions[t, l_toe_idx]
-        l_forward = l_toe - l_ankle
-        l_forward[2] = 0  # Project to ground plane
-        l_forward = l_forward / (np.linalg.norm(l_forward) + 1e-6)
-        
-        l_z = np.array([0, 0, 1])
-        l_x = np.cross(l_forward, l_z)
-        l_x = l_x / (np.linalg.norm(l_x) + 1e-6)
-        l_y = l_forward
-        
-        orientations[t, l_ankle_idx] = np.column_stack([l_x, l_y, l_z])
-        orientations[t, l_toe_idx] = np.column_stack([l_x, l_y, l_z])
-        
-        # Right foot
         r_ankle = positions[t, r_ankle_idx]
         r_toe = positions[t, r_toe_idx]
-        r_forward = r_toe - r_ankle
-        r_forward[2] = 0
-        r_forward = r_forward / (np.linalg.norm(r_forward) + 1e-6)
-        
-        r_z = np.array([0, 0, 1])
-        r_x = np.cross(r_forward, r_z)
-        r_x = r_x / (np.linalg.norm(r_x) + 1e-6)
-        r_y = r_forward
-        
-        orientations[t, r_ankle_idx] = np.column_stack([r_x, r_y, r_z])
-        orientations[t, r_toe_idx] = np.column_stack([r_x, r_y, r_z])
-    
+
+        pelvis_basis = orientations[t, pelvis_idx]
+
+        l_forward = _project_ground(l_toe - l_ankle)
+        l_forward = _normalize(l_forward, pelvis_basis[:, 0])
+        if np.dot(l_forward, pelvis_basis[:, 0]) < 0.0:
+            l_forward = -l_forward
+        l_basis = _orthonormalize_basis(
+            x_axis=l_forward,
+            y_axis=np.cross(np.array([0.0, 0.0, 1.0], dtype=np.float32), l_forward),
+            z_axis=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+        )
+        if np.dot(l_basis[:, 0], prev_left_basis[:, 0]) < 0.0:
+            l_basis[:, :2] *= -1.0
+        orientations[t, l_ankle_idx] = l_basis
+        orientations[t, l_toe_idx] = l_basis
+        prev_left_basis = l_basis
+
+        r_forward = _project_ground(r_toe - r_ankle)
+        r_forward = _normalize(r_forward, pelvis_basis[:, 0])
+        if np.dot(r_forward, pelvis_basis[:, 0]) < 0.0:
+            r_forward = -r_forward
+        r_basis = _orthonormalize_basis(
+            x_axis=r_forward,
+            y_axis=np.cross(np.array([0.0, 0.0, 1.0], dtype=np.float32), r_forward),
+            z_axis=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+        )
+        if np.dot(r_basis[:, 0], prev_right_basis[:, 0]) < 0.0:
+            r_basis[:, :2] *= -1.0
+        orientations[t, r_ankle_idx] = r_basis
+        orientations[t, r_toe_idx] = r_basis
+        prev_right_basis = r_basis
+
     return orientations
 
 
@@ -232,15 +290,27 @@ def extract_foot_contacts(
     r_ankle_vel, r_ankle_acc = calculate_kinematics(r_ankle_pos, fps)
     r_toe_vel, r_toe_acc = calculate_kinematics(r_toe_pos, fps)
     
-    # Detect contacts
+    # Detect joint-level support signals.
     l_ankle_contact = detect_foot_contacts(l_ankle_pos, l_ankle_vel, l_ankle_acc)
     l_toe_contact = detect_foot_contacts(l_toe_pos, l_toe_vel, l_toe_acc)
     r_ankle_contact = detect_foot_contacts(r_ankle_pos, r_ankle_vel, r_ankle_acc)
     r_toe_contact = detect_foot_contacts(r_toe_pos, r_toe_vel, r_toe_acc)
-    
-    # Stack into output format
-    left_foot_contacts = np.stack([l_ankle_contact, l_toe_contact], axis=1).astype(float)
-    right_foot_contacts = np.stack([r_ankle_contact, r_toe_contact], axis=1).astype(float)
+
+    # The ankle joint never reaches the floor in this dataset, but during stance the
+    # whole foot should be stabilized. Promote the foot-level support phase to both
+    # ankle and toe channels so downstream retargeting penalizes slip on the full foot.
+    left_foot_contact = binary_closing(
+        np.logical_or(l_ankle_contact, l_toe_contact), structure=np.ones(5)
+    )
+    left_foot_contact = binary_opening(left_foot_contact, structure=np.ones(3))
+
+    right_foot_contact = binary_closing(
+        np.logical_or(r_ankle_contact, r_toe_contact), structure=np.ones(5)
+    )
+    right_foot_contact = binary_opening(right_foot_contact, structure=np.ones(3))
+
+    left_foot_contacts = np.repeat(left_foot_contact[:, None], 2, axis=1).astype(float)
+    right_foot_contacts = np.repeat(right_foot_contact[:, None], 2, axis=1).astype(float)
     
     return left_foot_contacts, right_foot_contacts
 

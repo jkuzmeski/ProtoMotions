@@ -1,146 +1,128 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2025 The ProtoMotions Developers
+# SPDX-FileCopyrightText: Copyright (c) 2026 The ProtoMotions Developers
 # SPDX-License-Identifier: Apache-2.0
-"""
-Biomechanics Motion Processing Pipeline
+"""Production single-subject biomechanics retargeting pipeline."""
 
-This module provides a complete pipeline for processing treadmill motion capture data
-into ProtoMotions-compatible MotionLib format. The pipeline supports lower-body
-SMPL humanoid models and integrates with the local retargeting solver for
-trajectory optimization-based retargeting.
+from __future__ import annotations
 
-Pipeline Steps:
-    1. Treadmill to Overground: Convert treadmill motions to overground locomotion
-    2. Extract Keypoints: Convert positions to retargeter-compatible keypoint format
-    3. Retarget Motions: Trajectory-level kinematic optimization to target robot
-    4. Convert to ProtoMotions: Generate .motion files from retargeted data
-    5. Package MotionLib: Create .pt file for training
-
-Usage:
-    # Run the complete pipeline
-    python biomechanics_retarget/pipeline.py \\
-        --input-dir ./treadmill_data/S02 \\
-        --output-dir ./processed_data/S02 \\
-        --model-xml ./rescale/smpl_humanoid_lower_body_adjusted_pd.xml \\
-        --fps 200
-
-    # Run individual steps
-    python biomechanics_retarget/pipeline.py \\
-        --input-dir ./treadmill_data/S02 \\
-        --output-dir ./processed_data/S02 \\
-        --model-xml ./rescale/smpl_humanoid_lower_body_adjusted_pd.xml \\
-        --step overground  # or: keypoints, retarget, convert, package
-
-Author: BioMotions Team
-"""
-
-import json
-import os
-import sys
-from pathlib import Path
-from typing import Any, Optional, List, Tuple
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
+import json
+from pathlib import Path
+import shutil
+import sys
+from typing import Any
 
-import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-HUMAN_RETARGET_ROOT = Path(__file__).resolve().parents[1]
+if __package__ in {None, ""} and str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-# Ensure local modules can be imported
-sys.path.append(str(Path(__file__).parent))
-# Ensure data/scripts can be imported (for motion_filter)
-sys.path.append(str(REPO_ROOT / "data" / "scripts"))
+import numpy as np
+import typer
+from rich.console import Console
 
-try:
-    import typer
-    from rich.console import Console
-    from rich.progress import Progress, TaskID
-    from rich.panel import Panel
-except ImportError as e:
-    print("❌ Missing required dependencies.")
-    print("\nPlease install with:")
-    print("  pip install typer rich numpy scipy pandas")
-    print("\nOr if using conda:")
-    print("  conda install typer rich numpy scipy pandas -c conda-forge")
-    print(f"\nMissing module: {e}")
-    sys.exit(1)
+from HumanRetargeting.biomechanics_retarget.contact_sources import load_trial_contacts
+from HumanRetargeting.biomechanics_retarget.stages.assets import (
+    build_subject_assets,
+    resolve_subject_profile,
+)
+from HumanRetargeting.biomechanics_retarget.stages.convert import (
+    run_motion_conversion,
+)
+from HumanRetargeting.biomechanics_retarget.stages.keypoints import (
+    run_keypoint_extraction,
+)
+from HumanRetargeting.biomechanics_retarget.stages.overground import (
+    run_overground_trial,
+)
+from HumanRetargeting.biomechanics_retarget.stages.package import (
+    create_motion_manifest,
+    package_motion_library,
+)
+from HumanRetargeting.biomechanics_retarget.stages.retarget import (
+    resolve_pyroki_runtime,
+    run_pyroki_retarget_trial,
+    verify_pyroki_runtime,
+)
+from HumanRetargeting.biomechanics_retarget.subject_assets import SubjectAssets
+from HumanRetargeting.biomechanics_retarget.subject_profiles import SubjectProfile
+from HumanRetargeting.biomechanics_retarget.validation import (
+    ensure_validation_passed,
+    validate_motion_file,
+    validate_packaged_motion_lib,
+    validate_retargeted_npz,
+    write_validation_report,
+)
+
 
 console = Console()
 app = typer.Typer(pretty_exceptions_enable=False)
 
-try:
-    from .contact_sources import load_trial_contacts
-    from .subject_assets import SubjectAssetBuilder
-    from .subject_profiles import SubjectProfile, load_subject_profile
-except ImportError:
-    from contact_sources import load_trial_contacts
-    from subject_assets import SubjectAssetBuilder
-    from subject_profiles import SubjectProfile, load_subject_profile
-
 
 class PipelineStep(str, Enum):
-    """Pipeline execution steps."""
+    """Supported production pipeline stages."""
+
+    ASSETS = "assets"
     OVERGROUND = "overground"
     KEYPOINTS = "keypoints"
     RETARGET = "retarget"
     CONVERT = "convert"
-    FILTER = "filter"
     PACKAGE = "package"
-    CHECK = "check"
     ALL = "all"
 
 
-@dataclass
+@dataclass(slots=True)
 class PipelineConfig:
-    """Configuration for the biomechanics pipeline."""
+    """Configuration for one single-subject pipeline run."""
+
     input_dir: Path
     output_dir: Path
-    model_xml: Path
-    fps: int = 200
-    output_fps: int = 30
-    coordinate_transform: str = "y_to_x_forward"
-    speed_override: Optional[float] = None
-    auto_scale: bool = True
-    scale_override: Optional[float] = None
-    force_remake: bool = False
-    clean_intermediate: bool = False
-    subject_height_cm: Optional[int] = None  # Auto model selection
-    model_variant: str = "adjusted_pd"  # adjusted_pd or adjusted_torque
-    retarget_python: Optional[Path] = None  # Optional interpreter override for the retarget step
-    retarget_urdf_path: Optional[Path] = None  # Optional URDF override for retargeting
-    apply_motion_filter: bool = True  # Apply motion quality filter
-    filter_config: Optional[Path] = None  # Motion quality filter config
-    subject_profile: SubjectProfile | None = None
-    contact_source: str = "auto"
-    asset_root: Optional[Path] = None
-    subject_assets: dict[str, Any] | None = None
-    
-    # Derived paths
+    subject_profile_path: Path | None
+    height_cm: int | None
+    subject_id: str | None
+    model_variant: str
+    fps: int
+    output_fps: int
+    coordinate_transform: str
+    contact_source: str
+    step: PipelineStep
+    force: bool
+    pyroki_python: Path | None
+    pyroki_script: Path | None
+    assets_root: Path
+    rescale_dir: Path
+    qc_config_file: Path
+    export_profile: Path | None = None
+
+    @property
+    def profile_output_path(self) -> Path:
+        return self.output_dir / "profile.yaml"
+
     @property
     def overground_dir(self) -> Path:
         return self.output_dir / "overground_data"
-    
+
     @property
     def keypoints_dir(self) -> Path:
         return self.output_dir / "keypoints"
-    
+
     @property
     def contacts_dir(self) -> Path:
         return self.output_dir / "contacts"
-    
+
     @property
     def retargeted_dir(self) -> Path:
         return self.output_dir / "retargeted_motions"
-    
+
     @property
     def motion_dir(self) -> Path:
         return self.output_dir / "motion_files"
-    
+
     @property
     def yaml_dir(self) -> Path:
         return self.output_dir / "yaml_data"
-    
+
     @property
     def packaged_dir(self) -> Path:
         return self.output_dir / "packaged_data"
@@ -148,14 +130,30 @@ class PipelineConfig:
     @property
     def qc_dir(self) -> Path:
         return self.output_dir / "qc"
-    
+
     @property
-    def model_name(self) -> str:
-        return self.model_xml.stem.replace("_", "-")
-    
-    def create_directories(self):
-        """Create all output directories."""
-        for dir_path in [
+    def qc_keypoints_dir(self) -> Path:
+        return self.qc_dir / "keypoints"
+
+    @property
+    def qc_retarget_dir(self) -> Path:
+        return self.qc_dir / "retarget"
+
+    @property
+    def qc_motion_dir(self) -> Path:
+        return self.qc_dir / "motion"
+
+    @property
+    def qc_package_dir(self) -> Path:
+        return self.qc_dir / "package"
+
+    @property
+    def subject_summary_path(self) -> Path:
+        return self.qc_dir / "subject_summary.json"
+
+    def create_directories(self) -> None:
+        for path in (
+            self.output_dir,
             self.overground_dir,
             self.keypoints_dir,
             self.contacts_dir,
@@ -163,114 +161,176 @@ class PipelineConfig:
             self.motion_dir,
             self.yaml_dir,
             self.packaged_dir,
-            self.qc_dir,
-        ]:
-            dir_path.mkdir(parents=True, exist_ok=True)
+            self.qc_keypoints_dir,
+            self.qc_retarget_dir,
+            self.qc_motion_dir,
+            self.qc_package_dir,
+        ):
+            path.mkdir(parents=True, exist_ok=True)
 
 
-class BiomechanicsPipeline:
-    """Main pipeline class for processing treadmill motion data."""
-    
-    def __init__(self, config: PipelineConfig):
+@dataclass(slots=True)
+class SubjectContext:
+    """Resolved subject-specific production context."""
+
+    profile: SubjectProfile
+    profile_path: Path
+    generated_profile: bool
+    assets: SubjectAssets | None = None
+    robot_name: str | None = None
+    assets_summary: dict[str, Any] | None = None
+
+    @property
+    def model_xml(self) -> Path:
+        if self.assets is None:
+            raise RuntimeError("Subject assets have not been built yet")
+        return self.assets.mjcf_path
+
+    @property
+    def retarget_urdf(self) -> Path:
+        if self.assets is None:
+            raise RuntimeError("Subject assets have not been built yet")
+        return self.assets.urdf_path
+
+
+class ProductionPipeline:
+    """Single-subject production pipeline with explicit contract validation."""
+
+    def __init__(self, config: PipelineConfig) -> None:
         self.config = config
         self.config.create_directories()
-        self.subject_summary_path = self.config.qc_dir / "subject_summary.json"
-        
-    def find_input_files(self) -> List[Path]:
-        """Find all .txt motion files in the input directory."""
-        if self.config.subject_profile is not None:
-            txt_files = list(self.config.input_dir.glob(self.config.subject_profile.trial_glob))
-        else:
-            txt_files = list(self.config.input_dir.glob("**/*.txt"))
-        console.print(f"Found {len(txt_files)} .txt files in {self.config.input_dir}")
-        return sorted(txt_files)
-    
-    def step_overground(self, progress: Optional[Progress] = None, task_id: Optional[TaskID] = None) -> List[Path]:
-        """Step 1: Transform treadmill motions to overground."""
-        from treadmill2overground import process_motion_file
-        
-        console.print("\n[bold blue]Step 1: Transforming treadmill motions to overground[/bold blue]")
-        
-        input_files = self.find_input_files()
-        successful_files = []
-        
-        for i, motion_file in enumerate(input_files):
-            if progress and task_id:
-                progress.update(task_id, completed=i)
-            
-            # Check if output already exists
-            output_file = self.config.overground_dir / f"{motion_file.stem}.npy"
-            if output_file.exists() and not self.config.force_remake:
-                console.print(f"   ⏭️ Skipping {motion_file.name} (already processed)")
-                successful_files.append(output_file)
-                continue
-            
-            console.print(f"   Processing {motion_file.name}...")
-            
-            try:
-                speed_override = self.config.speed_override
-                if self.config.subject_profile is not None:
-                    speed_override = self.config.subject_profile.trial_speed_overrides.get(
-                        motion_file.stem,
-                        speed_override,
-                    )
+        self.context: SubjectContext | None = None
+        self.summary: dict[str, Any] = {
+            "status": "running",
+            "step": self.config.step.value,
+            "input_dir": str(self.config.input_dir.resolve()),
+            "output_dir": str(self.config.output_dir.resolve()),
+            "qc_config_file": str(self.config.qc_config_file.resolve()),
+        }
+        self._summary_written = False
 
-                success = process_motion_file(
-                    motion_file=motion_file,
-                    output_dir=self.config.overground_dir,
-                    fps=self.config.fps,
-                    coordinate_transform=self.config.coordinate_transform,
-                    speed_override=speed_override,
-                )
-                
-                if success:
-                    # Find the generated .npy file
-                    expected_npy = self.config.overground_dir / f"{motion_file.stem}.npy"
-                    if expected_npy.exists():
-                        successful_files.append(expected_npy)
-                        console.print(f"   ✅ Successfully processed {motion_file.name}")
-                    else:
-                        console.print(f"   ⚠️ Expected output file not found: {expected_npy}")
-                else:
-                    console.print(f"   ❌ Failed to process {motion_file.name}")
-                    
-            except Exception as e:
-                console.print(f"   ❌ Error processing {motion_file.name}: {e}")
-                continue
-        
-        if progress and task_id:
-            progress.update(task_id, completed=len(input_files))
-        
-        console.print(f"\n✅ Overground transformation completed. {len(successful_files)} files successful.")
-        return successful_files
-    
-    def _write_qc_report(self, stem: str, payload: dict[str, Any]) -> None:
-        report_path = self.config.qc_dir / f"{stem}.json"
-        report_path.write_text(
-            json.dumps(payload, indent=2, sort_keys=True),
-            encoding="utf-8",
+    def _write_json(self, output_file: Path, payload: dict[str, Any]) -> None:
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        output_file.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+    def _write_subject_summary(self) -> None:
+        self._write_json(self.config.subject_summary_path, self.summary)
+        self._summary_written = True
+
+    def _resolve_subject_context(self) -> SubjectContext:
+        if self.context is not None:
+            return self.context
+
+        profile, profile_path, generated = resolve_subject_profile(
+            input_dir=self.config.input_dir,
+            output_dir=self.config.output_dir,
+            subject_profile_path=self.config.subject_profile_path,
+            height_cm=self.config.height_cm,
+            subject_id=self.config.subject_id,
+            model_variant=self.config.model_variant,
+            fps=self.config.fps,
+            output_fps=self.config.output_fps,
+            coordinate_transform=self.config.coordinate_transform,
+            contact_source=self.config.contact_source,
         )
+        if self.config.export_profile is not None:
+            self.config.export_profile.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(profile_path, self.config.export_profile)
+
+        self.context = SubjectContext(
+            profile=profile,
+            profile_path=profile_path,
+            generated_profile=generated,
+        )
+        self.summary.update(
+            {
+                "subject_id": profile.subject_id,
+                "profile_path": str(profile_path),
+                "generated_profile": generated,
+                "robot_name": f"smpl_lower_body_subject_{profile.subject_id}",
+            }
+        )
+        self._write_subject_summary()
+        return self.context
+
+    def _ensure_assets(self) -> SubjectContext:
+        context = self._resolve_subject_context()
+        if context.assets is not None:
+            return context
+
+        assets, robot_name, assets_summary = build_subject_assets(
+            profile=context.profile,
+            rescale_dir=self.config.rescale_dir,
+            assets_root=self.config.assets_root,
+            force=self.config.force,
+        )
+        context.assets = assets
+        context.robot_name = robot_name
+        context.assets_summary = assets_summary
+        self.summary.update(
+            {
+                "robot_name": robot_name,
+                "assets": assets_summary,
+                "model_xml": str(assets.mjcf_path),
+                "retarget_urdf": str(assets.urdf_path),
+            }
+        )
+        self._write_subject_summary()
+        return context
+
+    def _find_input_trials(self) -> list[Path]:
+        context = self._resolve_subject_context()
+        trials = sorted(context.profile.input_dir.glob(context.profile.trial_glob))
+        if not trials:
+            raise FileNotFoundError(
+                f"No treadmill motion files matched {context.profile.trial_glob!r} in "
+                f"{context.profile.input_dir}"
+            )
+        return trials
+
+    def _write_keypoint_report(
+        self,
+        *,
+        trial_stem: str,
+        keypoint_file: Path,
+        payload: dict[str, Any],
+    ) -> None:
+        report = {
+            "passed": True,
+            "failures": [],
+            "trial": trial_stem,
+            "keypoint_file": str(keypoint_file),
+            **payload,
+        }
+        self._write_json(self.config.qc_keypoints_dir / f"{trial_stem}.json", report)
 
     def _apply_contact_source_to_keypoints(self, keypoint_file: Path) -> None:
-        if self.config.subject_profile is None:
-            self._write_qc_report(
-                f"{keypoint_file.stem}_keypoints_qc",
-                {"contact_source": "heuristic", "external_contact_path": None},
-            )
-            return
-
+        context = self._resolve_subject_context()
         keypoint_data = np.load(keypoint_file, allow_pickle=True).item()
-        resolved = load_trial_contacts(
-            profile=self.config.subject_profile,
-            trial_stem=keypoint_file.stem,
-            expected_frames=len(keypoint_data["positions"]),
-        )
+        positions = np.asarray(keypoint_data["positions"], dtype=np.float32)
         payload: dict[str, Any] = {
-            "contact_source": "heuristic",
-            "external_contact_path": None,
+            "metrics": {
+                "num_frames": int(positions.shape[0]),
+                "num_keypoints": int(positions.shape[1]),
+            }
         }
+
+        resolved = load_trial_contacts(
+            profile=context.profile,
+            trial_stem=keypoint_file.stem,
+            expected_frames=len(positions),
+        )
         if resolved is None:
-            self._write_qc_report(f"{keypoint_file.stem}_keypoints_qc", payload)
+            keypoint_data["contact_source"] = "heuristic"
+            keypoint_data["external_contact_path"] = None
+            np.save(keypoint_file, keypoint_data)
+            payload["contact_source"] = "heuristic"
+            payload["external_contact_path"] = None
+            self._write_keypoint_report(
+                trial_stem=keypoint_file.stem,
+                keypoint_file=keypoint_file,
+                payload=payload,
+            )
             return
 
         left_contacts, right_contacts, source_name = resolved
@@ -279,11 +339,8 @@ class BiomechanicsPipeline:
             len(left_contacts),
             len(right_contacts),
         )
-        payload["external_contact_path"] = source_name
-        if min_len == 0:
-            payload["contact_source"] = "empty_external_contacts"
-            self._write_qc_report(f"{keypoint_file.stem}_keypoints_qc", payload)
-            return
+        if min_len <= 0:
+            raise RuntimeError(f"Resolved empty external contacts for {keypoint_file.name}")
 
         keypoint_data["positions"] = keypoint_data["positions"][:min_len]
         keypoint_data["orientations"] = keypoint_data["orientations"][:min_len]
@@ -294,811 +351,451 @@ class BiomechanicsPipeline:
         np.save(keypoint_file, keypoint_data)
 
         payload["contact_source"] = "kinetics"
-        payload["external_contact_shape"] = [min_len, 2]
-        self._write_qc_report(f"{keypoint_file.stem}_keypoints_qc", payload)
+        payload["external_contact_path"] = source_name
+        payload["metrics"]["num_frames"] = min_len
+        payload["metrics"]["external_contact_shape"] = [int(min_len), 2]
+        self._write_keypoint_report(
+            trial_stem=keypoint_file.stem,
+            keypoint_file=keypoint_file,
+            payload=payload,
+        )
 
-    def step_keypoints(self, overground_files: Optional[List[Path]] = None) -> List[Path]:
-        """Step 2: Convert overground positions to retargeter-compatible keypoints."""
-        from extract_keypoints_from_overground import extract_keypoints_for_retargeting
-        
-        console.print("\n[bold blue]Step 2: Extracting keypoints for retargeting[/bold blue]")
-        
-        if overground_files is None:
-            overground_files = list(self.config.overground_dir.glob("*.npy"))
-        
-        successful_files = []
-        
-        for motion_file in overground_files:
-            output_file = self.config.keypoints_dir / f"{motion_file.stem}.npy"
-            
-            if output_file.exists() and not self.config.force_remake:
-                console.print(f"   ⏭️ Skipping {motion_file.name} (already processed)")
-                successful_files.append(output_file)
-                continue
-            
-            console.print(f"   Extracting keypoints from {motion_file.name}...")
-            
-            try:
-                extract_keypoints_for_retargeting(
-                    input_file=motion_file,
-                    output_file=output_file,
-                    fps=self.config.fps,
-                    output_fps=self.config.output_fps,
-                )
-                self._apply_contact_source_to_keypoints(output_file)
-                successful_files.append(output_file)
-                console.print(f"   ✅ Extracted keypoints to {output_file.name}")
-            except Exception as e:
-                console.print(f"   ❌ Error extracting keypoints from {motion_file.name}: {e}")
-                continue
-        
-        console.print(f"\n✅ Keypoint extraction completed. {len(successful_files)} files successful.")
-        return successful_files
-    
-    def _resolve_retarget_script(self, project_root: Path) -> tuple[Path | None, str]:
-        script_names = [
-            ("batch_retarget_lower_body.py", "treadmill"),
-            ("batch_retarget_to_smpl_from_keypoints.py", "smpl"),
-        ]
-        for script_name, source_type in script_names:
-            matches = sorted(project_root.rglob(script_name))
-            if matches:
-                return matches[0], source_type
-        return None, "smpl"
-
-    def step_retarget(self, keypoint_files: Optional[List[Path]] = None) -> List[Path]:
-        """Step 3: Retarget keypoints to the target robot."""
-        import subprocess
-
-        console.print("\n[bold blue]Step 3: Retargeting motions[/bold blue]")
-        
-        # Check for existing retargeted files first
-        retargeted_files = list(self.config.retargeted_dir.glob("*_retargeted.npz"))
-        
-        # If retargeted files exist and not forcing remake, skip retargeting
-        if retargeted_files and not self.config.force_remake:
-            console.print(f"✅ Found {len(retargeted_files)} retargeted motion files (skipping).")
-            return retargeted_files
-        
-        retarget_python = self._resolve_retarget_python()
-        retarget_script, source_type = self._resolve_retarget_script(REPO_ROOT)
-        if retarget_script is None:
-            console.print("[red]No retarget script found for the lower-body pipeline.[/red]")
-            return []
-
-        console.print(f"🔄 Running retargeter with: {retarget_python}")
-        
-        try:
-
-            if not retarget_script.exists():
-                console.print(f"[red]❌ Retarget script not found: "
-                              f"{retarget_script}[/red]")
-                return []
-            
-            cmd = [
-                str(retarget_python),
-                str(retarget_script),
-                "--keypoints-folder-path", str(self.config.keypoints_dir),
-                "--output-dir", str(self.config.retargeted_dir),
-                "--source-type", source_type,
-                "--retarget-fps", str(self.config.output_fps),
-                "--target-raw-frames", "-1",
-                "--no-visualize",
-                "--skip-existing",
-            ]
-
-            if self.config.retarget_urdf_path is not None:
-                cmd.extend(["--urdf-path", str(self.config.retarget_urdf_path)])
-            
-            console.print("   Running retargeting...")
-            console.print(f"   Script: {retarget_script}")
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            
-            if result.returncode != 0:
-                console.print("[red]❌ Retargeting failed:[/red]")
-                console.print(result.stderr)
-                return []
-            
-            # Step 2: Extract contact labels
-            console.print(f"   Extracting contact labels...")
-            cmd = [
-                str(retarget_python),
-                str(retarget_script),
-                "--keypoints-folder-path", str(self.config.keypoints_dir),
-                "--contacts-dir", str(self.config.contacts_dir),
-                "--source-type", source_type,
-                "--retarget-fps", str(self.config.output_fps),
-                "--target-raw-frames", "-1",
-                "--save-contacts-only",
-                "--skip-existing",
-            ]
-
-            if self.config.retarget_urdf_path is not None:
-                cmd.extend(["--urdf-path", str(self.config.retarget_urdf_path)])
-            
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                console.print(f"[yellow]⚠️ Contact extraction had issues (continuing):[/yellow]")
-                console.print(result.stderr)
-            
-            # Check results
-            retargeted_files = list(self.config.retargeted_dir.glob("*_retargeted.npz"))
-            if retargeted_files:
-                console.print(f"✅ Retargeting complete: {len(retargeted_files)} files")
+    def _resolve_stage_inputs(self, directory: Path, suffix: str) -> list[Path]:
+        input_trials = self._find_input_trials()
+        files: list[Path] = []
+        missing: list[str] = []
+        for trial in input_trials:
+            stage_file = directory / f"{trial.stem}{suffix}"
+            if not stage_file.exists():
+                missing.append(stage_file.name)
             else:
-                console.print(f"[red]❌ No retargeted files created[/red]")
-            
-            return retargeted_files
-            
-        except Exception as e:
-            console.print(f"[red]❌ Error running retargeter: {e}[/red]")
-            return []
+                files.append(stage_file)
+        if missing:
+            raise FileNotFoundError(
+                f"Missing required stage inputs in {directory}: {', '.join(missing)}"
+            )
+        return files
 
-    def _resolve_retarget_python(self) -> Path:
-        """Resolve the interpreter used for the retarget step."""
-        if self.config.retarget_python is not None:
-            return Path(self.config.retarget_python)
-        return Path(sys.executable)
-    
-    def step_convert(self, retargeted_files: Optional[List[Path]] = None) -> List[Path]:
-        """Step 4: Convert retargeted motions to ProtoMotions .motion format."""
-        from convert_retargeted_to_motion import convert_npz_to_motion
-        
-        console.print("\n[bold blue]Step 4: Converting to ProtoMotions format[/bold blue]")
-        
-        if retargeted_files is None:
-            retargeted_files = list(self.config.retargeted_dir.glob("*_retargeted.npz"))
-        
-        successful_files = []
-        
-        for motion_file in retargeted_files:
-            base_name = motion_file.stem.replace("_retargeted", "")
-            output_file = self.config.motion_dir / f"{base_name}.motion"
-            
-            if output_file.exists() and not self.config.force_remake:
-                console.print(f"   ⏭️ Skipping {motion_file.name} (already converted)")
-                successful_files.append(output_file)
+    def run_assets(self) -> SubjectContext:
+        context = self._ensure_assets()
+        self.summary["completed_step"] = PipelineStep.ASSETS.value
+        self.summary["status"] = "ok"
+        self._write_subject_summary()
+        return context
+
+    def run_overground(self) -> list[Path]:
+        context = self._resolve_subject_context()
+        output_files: list[Path] = []
+        for motion_file in self._find_input_trials():
+            output_file = self.config.overground_dir / f"{motion_file.stem}.npy"
+            if output_file.exists() and not self.config.force:
+                output_files.append(output_file)
                 continue
-            
-            # Find corresponding contact file
-            contact_file = self.config.contacts_dir / f"{base_name}_contacts.npz"
-            
-            console.print(f"   Converting {motion_file.name}...")
-            
-            try:
-                # Updated call signature to match convert_retargeted_to_motion.py
-                # Note: Retargeted motions are at output_fps (keypoints are downsampled)
-                success = convert_npz_to_motion(
-                    npz_file=motion_file,
+            converted = run_overground_trial(
+                motion_file=motion_file,
+                output_dir=self.config.overground_dir,
+                fps=context.profile.fps,
+                coordinate_transform=context.profile.coordinate_transform,
+                speed_override=context.profile.trial_speed_override(motion_file.stem),
+            )
+            if converted is None:
+                raise RuntimeError(f"Overground conversion failed for {motion_file.name}")
+            output_files.append(converted)
+
+        self.summary["completed_step"] = PipelineStep.OVERGROUND.value
+        self.summary["num_overground_files"] = len(output_files)
+        self._write_subject_summary()
+        return output_files
+
+    def run_keypoints(self) -> list[Path]:
+        context = self._resolve_subject_context()
+        overground_files = self._resolve_stage_inputs(self.config.overground_dir, ".npy")
+        output_files: list[Path] = []
+        for overground_file in overground_files:
+            output_file = self.config.keypoints_dir / overground_file.name
+            if not output_file.exists() or self.config.force:
+                run_keypoint_extraction(
+                    input_file=overground_file,
                     output_file=output_file,
-                    model_xml=self.config.model_xml,
-                    input_fps=self.config.output_fps,  # Retargeted data is at output_fps
-                    output_fps=self.config.output_fps,
-                    contact_file=contact_file if contact_file.exists() else None,
-                    apply_motion_filter=self.config.apply_motion_filter,
-                    height_offset=0.0,  # Ground the robot (feet on floor)
+                    fps=context.profile.fps,
+                    output_fps=context.profile.output_fps,
                 )
-                if success:
-                    successful_files.append(output_file)
-                    console.print(f"   ✅ Converted to {output_file.name}")
-                else:
-                    console.print(f"   ⚠️ Skipped {motion_file.name} (filtered out)")
-            except Exception as e:
-                console.print(f"   ❌ Error converting {motion_file.name}: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
-        
-        console.print(f"\n✅ Conversion completed. {len(successful_files)} files successful.")
-        return successful_files
-    
-    def step_check(self) -> None:
-        """Run validation checks on pipeline outputs."""
-        import subprocess
-        
-        console.print("\n[bold blue]Step: Validation Checks[/bold blue]")
-        
-        # Check keypoints
-        keypoint_files = list(self.config.keypoints_dir.glob("*.npy"))
-        if keypoint_files:
-            console.print(f"   Checking {len(keypoint_files)} keypoint files...")
-            for kf in keypoint_files:
-                cmd = [sys.executable, str(Path(__file__).parent / "check_pipeline_data.py"), "keypoints", str(kf)]
-                subprocess.run(cmd)
-        else:
-            console.print("   ⚠️ No keypoint files found to check.")
+            self._apply_contact_source_to_keypoints(output_file)
+            output_files.append(output_file)
 
-        # Check retargeted
-        retargeted_files = list(self.config.retargeted_dir.glob("*_retargeted.npz"))
-        if retargeted_files:
-            console.print(f"   Checking {len(retargeted_files)} retargeted files...")
-            for rf in retargeted_files:
-                cmd = [sys.executable, str(Path(__file__).parent / "check_pipeline_data.py"), "retargeted", str(rf), "--model-xml", str(self.config.model_xml)]
-                subprocess.run(cmd)
-        else:
-            console.print("   ⚠️ No retargeted files found to check.")
+        self.summary["completed_step"] = PipelineStep.KEYPOINTS.value
+        self.summary["num_keypoint_files"] = len(output_files)
+        self._write_subject_summary()
+        return output_files
 
-    def step_filter(self, motion_files: List[Path]) -> List[Path]:
-        """Step: Filter motions based on a configuration file."""
-        console.print("\n[bold blue]Step: Filtering Motions[/bold blue]")
+    def run_retarget(self) -> list[Path]:
+        context = self._ensure_assets()
+        keypoint_files = self._resolve_stage_inputs(self.config.keypoints_dir, ".npy")
+        python_path, script_path = resolve_pyroki_runtime(
+            repo_root=REPO_ROOT,
+            retarget_python=self.config.pyroki_python,
+            retarget_script=self.config.pyroki_script,
+        )
+        console.print(f"PyRoki interpreter: {python_path}")
+        console.print(f"PyRoki retarget script: {script_path}")
+        verify_pyroki_runtime(python_path)
 
-        if not self.config.filter_config:
-            console.print("   ⏭️ Skipping motion filtering (no --filter-config provided).")
-            return motion_files
-        
-        if not self.config.filter_config.exists():
-            console.print(f"   [red]❌ Filter config not found: {self.config.filter_config}[/red]")
-            return []
+        output_files: list[Path] = []
+        for keypoint_file in keypoint_files:
+            npz_file, _contact_file = run_pyroki_retarget_trial(
+                python_path=python_path,
+                script_path=script_path,
+                keypoint_file=keypoint_file,
+                retargeted_dir=self.config.retargeted_dir,
+                contacts_dir=self.config.contacts_dir,
+                retarget_fps=context.profile.output_fps,
+                retarget_urdf_path=context.retarget_urdf,
+                force=self.config.force,
+            )
+            report = validate_retargeted_npz(
+                npz_file=npz_file,
+                keypoint_file=keypoint_file,
+                model_xml=context.model_xml,
+                qc_config_file=self.config.qc_config_file,
+            )
+            report["trial"] = keypoint_file.stem
+            write_validation_report(
+                report,
+                self.config.qc_retarget_dir / f"{keypoint_file.stem}.json",
+            )
+            ensure_validation_passed(
+                report,
+                f"Retarget validation failed for {keypoint_file.stem}",
+            )
+            output_files.append(npz_file)
 
+        self.summary["completed_step"] = PipelineStep.RETARGET.value
+        self.summary["num_retargeted_files"] = len(output_files)
+        self.summary["pyroki_python"] = str(python_path)
+        self.summary["pyroki_script"] = str(script_path)
+        self._write_subject_summary()
+        return output_files
+
+    def run_convert(self) -> list[Path]:
+        context = self._ensure_assets()
+        npz_files = self._resolve_stage_inputs(self.config.retargeted_dir, "_retargeted.npz")
+        output_files: list[Path] = []
+        for npz_file in npz_files:
+            trial_stem = npz_file.stem.removesuffix("_retargeted")
+            output_file = self.config.motion_dir / f"{trial_stem}.motion"
+            contact_file = self.config.contacts_dir / f"{trial_stem}_contacts.npz"
+            if not output_file.exists() or self.config.force:
+                run_motion_conversion(
+                    npz_file=npz_file,
+                    output_file=output_file,
+                    model_xml=context.model_xml,
+                    input_fps=context.profile.output_fps,
+                    output_fps=context.profile.output_fps,
+                    contact_file=contact_file if contact_file.exists() else None,
+                    apply_motion_filter=False,
+                )
+            report = validate_motion_file(
+                motion_file=output_file,
+                model_xml=context.model_xml,
+                qc_config_file=self.config.qc_config_file,
+            )
+            report["trial"] = trial_stem
+            write_validation_report(
+                report,
+                self.config.qc_motion_dir / f"{trial_stem}.json",
+            )
+            ensure_validation_passed(
+                report,
+                f"Motion validation failed for {trial_stem}",
+            )
+            output_files.append(output_file)
+
+        self.summary["completed_step"] = PipelineStep.CONVERT.value
+        self.summary["num_motion_files"] = len(output_files)
+        self._write_subject_summary()
+        return output_files
+
+    def run_package(self) -> Path:
+        context = self._ensure_assets()
+        motion_files = self._resolve_stage_inputs(self.config.motion_dir, ".motion")
+        manifest_file = self.config.yaml_dir / f"motions_{context.profile.subject_id}.yaml"
+        create_motion_manifest(
+            motion_files=motion_files,
+            output_file=manifest_file,
+            fps=context.profile.output_fps,
+        )
+
+        packaged_file = self.config.packaged_dir / f"{context.profile.subject_id}.pt"
+        if self.config.force or not packaged_file.exists():
+            package_motion_library(
+                manifest_file=manifest_file,
+                output_file=packaged_file,
+                device="cpu",
+            )
+
+        report = validate_packaged_motion_lib(
+            packaged_file=packaged_file,
+            expected_motion_files=motion_files,
+        )
+        report["subject_id"] = context.profile.subject_id
+        write_validation_report(report, self.config.qc_package_dir / "package.json")
+        ensure_validation_passed(
+            report,
+            f"Packaged MotionLib validation failed for {context.profile.subject_id}",
+        )
+
+        self.summary["completed_step"] = PipelineStep.PACKAGE.value
+        self.summary["packaged_file"] = str(packaged_file)
+        self.summary["motion_manifest"] = str(manifest_file)
+        self._write_subject_summary()
+        return packaged_file
+
+    def run(self) -> Path | None:
         try:
-            from motion_filter import filter_motions
-        except ImportError:
-            console.print("[red]❌ Could not import 'motion_filter'. Make sure it is in the python path.[/red]")
-            console.print(f"   Attempted to import from: {REPO_ROOT / 'data' / 'scripts'}")
-            return []
+            if self.config.step == PipelineStep.ASSETS:
+                self.run_assets()
+                self.summary["status"] = "ok"
+                self._write_subject_summary()
+                return self.config.profile_output_path
+            if self.config.step == PipelineStep.OVERGROUND:
+                self.run_overground()
+                self.summary["status"] = "ok"
+                self._write_subject_summary()
+                return self.config.overground_dir
+            if self.config.step == PipelineStep.KEYPOINTS:
+                self.run_keypoints()
+                self.summary["status"] = "ok"
+                self._write_subject_summary()
+                return self.config.keypoints_dir
+            if self.config.step == PipelineStep.RETARGET:
+                self.run_retarget()
+                self.summary["status"] = "ok"
+                self._write_subject_summary()
+                return self.config.retargeted_dir
+            if self.config.step == PipelineStep.CONVERT:
+                self.run_convert()
+                self.summary["status"] = "ok"
+                self._write_subject_summary()
+                return self.config.motion_dir
+            if self.config.step == PipelineStep.PACKAGE:
+                packaged_file = self.run_package()
+                self.summary["status"] = "ok"
+                self._write_subject_summary()
+                return packaged_file
 
-        console.print(f"   Using filter configuration: {self.config.filter_config}")
-        
-        # Convert Path objects to strings for the filter function
-        motion_file_paths = [str(p) for p in motion_files]
-        
-        # This function should return a list of file paths that passed the filter
-        kept_files_str = filter_motions(
-            motion_files=motion_file_paths,
-            filter_config_path=str(self.config.filter_config)
-        )
-        
-        kept_files = {Path(p) for p in kept_files_str}
-        all_files = set(motion_files)
-        discarded_files = all_files - kept_files
-
-        console.print(f"   [green]Kept {len(kept_files)} files.[/green]")
-        for file in sorted(list(discarded_files)):
-            console.print(f"      [yellow]Discarded: {file.name}[/yellow]")
-            
-        console.print(f"\n✅ Motion filtering completed.")
-        return sorted(list(kept_files))
-
-    def step_package(self, motion_files: Optional[List[Path]] = None) -> Path:
-        """Step 5: Package motion files into a MotionLib .pt file."""
-        import yaml
-        import torch
-        
-        console.print("\n[bold blue]Step 5: Packaging MotionLib[/bold blue]")
-        
-        if motion_files is None:
-            motion_files = list(self.config.motion_dir.glob("*.motion"))
-        
-        if not motion_files:
-            console.print("❌ No motion files found to package")
-            raise ValueError("No motion files found")
-        
-        # Create YAML configuration
-        yaml_file = self.config.yaml_dir / f"motions_fps_{self.config.model_name}.yaml"
-        self._create_motion_yaml(motion_files, yaml_file)
-        console.print(f"   ✅ Created motion YAML: {yaml_file}")
-        
-        # Package into MotionLib
-        output_file = self.config.packaged_dir / f"{self.config.input_dir.name}.pt"
-        self._package_motion_lib(yaml_file, output_file)
-        console.print(f"   ✅ Packaged MotionLib: {output_file}")
-        
-        return output_file
-    
-    def _create_motion_yaml(self, motion_files: List[Path], output_file: Path) -> None:
-        """Create a YAML file listing all motion files with their FPS."""
-        import yaml
-        import torch
-        
-        motions_list = []
-        
-        for idx, motion_path in enumerate(sorted(motion_files)):
-            # Load motion to get duration
-            try:
-                motion_data = torch.load(motion_path, map_location="cpu", weights_only=False)
-                if isinstance(motion_data, dict) and "rigid_body_pos" in motion_data:
-                    num_frames = motion_data["rigid_body_pos"].shape[0]
-                else:
-                    num_frames = 100  # Default fallback
-            except Exception:
-                num_frames = 100
-            
-            duration = num_frames / self.config.output_fps
-            
-            motion_entry = {
-                "file": str(motion_path.resolve().as_posix()),
-                "fps": self.config.output_fps,
-                "idx": idx,
-                "sub_motions": [{
-                    "idx": idx,
-                    "timings": {
-                        "start": 0.0,
-                        "end": duration
-                    },
-                    "weight": 1.0
-                }]
-            }
-            motions_list.append(motion_entry)
-        
-        yaml_data = {"motions": motions_list}
-        
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_file, "w") as f:
-            yaml.dump(yaml_data, f, default_flow_style=False, indent=2)
-    
-    def _package_motion_lib(self, yaml_file: Path, output_file: Path) -> None:
-        """Package motion files into a MotionLib .pt file."""
-        from protomotions.components.motion_lib import MotionLib, MotionLibConfig
-        
-        # Create motion lib config
-        config = MotionLibConfig(
-            motion_file=str(yaml_file.resolve()),
-            world_size=1,
-        )
-        
-        # Create motion library - it will load all motions from the YAML
-        console.print("   Loading motions into MotionLib...")
-        mlib = MotionLib(config=config, device="cpu")
-        
-        # Save the motion library state
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-        console.print(f"   Saving {mlib.num_motions()} motions to {output_file}")
-        mlib.save_to_file(str(output_file))
-
-    def _write_subject_summary(self, packaged_output: Path | None = None) -> None:
-        motion_files = sorted(self.config.motion_dir.glob("*.motion"))
-        summary = {
-            "subject_id": (
-                self.config.subject_profile.subject_id
-                if self.config.subject_profile is not None
-                else self.config.output_dir.name
-            ),
-            "input_dir": str(self.config.input_dir),
-            "output_dir": str(self.config.output_dir),
-            "model_xml": str(self.config.model_xml),
-            "retarget_urdf_path": (
-                str(self.config.retarget_urdf_path)
-                if self.config.retarget_urdf_path is not None
-                else None
-            ),
-            "contact_source": self.config.contact_source,
-            "subject_assets": self.config.subject_assets,
-            "motion_count": len(motion_files),
-            "packaged_output": str(packaged_output) if packaged_output is not None else None,
-        }
-        self.subject_summary_path.write_text(
-            json.dumps(summary, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-    
-    def run(self, step: PipelineStep = PipelineStep.ALL) -> Optional[Path]:
-        """Run the pipeline or specific step."""
-        console.print(Panel.fit(
-            "[bold green]🏃 Biomechanics Motion Processing Pipeline 🏃[/bold green]",
-            title="BioMotions"
-        ))
-        console.print(f"📁 Input directory: {self.config.input_dir}")
-        console.print(f"📂 Output directory: {self.config.output_dir}")
-        console.print(f"🤖 Target model: {self.config.model_xml}")
-        console.print(f"📊 Input FPS: {self.config.fps}, Output FPS: {self.config.output_fps}")
-        
-        if step == PipelineStep.OVERGROUND:
-            self.step_overground()
-        elif step == PipelineStep.KEYPOINTS:
-            self.step_keypoints()
-        elif step == PipelineStep.RETARGET:
-            self.step_retarget()
-        elif step == PipelineStep.CONVERT:
-            self.step_convert()
-        elif step == PipelineStep.CHECK:
-            self.step_check()
-        elif step == PipelineStep.PACKAGE:
-            packaged = self.step_package()
-            self._write_subject_summary(packaged)
-            return packaged
-        elif step == PipelineStep.ALL:
-            with Progress() as progress:
-                # Step 1: Overground transformation
-                task1 = progress.add_task("Transforming to overground...", total=100)
-                overground_files = self.step_overground(progress, task1)
-                
-                if not overground_files:
-                    console.print("❌ No files successfully transformed to overground")
-                    return None
-                
-                # Step 2: Extract keypoints
-                keypoint_files = self.step_keypoints(overground_files)
-                
-                if not keypoint_files:
-                    console.print("❌ No keypoints successfully extracted")
-                    return None
-                
-                # Step 3: Retarget motions
-                retargeted_files = self.step_retarget(keypoint_files)
-
-                if not retargeted_files:
-                    console.print("\n⚠️ Pipeline paused. Please run the retarget step manually.")
-                    console.print("After retargeting, run: python pipeline.py ... --step convert")
-                    return None
-                
-                # Step 4: Convert to ProtoMotions format
-                motion_files = self.step_convert(retargeted_files)
-                
-                if not motion_files:
-                    console.print("❌ No motion files successfully converted")
-                    return None
-                
-                # Step 5: Package MotionLib
-                output_file = self.step_package(motion_files)
-                self._write_subject_summary(output_file)
-                
-                console.print("\n" + "=" * 60)
-                console.print("[bold green]🎉 Pipeline completed successfully! 🎉[/bold green]")
-                console.print(f"📦 Packaged MotionLib: {output_file}")
-                
-                return output_file
-        
-        return None
+            self.run_assets()
+            self.run_overground()
+            self.run_keypoints()
+            self.run_retarget()
+            self.run_convert()
+            packaged_file = self.run_package()
+            self.summary["status"] = "ok"
+            self._write_subject_summary()
+            return packaged_file
+        except Exception as exc:
+            self.summary["status"] = "failed"
+            self.summary["error"] = str(exc)
+            self._write_subject_summary()
+            raise
 
 
-def get_model_for_height(
-    height_cm: int,
-    variant: str = "adjusted_pd",
-    rescale_dir: Optional[Path] = None,
+def main(
+    input_dir: Path,
+    output_dir: Path,
+    *,
+    subject_profile_path: Path | None = None,
+    height: int | None = None,
+    subject_id: str | None = None,
+    model_variant: str = "adjusted_pd",
+    fps: int = 200,
+    output_fps: int = 30,
+    coordinate_transform: str = "y_to_x_forward",
+    contact_source: str = "heuristic",
+    step: PipelineStep = PipelineStep.ALL,
+    force: bool = False,
+    pyroki_python: Path | None = None,
+    pyroki_script: Path | None = None,
+    export_profile: Path | None = None,
+    qc_config_file: Path | None = None,
+    assets_root: Path | None = None,
+    subject_height: int | None = None,
+    model_xml: Path | None = None,
+    speed_override: float | None = None,
+    auto_scale: bool = True,
+    scale_override: float | None = None,
+    force_remake: bool | None = None,
+    clean_intermediate: bool = False,
+    retarget_python: Path | None = None,
+    retarget_script: Path | None = None,
+    retarget_urdf_path: Path | None = None,
     contact_pads: bool = False,
-) -> Tuple[Path, str]:
-    """
-    Get or create the model file for a given subject height.
-    
-    Args:
-        height_cm: Subject height in centimeters
-        variant: Model variant ('adjusted_pd' or 'adjusted_torque')
-        rescale_dir: Directory containing model files
-        
-    Returns:
-        Tuple of (model_xml_path, robot_name)
-    """
-    if rescale_dir is None:
-        rescale_dir = HUMAN_RETARGET_ROOT / "rescale"
-    
-    # Construct expected filename
-    base_name = f"smpl_humanoid_lower_body_{variant}"
-    height_name = f"{base_name}_height_{height_cm}cm"
-    model_stem = f"{height_name}{'_contact_pads' if contact_pads else ''}"
-    model_path = rescale_dir / f"{model_stem}.xml"
-    
-    # Robot name for factory
-    robot_name = f"smpl_lower_body_{height_cm}cm"
-    if contact_pads:
-        robot_name += "_contact_pads"
-    if variant == "adjusted_torque":
-        robot_name += "_torque"
+) -> Path | None:
+    """Run the production single-subject pipeline.
 
-    # Prefer the already-generated assets under protomotions/data/assets/mjcf
-    assets_mjcf_dir = (
+    Deprecated keyword arguments are accepted so legacy wrappers can still call
+    into the production path, but they are not part of the supported CLI.
+    """
+    del model_xml, speed_override, auto_scale, scale_override, clean_intermediate, retarget_urdf_path
+    del contact_pads
+
+    if force_remake is not None:
+        force = force_remake
+    if retarget_python is not None and pyroki_python is None:
+        pyroki_python = retarget_python
+    if retarget_script is not None and pyroki_script is None:
+        pyroki_script = retarget_script
+    if height is None and subject_height is not None:
+        height = subject_height
+
+    if subject_profile_path is None and height is None:
+        raise ValueError("Provide either --subject-profile or --height")
+    if subject_profile_path is not None and height is not None:
+        raise ValueError("Use either --subject-profile or --height, not both")
+
+    qc_config = qc_config_file or (
+        REPO_ROOT
+        / "HumanRetargeting"
+        / "biomechanics_retarget"
+        / "config"
+        / "qc_thresholds.yaml"
+    )
+    assets_root = assets_root or (
         REPO_ROOT
         / "protomotions"
         / "data"
         / "assets"
-        / "mjcf"
-    )
-    assets_model_path = assets_mjcf_dir / f"{model_stem}.xml"
-    if assets_model_path.exists():
-        console.print(
-            f"✅ Found model for {height_cm}cm in assets: {assets_model_path.name}"
-        )
-        return assets_model_path, robot_name
-    
-    # Check if model exists in rescale directory
-    if model_path.exists():
-        console.print(f"✅ Found model for {height_cm}cm: {model_path.name}")
-        return model_path, robot_name
-    
-    # Try to create it
-    console.print(f"⚠️ Model for {height_cm}cm not found, attempting to create...")
-    
-    try:
-        # Import from the same directory as this file
-        import sys
-        current_dir = Path(__file__).parent
-        if str(current_dir) not in sys.path:
-            sys.path.insert(0, str(current_dir))
-        
-        from quick_rescale import QuickRescaler
-        
-        rescaler = QuickRescaler(
-            height_cm=height_cm,
-            variant=variant,
-            rescale_dir=rescale_dir,
-        )
-        
-        rescaler.run(force_overwrite=False)
-
-        # After attempting creation (or skipping because files exist), re-check.
-        if model_path.exists():
-            console.print(f"✅ Using model for {height_cm}cm: {model_path.name}")
-            _create_robot_config_for_height(
-                height_cm, variant, robot_name, contact_pads=contact_pads
-            )
-            return model_path, robot_name
-
-        if assets_model_path.exists():
-            console.print(
-                f"✅ Using model for {height_cm}cm in assets: {assets_model_path.name}"
-            )
-            _create_robot_config_for_height(
-                height_cm, variant, robot_name, contact_pads=contact_pads
-            )
-            return assets_model_path, robot_name
-    except ImportError as e:
-        console.print(f"   Could not import rescaling module: {e}")
-    except Exception as e:
-        console.print(f"   Rescaling failed: {e}")
-        import traceback
-        traceback.print_exc()
-    
-    # Fall back to base model
-    base_model = rescale_dir / f"{base_name}.xml"
-    console.print(f"⚠️ Using base model: {base_model.name}")
-    return base_model, "smpl_lower_body"
-
-
-def get_model_for_subject_profile(
-    subject_profile: SubjectProfile,
-    *,
-    project_root: Optional[Path] = None,
-    force: bool = False,
-) -> tuple[Path, str, Path, dict[str, Any]]:
-    """Build or reuse deterministic subject-specific lower-body assets."""
-    if project_root is None:
-        project_root = REPO_ROOT
-
-    builder = SubjectAssetBuilder(
-        profile=subject_profile,
-        rescale_dir=project_root / "HumanRetargeting" / "rescale",
-        assets_root=project_root / "protomotions" / "data" / "assets",
-    )
-    assets = builder.build(force=force)
-    return (
-        assets.mjcf_path,
-        f"smpl_lower_body_subject_{subject_profile.subject_id}",
-        assets.urdf_path,
-        {
-            "metadata_path": assets.metadata_path,
-            "default_root_height": assets.default_root_height,
-            "asset_root": assets.asset_root,
-        },
     )
 
-
-def _create_robot_config_for_height(
-    height_cm: int,
-    variant: str,
-    robot_name: str,
-    contact_pads: bool = False,
-) -> None:
-    """
-    Create a robot config for a given height using the factory.
-    
-    Args:
-        height_cm: Subject height in centimeters
-        variant: Model variant ('adjusted_pd' or 'adjusted_torque')
-        robot_name: Robot configuration name
-    """
-    try:
-        from protomotions.robot_configs.smpl_lower_body import SmplLowerBodyConfigFactory
-        
-        # Get the absolute path to the assets directory
-        project_root = REPO_ROOT
-        asset_root = str(project_root / "protomotions" / "data" / "assets")
-        
-        # Create config using the factory
-        config = SmplLowerBodyConfigFactory.create(
-            height_cm=height_cm,
-            variant=variant,
-            asset_root=asset_root,
-            contact_pads=contact_pads,
+    pipeline = ProductionPipeline(
+        PipelineConfig(
+            input_dir=input_dir.resolve(),
+            output_dir=output_dir.resolve(),
+            subject_profile_path=subject_profile_path.resolve() if subject_profile_path else None,
+            height_cm=height,
+            subject_id=subject_id,
+            model_variant=model_variant,
+            fps=fps,
+            output_fps=output_fps,
+            coordinate_transform=coordinate_transform,
+            contact_source=contact_source,
+            step=step,
+            force=force,
+            pyroki_python=pyroki_python.resolve() if pyroki_python else None,
+            pyroki_script=pyroki_script.resolve() if pyroki_script else None,
+            assets_root=assets_root.resolve(),
+            rescale_dir=(REPO_ROOT / "HumanRetargeting" / "rescale").resolve(),
+            qc_config_file=qc_config.resolve(),
+            export_profile=export_profile.resolve() if export_profile else None,
         )
-        
-        console.print(f"✅ Created robot config for {height_cm}cm")
-        console.print(f"   Root height: {config.default_root_height:.3f}m")
-        
-    except Exception as e:
-        console.print(f"⚠️ Could not create robot config: {e}")
-        console.print(f"   You may need to add {height_cm}cm to smpl_lower_body.py")
+    )
+    return pipeline.run()
 
 
 @app.command()
-def main(
-    input_dir: Path = typer.Argument(
-        ..., exists=True, help="Directory with treadmill motion .txt files"
-    ),
-    output_dir: Path = typer.Argument(..., help="Output directory"),
-    model_xml: Optional[Path] = typer.Option(
-        None, "--model", "-m", exists=True, help="Path to MJCF model file"
-    ),
-    subject_height: Optional[int] = typer.Option(
-        None, "--height", "-h",
-        help="Subject height in cm (auto-selects/creates model)"
-    ),
-    model_variant: str = typer.Option(
-        "adjusted_pd", "--variant", "-v",
-        help="Model variant: adjusted_pd or adjusted_torque"
-    ),
-    fps: Optional[int] = typer.Option(None, "--fps", "-f", help="Motion capture FPS"),
-    output_fps: Optional[int] = typer.Option(None, "--output-fps", help="Output FPS"),
-    speed_override: Optional[float] = typer.Option(
-        None, "--speed", "-s", help="Override treadmill speed (m/s)"
-    ),
-    coordinate_transform: Optional[str] = typer.Option(
-        None, "--transform", "-t",
-        help="Coordinate transform: 'none' or 'y_to_x_forward'"
-    ),
-    auto_scale: bool = typer.Option(
-        True, "--auto-scale/--no-auto-scale", help="Auto-scale motions"
-    ),
-    scale_override: Optional[float] = typer.Option(
-        None, "--scale", help="Manual scale factor"
-    ),
-    force_remake: bool = typer.Option(
-        False, "--force", help="Force reprocessing"
-    ),
-    step: PipelineStep = typer.Option(
-        PipelineStep.ALL, "--step", help="Pipeline step to run"
-    ),
-    clean_intermediate: bool = typer.Option(
-        False, "--clean", help="Remove intermediate files"
-    ),
-    retarget_python: Optional[Path] = typer.Option(
-        None, "--retarget-python", help="Path to the Python interpreter used for retargeting"
-    ),
-    retarget_urdf_path: Optional[Path] = typer.Option(
-        None,
-        "--retarget-urdf-path",
-        exists=True,
-        help=(
-            "Optional URDF to use for retargeting (e.g. the contact-pad URDF). "
-            "If omitted, the retarget script default is used."
-        ),
-    ),
-    subject_profile_path: Optional[Path] = typer.Option(
+def cli(
+    input_dir: Path = typer.Argument(..., exists=True, file_okay=False, dir_okay=True),
+    output_dir: Path = typer.Argument(..., file_okay=False, dir_okay=True),
+    subject_profile_path: Path | None = typer.Option(
         None,
         "--subject-profile",
         exists=True,
-        help="YAML subject profile describing anthropometry and optional kinetics sidecars.",
+        file_okay=True,
+        dir_okay=False,
+        help="Checked-in subject profile YAML.",
+    ),
+    height: int | None = typer.Option(
+        None,
+        "--height",
+        help="Generate a canonical height-only profile such as H182.",
+    ),
+    subject_id: str | None = typer.Option(
+        None,
+        "--subject-id",
+        help="Explicit subject id. Height-only runs default to H<height>.",
+    ),
+    model_variant: str = typer.Option(
+        "adjusted_pd",
+        "--model-variant",
+        help="Lower-body template variant used when materializing subject assets.",
+    ),
+    fps: int = typer.Option(200, "--fps", help="Input treadmill frame rate."),
+    output_fps: int = typer.Option(30, "--output-fps", help="Output frame rate."),
+    coordinate_transform: str = typer.Option(
+        "y_to_x_forward",
+        "--coordinate-transform",
+        help="Coordinate transform applied during treadmill-to-overground conversion.",
     ),
     contact_source: str = typer.Option(
-        "auto",
+        "heuristic",
         "--contact-source",
-        help="Contact source preference: auto, kinetics, or heuristic.",
+        help="Default contact source for height-only generated profiles.",
     ),
-    contact_pads: bool = typer.Option(
+    step: PipelineStep = typer.Option(
+        PipelineStep.ALL,
+        "--step",
+        help="Single pipeline step to run, or all for the full production flow.",
+    ),
+    force: bool = typer.Option(
         False,
-        "--contact-pads/--no-contact-pads",
-        help=(
-            "Use the *_contact_pads MJCF (when available) so conversion/packaging "
-            "matches the smpl_lower_body_170cm_contact_pads robot."
-        ),
+        "--force",
+        help="Rebuild existing outputs instead of reusing them.",
+    ),
+    pyroki_python: Path | None = typer.Option(
+        None,
+        "--pyroki-python",
+        file_okay=True,
+        dir_okay=False,
+        help="Override the default production PyRoki interpreter.",
+    ),
+    pyroki_script: Path | None = typer.Option(
+        None,
+        "--pyroki-script",
+        file_okay=True,
+        dir_okay=False,
+        help="Override the default production PyRoki wrapper script.",
+    ),
+    export_profile: Path | None = typer.Option(
+        None,
+        "--export-profile",
+        file_okay=True,
+        dir_okay=False,
+        help="Optional extra copy of the resolved run profile.",
+    ),
+    qc_config_file: Path | None = typer.Option(
+        None,
+        "--qc-config",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        help="Checked-in QC threshold config.",
     ),
 ) -> None:
-    """
-    Process treadmill motions to ProtoMotions MotionLib format.
-    
-    Supports automatic model selection by subject height:
-    
-        python pipeline.py ./treadmill_data/S02 ./processed_S02 --height 156
-    
-    Or manual model specification:
-    
-        python pipeline.py ./treadmill_data/S02 ./processed_S02 \\
-            --model ./rescale/smpl_humanoid_lower_body_adjusted_pd.xml
-    """
-    subject_profile: SubjectProfile | None = None
-    generated_assets: dict[str, Any] | None = None
-    project_root = REPO_ROOT
-    asset_root = project_root / "protomotions" / "data" / "assets"
-    requested_fps = fps
-    requested_output_fps = output_fps
-    requested_coordinate_transform = coordinate_transform
-    fps = 200 if fps is None else fps
-    output_fps = 30 if output_fps is None else output_fps
-    coordinate_transform = (
-        "y_to_x_forward" if coordinate_transform is None else coordinate_transform
-    )
-
-    # Determine model to use
-    if subject_profile_path is not None:
-        subject_profile = load_subject_profile(subject_profile_path)
-        input_dir = subject_profile.input_dir
-        model_variant = subject_profile.model_variant
-        contact_pads = subject_profile.contact_pads
-        contact_source = subject_profile.contact_source or contact_source
-        subject_profile.contact_source = contact_source
-        subject_height = subject_profile.height_cm
-        if requested_fps is None:
-            fps = subject_profile.fps
-        if requested_output_fps is None:
-            output_fps = subject_profile.output_fps
-        if requested_coordinate_transform is None:
-            coordinate_transform = subject_profile.coordinate_transform
-
-        builder = SubjectAssetBuilder(
-            profile=subject_profile,
-            rescale_dir=HUMAN_RETARGET_ROOT / "rescale",
-            assets_root=asset_root,
+    """CLI entrypoint for the production single-subject pipeline."""
+    try:
+        result = main(
+            input_dir=input_dir,
+            output_dir=output_dir,
+            subject_profile_path=subject_profile_path,
+            height=height,
+            subject_id=subject_id,
+            model_variant=model_variant,
+            fps=fps,
+            output_fps=output_fps,
+            coordinate_transform=coordinate_transform,
+            contact_source=contact_source,
+            step=step,
+            force=force,
+            pyroki_python=pyroki_python,
+            pyroki_script=pyroki_script,
+            export_profile=export_profile,
+            qc_config_file=qc_config_file,
         )
-        assets = builder.build(force=force_remake)
-        generated_assets = {
-            "mjcf": str(assets.mjcf_path),
-            "usda": str(assets.usda_path),
-            "urdf": str(assets.urdf_path),
-            "metadata": str(assets.metadata_path),
-            "default_root_height": assets.default_root_height,
-        }
-        model_xml = assets.mjcf_path
-        if retarget_urdf_path is None:
-            retarget_urdf_path = assets.urdf_path
-        console.print(f"\n📏 Subject profile: {subject_profile.subject_id}")
-        console.print(f"🤖 Subject asset bundle: {assets.subject_stem}")
-    elif subject_height is not None:
-        # Auto-select or create model based on height
-        model_xml, robot_name = get_model_for_height(
-            height_cm=subject_height,
-            variant=model_variant,
-            contact_pads=contact_pads,
-        )
-        console.print(f"\n📏 Subject height: {subject_height}cm")
-        console.print(f"🤖 Robot config: {robot_name}")
-    elif model_xml is None:
-        # No model specified - error
-        console.print("❌ Must specify either --model or --height")
-        console.print("\nExamples:")
-        console.print("  --height 156              (auto-select 156cm model)")
-        console.print("  --model path/to/model.xml (manual model path)")
-        raise typer.Exit(1)
+    except Exception as exc:
+        console.print(f"[red]Pipeline failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
 
-    config = PipelineConfig(
-        input_dir=input_dir,
-        output_dir=output_dir,
-        model_xml=model_xml,
-        fps=fps,
-        output_fps=output_fps,
-        coordinate_transform=coordinate_transform,
-        speed_override=speed_override,
-        auto_scale=auto_scale,
-        scale_override=scale_override,
-        force_remake=force_remake,
-        clean_intermediate=clean_intermediate,
-        subject_height_cm=subject_height,
-        model_variant=model_variant,
-        retarget_python=retarget_python,
-        retarget_urdf_path=retarget_urdf_path,
-        subject_profile=subject_profile,
-        contact_source=contact_source,
-        asset_root=asset_root,
-        subject_assets=generated_assets,
-    )
-    
-    pipeline = BiomechanicsPipeline(config)
-    packaged_output = pipeline.run(step)
-    if subject_profile is not None:
-        summary = {
-            "subject_id": subject_profile.subject_id,
-            "input_dir": str(input_dir),
-            "output_dir": str(output_dir),
-            "contact_source": contact_source,
-            "packaged_output": str(packaged_output) if packaged_output is not None else None,
-            "model_xml": str(model_xml),
-            "retarget_urdf_path": str(retarget_urdf_path) if retarget_urdf_path is not None else None,
-            "generated_assets": generated_assets,
-            "motion_file_count": len(list((output_dir / "motion_files").glob("*.motion"))),
-            "retargeted_file_count": len(list((output_dir / "retargeted_motions").glob("*_retargeted.npz"))),
-            "keypoint_file_count": len(list((output_dir / "keypoints").glob("*.npy"))),
-        }
-        pipeline.subject_summary_path.write_text(
-            json.dumps(summary, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+    if result is not None:
+        console.print(f"[green]Pipeline output:[/green] {result}")
 
 
 if __name__ == "__main__":

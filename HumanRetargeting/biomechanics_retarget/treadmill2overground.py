@@ -73,6 +73,33 @@ def apply_position_coordinate_transform(
     return joint_centers, forward_axis
 
 
+def load_normalized_motion_from_txt(
+    motion_filepath: str,
+    coordinate_transform: str,
+) -> Tuple[np.ndarray, int]:
+    """Load motion data, apply coordinate normalization, and ground it without translation."""
+    print(f"   - Loading motion data from {motion_filepath}...")
+    try:
+        motion_df = pd.read_csv(motion_filepath, sep="\t", header=None)
+        joint_centers = motion_df.iloc[:, 1:].to_numpy().reshape(motion_df.shape[0], -1, 3)
+        print(f"   - Loaded {joint_centers.shape[0]} frames for {joint_centers.shape[1]} joints.")
+    except Exception as e:
+        print(f"   - ❌ Error loading motion file {motion_filepath}: {e}")
+        raise
+
+    joint_centers, forward_axis = apply_position_coordinate_transform(
+        joint_centers, coordinate_transform
+    )
+    print("   - Applying ground plane adjustment...")
+    ground_height = estimate_ground_height(joint_centers)
+    joint_centers[:, :, 2] -= ground_height
+    print(
+        "   - Lowered motion by "
+        f"{-ground_height:.3f}m using the 1st percentile of ankle/toe heights."
+    )
+    return joint_centers, forward_axis
+
+
 def process_motion_file(
     motion_file: Path,
     output_dir: Path,
@@ -213,22 +240,8 @@ def transform_treadmill_to_overground(
 def create_motion_from_txt(
     motion_filepath: str, treadmill_speed: float, mocap_fr: int, coordinate_transform: str
 ) -> np.ndarray:
-    print(f"   - Loading motion data from {motion_filepath}...")
-    try:
-        motion_df = pd.read_csv(motion_filepath, sep="\t", header=None)
-        joint_centers = motion_df.iloc[:, 1:].to_numpy().reshape(motion_df.shape[0], -1, 3)
-        print(f"   - Loaded {joint_centers.shape[0]} frames for {joint_centers.shape[1]} joints.")
-    except Exception as e:
-        print(f"   - ❌ Error loading motion file {motion_filepath}: {e}")
-        raise
-
-    joint_centers, forward_axis = apply_position_coordinate_transform(joint_centers, coordinate_transform)
-    print("   - Applying ground plane adjustment...")
-    ground_height = estimate_ground_height(joint_centers)
-    joint_centers[:, :, 2] -= ground_height
-    print(
-        "   - Lowered motion by "
-        f"{-ground_height:.3f}m using the 1st percentile of ankle/toe heights."
+    joint_centers, forward_axis = load_normalized_motion_from_txt(
+        motion_filepath, coordinate_transform
     )
 
     if treadmill_speed > 0:

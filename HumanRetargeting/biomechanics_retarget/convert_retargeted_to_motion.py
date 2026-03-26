@@ -67,6 +67,55 @@ except ImportError:
 app = typer.Typer(pretty_exceptions_enable=False)
 
 
+def _stabilize_joint_angles_for_velocity(
+    joint_angles: torch.Tensor,
+    lower_limits: torch.Tensor,
+    upper_limits: torch.Tensor,
+) -> torch.Tensor:
+    """Select the nearest valid periodic branch before differentiating joint angles."""
+    raw_angles = joint_angles.detach().cpu().numpy().astype(np.float32, copy=False)
+    lower = lower_limits.detach().cpu().numpy().astype(np.float32, copy=False)
+    upper = upper_limits.detach().cpu().numpy().astype(np.float32, copy=False)
+
+    wrapped = ((raw_angles + np.pi) % (2.0 * np.pi)) - np.pi
+    stabilized = np.empty_like(wrapped)
+    branch_offsets = np.arange(-2, 3, dtype=np.float32) * (2.0 * np.pi)
+
+    for dof_idx in range(wrapped.shape[1]):
+        lower_limit = lower[dof_idx]
+        upper_limit = upper[dof_idx]
+        initial_target = 0.5 * (lower_limit + upper_limit)
+
+        for frame_idx in range(wrapped.shape[0]):
+            base_angle = wrapped[frame_idx, dof_idx]
+            candidates = base_angle + branch_offsets
+            valid_candidates = candidates[
+                (candidates >= lower_limit - 1e-5) & (candidates <= upper_limit + 1e-5)
+            ]
+            target = initial_target if frame_idx == 0 else stabilized[frame_idx - 1, dof_idx]
+
+            if valid_candidates.size == 0:
+                chosen = np.clip(base_angle, lower_limit, upper_limit)
+            else:
+                chosen = valid_candidates[np.argmin(np.abs(valid_candidates - target))]
+            stabilized[frame_idx, dof_idx] = chosen
+
+    return torch.from_numpy(stabilized).to(
+        device=joint_angles.device,
+        dtype=joint_angles.dtype,
+    )
+
+
+def _unwrap_joint_angles_for_motion(joint_angles: torch.Tensor) -> torch.Tensor:
+    """Unwrap per-DOF 2pi branch crossings while preserving the exact pose."""
+    raw_angles = joint_angles.detach().cpu().numpy().astype(np.float32, copy=False)
+    unwrapped = np.unwrap(raw_angles, axis=0)
+    return torch.from_numpy(unwrapped).to(
+        device=joint_angles.device,
+        dtype=joint_angles.dtype,
+    )
+
+
 def load_npz_file(
     npz_path: Path,
     device: torch.device,
@@ -101,25 +150,34 @@ def load_npz_file(
             # Handle bytes vs string
             if isinstance(source_names[0], bytes):
                 source_names = [n.decode("utf-8") for n in source_names]
-                
-            print(f"Reordering joints from {len(source_names)} source to {len(target_joint_names)} target...")
-            
-            # Create mapping
-            reorder_indices = []
-            for target_name in target_joint_names:
-                if target_name in source_names:
-                    reorder_indices.append(source_names.index(target_name))
-                else:
-                    print(f"Warning: Joint {target_name} not found in source motion! Filling with zeros.")
-                    reorder_indices.append(-1) # Marker for missing
-            
-            # Apply reordering
-            new_joint_angles = torch.zeros((raw_joint_angles.shape[0], len(target_joint_names)), device=device, dtype=dtype)
-            for i, src_idx in enumerate(reorder_indices):
-                if src_idx != -1:
-                    new_joint_angles[:, i] = raw_joint_angles[:, src_idx]
-            
-            joint_angles = new_joint_angles
+
+            if source_names == target_joint_names:
+                joint_angles = raw_joint_angles
+            else:
+                missing_targets = [
+                    target_name
+                    for target_name in target_joint_names
+                    if target_name not in source_names
+                ]
+                unexpected_sources = [
+                    source_name
+                    for source_name in source_names
+                    if source_name not in target_joint_names
+                ]
+                if missing_targets or unexpected_sources:
+                    raise ValueError(
+                        "Joint-name mismatch between retargeted motion and target model. "
+                        f"Missing target joints: {missing_targets}. "
+                        f"Unexpected source joints: {unexpected_sources}."
+                    )
+
+                print(
+                    f"Reordering joints from {len(source_names)} source to "
+                    f"{len(target_joint_names)} target..."
+                )
+
+                reorder_indices = [source_names.index(target_name) for target_name in target_joint_names]
+                joint_angles = raw_joint_angles[:, reorder_indices]
     else:
         joint_angles = raw_joint_angles
     
@@ -241,6 +299,10 @@ def convert_npz_to_motion(
     root_pos, root_rot_wxyz, joint_angles = load_npz_file(
         npz_file, device, dtype, input_fps, output_fps, target_joint_names=target_dof_names
     )
+    # MotionLib linearly interpolates DOF positions during playback. Unwrap each
+    # joint's periodic branch crossings here so the exported motion stays
+    # kinematically identical but does not generate impossible in-between poses.
+    joint_angles = _unwrap_joint_angles_for_motion(joint_angles)
     
     print(f"Loaded motion: {root_pos.shape[0]} frames (resampled from {input_fps} -> {output_fps} fps)")
     
@@ -276,9 +338,17 @@ def convert_npz_to_motion(
     # Re-extracting from transforms can cause angle wrapping issues.
     motion.dof_pos = joint_angles
 
-    # Compute DOF velocities using finite differences
+    # Keep the exported DOF positions on the exact unwrapped branch so
+    # ProtoMotions interpolation is stable, but compute velocities from the
+    # nearest valid branch so existing velocity-based QC/filter thresholds stay
+    # meaningful.
+    joint_angles_for_velocity = _stabilize_joint_angles_for_velocity(
+        joint_angles,
+        lower_limits=kinematic_info.dof_limits_lower.to(device=device, dtype=dtype),
+        upper_limits=kinematic_info.dof_limits_upper.to(device=device, dtype=dtype),
+    )
     dof_vel = compute_cartesian_velocity(
-        batched_robot_pos=joint_angles.unsqueeze(1),
+        batched_robot_pos=joint_angles_for_velocity.unsqueeze(1),
         fps=output_fps,
     )
     motion.dof_vel = dof_vel.squeeze(1)

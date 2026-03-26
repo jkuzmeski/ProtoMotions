@@ -1,16 +1,42 @@
 */babel/*.json
-.idea
-*__pycache__*
-*.egg-info
-outputs/*
-rendered_images/*
-*tmp*
-results/*
+.idea/
 .DS_Store
 **/.DS_Store
 
-output/
-.venv/
+# Python caches and local build output
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
 
+# Local environments and machine-local config
+.venv/
+.venvs/
 .gemini/
 gha-creds-*.json
+
+# General generated output
+output/
+outputs/
+results/
+rendered_images/
+*tmp*
+
+# Refactored biomechanics pipeline run artifacts
+HumanRetargeting/biomechanics_retarget/processed_data/**/profile.yaml
+HumanRetargeting/biomechanics_retarget/processed_data/**/qc/
+HumanRetargeting/biomechanics_retarget/processed_data/**/yaml_data/motions_*.yaml
+HumanRetargeting/biomechanics_retarget/processed_data/**/contacts/*.npz
+HumanRetargeting/biomechanics_retarget/processed_data/**/keypoints/*.npy
+HumanRetargeting/biomechanics_retarget/processed_data/**/motion_files/*.motion
+HumanRetargeting/biomechanics_retarget/processed_data/**/overground_data/*.npy
+HumanRetargeting/biomechanics_retarget/processed_data/**/overground_data/metadata/*
+HumanRetargeting/biomechanics_retarget/processed_data/**/packaged_data/*.pt
+HumanRetargeting/biomechanics_retarget/processed_data/**/retargeted_motions/*.npz

@@ -1,19 +1,29 @@
 {
-  "contact_source": "heuristic",
-  "generated_assets": {
+  "assets": {
     "default_root_height": 0.95,
     "metadata": "/mnt/d/Biomotions/ProtoMotions/protomotions/data/assets/subjects/smpl_humanoid_lower_body_subject_S_GENERIC.yaml",
     "mjcf": "/mnt/d/Biomotions/ProtoMotions/protomotions/data/assets/mjcf/smpl_humanoid_lower_body_subject_S_GENERIC.xml",
     "urdf": "/mnt/d/Biomotions/ProtoMotions/protomotions/data/assets/urdf/for_retargeting/smpl_humanoid_lower_body_subject_S_GENERIC.urdf",
     "usda": "/mnt/d/Biomotions/ProtoMotions/protomotions/data/assets/usd/smpl_humanoid_lower_body_subject_S_GENERIC.usda"
   },
+  "completed_step": "package",
+  "generated_profile": false,
   "input_dir": "/mnt/d/Biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/treadmill_data/S_GENERIC",
-  "keypoint_file_count": 8,
   "model_xml": "/mnt/d/Biomotions/ProtoMotions/protomotions/data/assets/mjcf/smpl_humanoid_lower_body_subject_S_GENERIC.xml",
-  "motion_file_count": 7,
-  "output_dir": "HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC",
-  "packaged_output": "HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/packaged_data/S_GENERIC.pt",
-  "retarget_urdf_path": "/mnt/d/Biomotions/ProtoMotions/protomotions/data/assets/urdf/for_retargeting/smpl_humanoid_lower_body_subject_S_GENERIC.urdf",
-  "retargeted_file_count": 8,
+  "motion_manifest": "/mnt/d/Biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/yaml_data/motions_S_GENERIC.yaml",
+  "num_keypoint_files": 8,
+  "num_motion_files": 8,
+  "num_overground_files": 8,
+  "num_retargeted_files": 8,
+  "output_dir": "/mnt/d/Biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC",
+  "packaged_file": "/mnt/d/Biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/packaged_data/S_GENERIC.pt",
+  "profile_path": "/mnt/d/Biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/profile.yaml",
+  "pyroki_python": "/mnt/d/Biomotions/ProtoMotions/.venvs/pyroki/bin/python",
+  "pyroki_script": "/mnt/d/Biomotions/ProtoMotions/pyroki/batch_retarget_to_smpl_lower_body.py",
+  "qc_config_file": "/mnt/d/Biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/config/qc_thresholds.yaml",
+  "retarget_urdf": "/mnt/d/Biomotions/ProtoMotions/protomotions/data/assets/urdf/for_retargeting/smpl_humanoid_lower_body_subject_S_GENERIC.urdf",
+  "robot_name": "smpl_lower_body_subject_S_GENERIC",
+  "status": "ok",
+  "step": "all",
   "subject_id": "S_GENERIC"
 }

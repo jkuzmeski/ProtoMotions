@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict
 
@@ -77,6 +79,152 @@ SKELETON_EDGES = [
 ]
 DEFAULT_SMOOTHING_WINDOW = 5
 DEFAULT_BLEND_ALPHAS = (0.15, 0.3, 0.45, 0.6, 0.75, 0.9, 1.0)
+
+
+@dataclass(frozen=True)
+class RetargetCostConfig:
+    weights: Dict[str, float]
+    reference_smoothing_window: int = DEFAULT_SMOOTHING_WINDOW
+    blend_alphas: tuple[float, ...] = DEFAULT_BLEND_ALPHAS
+    max_velocity_threshold: float = 15.0
+    velocity_budget_scale: float = 1.1
+    velocity_budget_margin: float = 0.5
+    joint_step_budget_scale: float = 1.15
+    joint_step_budget_margin: float = 0.05
+
+
+_RETARGET_COST_PRESETS: dict[str, RetargetCostConfig] = {
+    "conservative": RetargetCostConfig(
+        weights={
+            "position": 14.0,
+            "relative_position": 8.0,
+            "orientation": 3.0,
+            "body_velocity": 2.5,
+            "body_acceleration": 20.0,
+            "body_velocity_match": 6.0,
+            "root_orientation_smoothness": 8.0,
+            "root_orientation_acceleration": 20.0,
+            "joint_smoothness": 10.0,
+            "joint_acceleration": 45.0,
+            "root_smoothness": 6.0,
+            "root_acceleration": 20.0,
+            "foot_velocity": 14.0,
+            "foot_height": 28.0,
+            "foot_level": 15.0,
+            "joint_limit": 200.0,
+            "joint_deviation": 2.5,
+            "root_deviation": 4.0,
+            "root_orientation_deviation": 6.0,
+        },
+    ),
+    "balanced": RetargetCostConfig(
+        weights={
+            "position": 18.0,
+            "relative_position": 10.0,
+            "orientation": 3.5,
+            "body_velocity": 2.0,
+            "body_acceleration": 12.0,
+            "body_velocity_match": 8.0,
+            "root_orientation_smoothness": 5.0,
+            "root_orientation_acceleration": 12.0,
+            "joint_smoothness": 6.0,
+            "joint_acceleration": 22.0,
+            "root_smoothness": 4.0,
+            "root_acceleration": 10.0,
+            "foot_velocity": 10.0,
+            "foot_height": 18.0,
+            "foot_level": 10.0,
+            "joint_limit": 180.0,
+            "joint_deviation": 1.5,
+            "root_deviation": 2.5,
+            "root_orientation_deviation": 3.0,
+        },
+        reference_smoothing_window=3,
+        max_velocity_threshold=20.0,
+        velocity_budget_scale=1.25,
+        velocity_budget_margin=0.75,
+        joint_step_budget_scale=1.3,
+        joint_step_budget_margin=0.08,
+    ),
+    "gait_preserving": RetargetCostConfig(
+        weights={
+            "position": 24.0,
+            "relative_position": 14.0,
+            "orientation": 4.5,
+            "body_velocity": 1.25,
+            "body_acceleration": 7.5,
+            "body_velocity_match": 10.0,
+            "root_orientation_smoothness": 2.5,
+            "root_orientation_acceleration": 6.0,
+            "joint_smoothness": 3.0,
+            "joint_acceleration": 10.0,
+            "root_smoothness": 2.0,
+            "root_acceleration": 6.0,
+            "foot_velocity": 8.0,
+            "foot_height": 12.0,
+            "foot_level": 8.0,
+            "joint_limit": 160.0,
+            "joint_deviation": 0.75,
+            "root_deviation": 1.25,
+            "root_orientation_deviation": 1.5,
+        },
+        reference_smoothing_window=3,
+        max_velocity_threshold=28.0,
+        velocity_budget_scale=1.5,
+        velocity_budget_margin=1.25,
+        joint_step_budget_scale=1.75,
+        joint_step_budget_margin=0.12,
+    ),
+}
+_RETARGET_COST_PRESETS["biomechanics"] = _RETARGET_COST_PRESETS["gait_preserving"]
+
+
+def _parse_weight_overrides(raw: str | None) -> dict[str, float]:
+    if raw is None:
+        return {}
+
+    candidate_path = Path(raw)
+    if candidate_path.exists():
+        payload = json.loads(candidate_path.read_text(encoding="utf-8"))
+    else:
+        payload = json.loads(raw)
+
+    if not isinstance(payload, dict):
+        raise ValueError("retarget weight overrides must be a JSON object")
+
+    overrides: dict[str, float] = {}
+    for key, value in payload.items():
+        overrides[str(key)] = float(value)
+    return overrides
+
+
+def _resolve_retarget_cost_config(
+    preset: str,
+    weight_overrides: dict[str, float] | None = None,
+) -> RetargetCostConfig:
+    normalized_preset = preset.strip().lower().replace("-", "_")
+    if normalized_preset not in _RETARGET_COST_PRESETS:
+        available = ", ".join(sorted(_RETARGET_COST_PRESETS))
+        raise ValueError(
+            f"unknown retarget cost preset {preset!r}; expected one of: {available}"
+        )
+
+    config = _RETARGET_COST_PRESETS[normalized_preset]
+    overrides = weight_overrides or {}
+    if not overrides:
+        return config
+
+    unexpected = set(overrides) - set(config.weights)
+    if unexpected:
+        available = ", ".join(sorted(config.weights))
+        unknown = ", ".join(sorted(unexpected))
+        raise ValueError(
+            f"unknown retarget weight override(s): {unknown}. Valid keys: {available}"
+        )
+
+    resolved_weights = dict(config.weights)
+    resolved_weights.update(overrides)
+    return replace(config, weights=resolved_weights)
 
 
 def _resolve_model_xml(urdf_path: str | None) -> Path:
@@ -416,10 +564,84 @@ def _compute_world_transforms_autograd(
     return torch.stack(world_positions, dim=1), torch.stack(world_rotations, dim=1)
 
 
+def _build_reference_dynamics(
+    reference_qpos: torch.Tensor,
+    *,
+    kinematic_info,
+    body_indices: torch.Tensor,
+    fps: int,
+) -> Dict[str, torch.Tensor]:
+    """Build per-timestep derivative targets from the reference trajectory."""
+    _, reference_joint_rot_mats = extract_transforms_from_qpos(
+        kinematic_info,
+        reference_qpos,
+    )
+    reference_world_pos, reference_world_rot = _compute_world_transforms_autograd(
+        kinematic_info=kinematic_info,
+        root_pos=reference_qpos[:, :3],
+        joint_rot_mats=reference_joint_rot_mats,
+    )
+    reference_body_pos = reference_world_pos[:, body_indices]
+    reference_body_rot = reference_world_rot[:, body_indices]
+
+    reference_world_vel = (
+        (reference_world_pos[1:] - reference_world_pos[:-1]) * fps
+        if reference_world_pos.shape[0] > 1
+        else torch.zeros_like(reference_world_pos)
+    )
+    reference_world_acc = (
+        reference_world_vel[1:] - reference_world_vel[:-1]
+        if reference_world_vel.shape[0] > 1
+        else torch.zeros_like(reference_world_vel)
+    )
+    reference_pelvis_rot_delta = (
+        reference_body_rot[1:, 0] - reference_body_rot[:-1, 0]
+        if reference_body_rot.shape[0] > 1
+        else torch.zeros_like(reference_body_rot[:, 0])
+    )
+    reference_pelvis_rot_acc = (
+        reference_pelvis_rot_delta[1:] - reference_pelvis_rot_delta[:-1]
+        if reference_pelvis_rot_delta.shape[0] > 1
+        else torch.zeros_like(reference_pelvis_rot_delta)
+    )
+    reference_joint_vel = (
+        reference_qpos[1:, 7:] - reference_qpos[:-1, 7:]
+        if reference_qpos.shape[0] > 1
+        else torch.zeros_like(reference_qpos[:, 7:])
+    )
+    reference_joint_acc = (
+        reference_joint_vel[1:] - reference_joint_vel[:-1]
+        if reference_joint_vel.shape[0] > 1
+        else torch.zeros_like(reference_joint_vel)
+    )
+    reference_root_vel = (
+        reference_qpos[1:, :3] - reference_qpos[:-1, :3]
+        if reference_qpos.shape[0] > 1
+        else torch.zeros_like(reference_qpos[:, :3])
+    )
+    reference_root_acc = (
+        reference_root_vel[1:] - reference_root_vel[:-1]
+        if reference_root_vel.shape[0] > 1
+        else torch.zeros_like(reference_root_vel)
+    )
+
+    return {
+        "world_vel": reference_world_vel,
+        "world_acc": reference_world_acc,
+        "pelvis_rot_delta": reference_pelvis_rot_delta,
+        "pelvis_rot_acc": reference_pelvis_rot_acc,
+        "joint_vel": reference_joint_vel,
+        "joint_acc": reference_joint_acc,
+        "root_vel": reference_root_vel,
+        "root_acc": reference_root_acc,
+    }
+
+
 def _compute_trajectory_losses(
     qpos: torch.Tensor,
     *,
     reference_qpos: torch.Tensor,
+    reference_dynamics: Dict[str, torch.Tensor],
     target_positions: torch.Tensor,
     target_rotations: torch.Tensor,
     left_contacts: torch.Tensor,
@@ -430,6 +652,7 @@ def _compute_trajectory_losses(
     right_body_indices: torch.Tensor,
     pair_mask: torch.Tensor,
     fps: int,
+    cost_config: RetargetCostConfig,
 ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     _, joint_rot_mats = extract_transforms_from_qpos(kinematic_info, qpos)
     world_pos, world_rot = _compute_world_transforms_autograd(
@@ -484,21 +707,49 @@ def _compute_trajectory_losses(
             ((delta_robot - delta_target).pow(2) * pair_mask[None, :, :, None]).sum() / (pair_denom * 3.0)
         ),
         "orientation": _compute_orientation_loss(body_rot, target_rotations),
-        "body_velocity": world_vel.pow(2).mean() if world_vel.numel() > 0 else qpos.new_tensor(0.0),
-        "body_acceleration": world_acc.pow(2).mean() if world_acc.numel() > 0 else qpos.new_tensor(0.0),
+        "body_velocity": (
+            F.mse_loss(world_vel, reference_dynamics["world_vel"])
+            if world_vel.numel() > 0
+            else qpos.new_tensor(0.0)
+        ),
+        "body_acceleration": (
+            F.mse_loss(world_acc, reference_dynamics["world_acc"])
+            if world_acc.numel() > 0
+            else qpos.new_tensor(0.0)
+        ),
         "body_velocity_match": (
             F.mse_loss(body_vel, target_body_vel) if body_vel.numel() > 0 else qpos.new_tensor(0.0)
         ),
         "root_orientation_smoothness": (
-            pelvis_rot_delta.pow(2).mean() if pelvis_rot_delta.numel() > 0 else qpos.new_tensor(0.0)
+            F.mse_loss(pelvis_rot_delta, reference_dynamics["pelvis_rot_delta"])
+            if pelvis_rot_delta.numel() > 0
+            else qpos.new_tensor(0.0)
         ),
         "root_orientation_acceleration": (
-            pelvis_rot_acc.pow(2).mean() if pelvis_rot_acc.numel() > 0 else qpos.new_tensor(0.0)
+            F.mse_loss(pelvis_rot_acc, reference_dynamics["pelvis_rot_acc"])
+            if pelvis_rot_acc.numel() > 0
+            else qpos.new_tensor(0.0)
         ),
-        "joint_smoothness": joint_vel.pow(2).mean() if joint_vel.numel() > 0 else qpos.new_tensor(0.0),
-        "joint_acceleration": joint_acc.pow(2).mean() if joint_acc.numel() > 0 else qpos.new_tensor(0.0),
-        "root_smoothness": root_vel.pow(2).mean() if root_vel.numel() > 0 else qpos.new_tensor(0.0),
-        "root_acceleration": root_acc.pow(2).mean() if root_acc.numel() > 0 else qpos.new_tensor(0.0),
+        "joint_smoothness": (
+            F.mse_loss(joint_vel, reference_dynamics["joint_vel"])
+            if joint_vel.numel() > 0
+            else qpos.new_tensor(0.0)
+        ),
+        "joint_acceleration": (
+            F.mse_loss(joint_acc, reference_dynamics["joint_acc"])
+            if joint_acc.numel() > 0
+            else qpos.new_tensor(0.0)
+        ),
+        "root_smoothness": (
+            F.mse_loss(root_vel, reference_dynamics["root_vel"])
+            if root_vel.numel() > 0
+            else qpos.new_tensor(0.0)
+        ),
+        "root_acceleration": (
+            F.mse_loss(root_acc, reference_dynamics["root_acc"])
+            if root_acc.numel() > 0
+            else qpos.new_tensor(0.0)
+        ),
         "foot_velocity": (
             (foot_vel.pow(2).sum(dim=-1) * foot_vel_contacts).sum() / foot_vel_contacts.sum().clamp_min(1.0)
             if foot_vel.numel() > 0
@@ -521,27 +772,21 @@ def _compute_trajectory_losses(
         "root_orientation_deviation": (qpos[:, 3:7] - reference_qpos[:, 3:7]).pow(2).mean(),
     }
 
-    weights = {
-        "position": 14.0,
-        "relative_position": 8.0,
-        "orientation": 3.0,
-        "body_velocity": 2.5,
-        "body_acceleration": 20.0,
-        "body_velocity_match": 6.0,
-        "root_orientation_smoothness": 8.0,
-        "root_orientation_acceleration": 20.0,
-        "joint_smoothness": 10.0,
-        "joint_acceleration": 45.0,
-        "root_smoothness": 6.0,
-        "root_acceleration": 20.0,
-        "foot_velocity": 14.0,
-        "foot_height": 28.0,
-        "foot_level": 15.0,
-        "joint_limit": 200.0,
-        "joint_deviation": 2.5,
-        "root_deviation": 4.0,
-        "root_orientation_deviation": 6.0,
-    }
+    if target_body_vel.numel() > 0:
+        motion_speed_mps = float(
+            torch.linalg.vector_norm(target_body_vel[:, 0], dim=-1).mean().detach().cpu()
+        )
+    else:
+        motion_speed_mps = 0.0
+    motion_scale = min(max(motion_speed_mps / 1.5, 1.0), 3.0)
+    tracking_scale = min(np.sqrt(motion_scale), 1.75)
+    deviation_scale = 1.0 / motion_scale
+
+    weights = dict(cost_config.weights)
+    for name in ("position", "relative_position", "orientation", "body_velocity_match"):
+        weights[name] *= tracking_scale
+    for name in ("joint_deviation", "root_deviation", "root_orientation_deviation"):
+        weights[name] *= deviation_scale
     total_loss = sum(weights[name] * value for name, value in losses.items())
     return total_loss, losses
 
@@ -558,6 +803,7 @@ def _optimize_trajectory(
     steps: int,
     learning_rate: float,
     log_every: int,
+    cost_config: RetargetCostConfig,
 ) -> torch.Tensor:
     device = reference_qpos.device
     dtype = reference_qpos.dtype
@@ -578,6 +824,12 @@ def _optimize_trajectory(
         dtype=torch.long,
     )
     pair_mask = _build_retarget_mask(device=device, dtype=dtype)
+    reference_dynamics = _build_reference_dynamics(
+        reference_qpos,
+        kinematic_info=kinematic_info,
+        body_indices=body_indices,
+        fps=fps,
+    )
 
     lower = kinematic_info.dof_limits_lower.to(device=device, dtype=dtype)
     upper = kinematic_info.dof_limits_upper.to(device=device, dtype=dtype)
@@ -598,6 +850,7 @@ def _optimize_trajectory(
         total_loss, loss_terms = _compute_trajectory_losses(
             qpos,
             reference_qpos=reference_qpos,
+            reference_dynamics=reference_dynamics,
             target_positions=target_positions,
             target_rotations=target_rotations,
             left_contacts=left_contacts,
@@ -608,6 +861,7 @@ def _optimize_trajectory(
             right_body_indices=right_body_indices,
             pair_mask=pair_mask,
             fps=fps,
+            cost_config=cost_config,
         )
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_([root_pos, root_quat, joint_angles], max_norm=10.0)
@@ -707,8 +961,7 @@ def _select_trajectory_candidate(
     fps: int,
     lower_limits: torch.Tensor,
     upper_limits: torch.Tensor,
-    blend_alphas: tuple[float, ...] = DEFAULT_BLEND_ALPHAS,
-    max_velocity_threshold: float = 15.0,
+    cost_config: RetargetCostConfig,
 ) -> torch.Tensor:
     reference_pos_loss, reference_velocity, reference_joint_step = _compute_motion_quality_metrics(
         reference_qpos,
@@ -719,9 +972,16 @@ def _select_trajectory_candidate(
     )
     velocity_budget = max(
         reference_velocity,
-        min(max_velocity_threshold - 0.25, reference_velocity * 1.1 + 0.5),
+        min(
+            cost_config.max_velocity_threshold - 0.25,
+            reference_velocity * cost_config.velocity_budget_scale
+            + cost_config.velocity_budget_margin,
+        ),
     )
-    joint_step_budget = reference_joint_step * 1.15 + 0.05
+    joint_step_budget = (
+        reference_joint_step * cost_config.joint_step_budget_scale
+        + cost_config.joint_step_budget_margin
+    )
 
     candidates = [(0.0, reference_qpos)]
     candidates.extend(
@@ -735,7 +995,7 @@ def _select_trajectory_candidate(
                 upper_limits=upper_limits,
             ),
         )
-        for alpha in blend_alphas
+        for alpha in cost_config.blend_alphas
     )
 
     best_candidate = reference_qpos
@@ -804,6 +1064,8 @@ def _retarget_motion(
     retarget_fps: int,
     retarget_mode: str,
     log_every: int,
+    cost_preset: str,
+    weight_overrides: dict[str, float],
 ) -> None:
     keypoint_data = np.load(keypoint_path, allow_pickle=True).item()
     positions = np.asarray(keypoint_data["positions"], dtype=np.float32)
@@ -819,12 +1081,17 @@ def _retarget_motion(
         device=device,
         dtype=dtype,
     )
+    cost_config = _resolve_retarget_cost_config(
+        cost_preset,
+        weight_overrides=weight_overrides,
+    )
     lower = kinematic_info.dof_limits_lower.to(device=device, dtype=dtype)
     upper = kinematic_info.dof_limits_upper.to(device=device, dtype=dtype)
     reference_qpos = _build_reference_qpos(
         initial_qpos,
         lower_limits=lower,
         upper_limits=upper,
+        window_size=cost_config.reference_smoothing_window,
     )
     body_indices = torch.tensor(
         [kinematic_info.body_names.index(name) for name in KEYPOINT_TO_BODY_NAMES],
@@ -842,7 +1109,7 @@ def _retarget_motion(
     if retarget_mode == "trajectory":
         print(
             f"Optimizing trajectory on {device} for {keypoint_path.name} "
-            f"({initial_qpos.shape[0]} frames, {optimizer_steps} steps)..."
+            f"({initial_qpos.shape[0]} frames, {optimizer_steps} steps, preset={cost_preset})..."
         )
         optimized_qpos = _optimize_trajectory(
             reference_qpos=reference_qpos,
@@ -855,6 +1122,7 @@ def _retarget_motion(
             steps=optimizer_steps,
             learning_rate=optimizer_lr,
             log_every=log_every,
+            cost_config=cost_config,
         )
         qpos = _select_trajectory_candidate(
             reference_qpos=reference_qpos,
@@ -865,6 +1133,7 @@ def _retarget_motion(
             fps=retarget_fps,
             lower_limits=lower,
             upper_limits=upper,
+            cost_config=cost_config,
         )
     else:
         qpos = reference_qpos
@@ -894,8 +1163,14 @@ def main() -> None:
     parser.add_argument(
         "--keypoints-folder-path",
         type=str,
-        required=True,
+        default=None,
         help="Path to the folder containing extracted lower-body keypoints.",
+    )
+    parser.add_argument(
+        "--keypoint-file-path",
+        type=str,
+        default=None,
+        help="Optional path to a single extracted lower-body keypoint file.",
     )
     parser.add_argument(
         "--output-dir",
@@ -965,7 +1240,7 @@ def main() -> None:
     parser.add_argument(
         "--optimizer-steps",
         type=int,
-        default=40,
+        default=120,
         help="Number of optimization steps for trajectory retargeting.",
     )
     parser.add_argument(
@@ -986,18 +1261,49 @@ def main() -> None:
         default=50,
         help="Print optimization losses every N steps.",
     )
+    parser.add_argument(
+        "--cost-preset",
+        type=str,
+        choices=tuple(sorted(_RETARGET_COST_PRESETS)),
+        default="gait_preserving",
+        help=(
+            "Retarget cost preset. Use gait_preserving/biomechanics to prioritize "
+            "source gait fidelity over robot-conservative smoothing."
+        ),
+    )
+    parser.add_argument(
+        "--weight-overrides",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON string or JSON file path with per-loss weight overrides. "
+            "Keys must match the local loss names."
+        ),
+    )
     args = parser.parse_args()
 
     if args.visualize:
         print("Visualization is not implemented for the lower-body local retargeter. Continuing without it.")
 
-    keypoint_paths = sorted(glob.glob(os.path.join(args.keypoints_folder_path, "*.npy")))
+    if args.keypoint_file_path:
+        keypoint_paths = [args.keypoint_file_path]
+    elif args.keypoints_folder_path:
+        keypoint_paths = sorted(glob.glob(os.path.join(args.keypoints_folder_path, "*.npy")))
+    else:
+        parser.error("Provide either --keypoint-file-path or --keypoints-folder-path")
+
     if not keypoint_paths:
-        print(f"No .npy files found in {args.keypoints_folder_path}. Exiting.")
+        missing_target = args.keypoint_file_path or args.keypoints_folder_path
+        print(f"No .npy files found in {missing_target}. Exiting.")
         return
 
     if args.save_contacts_only:
-        contacts_dir = Path(args.contacts_dir or Path(args.keypoints_folder_path) / "contacts")
+        if args.contacts_dir is not None:
+            contacts_dir = Path(args.contacts_dir)
+        elif args.keypoints_folder_path is not None:
+            contacts_dir = Path(args.keypoints_folder_path) / "contacts"
+        else:
+            contacts_dir = Path(keypoint_paths[0]).parent / "contacts"
         for keypoint_path_str in keypoint_paths:
             keypoint_path = Path(keypoint_path_str)
             output_path = contacts_dir / f"{keypoint_path.stem}_contacts.npz"
@@ -1010,6 +1316,12 @@ def main() -> None:
 
     model_xml = _resolve_model_xml(args.urdf_path)
     print(f"Using lower-body model XML: {model_xml}")
+    weight_overrides = _parse_weight_overrides(args.weight_overrides)
+    if weight_overrides:
+        print(
+            "Applying weight overrides: "
+            + ", ".join(f"{name}={value}" for name, value in sorted(weight_overrides.items()))
+        )
 
     output_dir = Path(args.output_dir)
     for keypoint_path_str in keypoint_paths:
@@ -1028,6 +1340,8 @@ def main() -> None:
             retarget_fps=args.retarget_fps,
             retarget_mode=args.retarget_mode,
             log_every=args.log_every,
+            cost_preset=args.cost_preset,
+            weight_overrides=weight_overrides,
         )
 
 

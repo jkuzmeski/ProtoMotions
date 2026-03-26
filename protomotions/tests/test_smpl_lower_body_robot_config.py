@@ -2,9 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from pathlib import Path
+import shutil
+
+import pytest
 
 from protomotions.robot_configs.factory import robot_config
-from protomotions.robot_configs.smpl_lower_body import SmplLowerBodyConfigFactory
+import protomotions.robot_configs.smpl_lower_body as smpl_lower_body_config_module
 
 from HumanRetargeting.biomechanics_retarget.subject_assets import SubjectAssetBuilder
 from HumanRetargeting.biomechanics_retarget.subject_profiles import load_subject_profile
@@ -21,7 +24,10 @@ def test_smpl_lower_body_base_robot_config_loads():
     assert Path(config.asset.asset_root, config.asset.asset_file_name).exists()
 
 
-def test_smpl_lower_body_subject_robot_config_loads_generated_assets(tmp_path):
+def test_smpl_lower_body_subject_robot_config_loads_generated_assets(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     profile = load_subject_profile(
         REPO_ROOT / "HumanRetargeting" / "biomechanics_retarget" / "profiles" / "S_GENERIC.yaml"
     )
@@ -32,10 +38,12 @@ def test_smpl_lower_body_subject_robot_config_loads_generated_assets(tmp_path):
     )
     assets = builder.build(force=True)
 
-    config = SmplLowerBodyConfigFactory.create(
-        subject_id=profile.subject_id,
-        asset_root=assets.asset_root,
-    )
+    fake_repo_root = tmp_path / "repo"
+    fake_assets_root = fake_repo_root / "protomotions" / "data" / "assets"
+    shutil.copytree(assets.asset_root, fake_assets_root, dirs_exist_ok=True)
+
+    monkeypatch.setattr(smpl_lower_body_config_module, "REPO_ROOT", fake_repo_root)
+    config = robot_config(f"smpl_lower_body_subject_{profile.subject_id}")
 
     assert Path(config.asset.asset_root, config.asset.asset_file_name).exists()
     assert config.default_root_height > 0.0

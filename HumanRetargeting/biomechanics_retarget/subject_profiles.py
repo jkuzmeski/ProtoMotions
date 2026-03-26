@@ -61,6 +61,7 @@ class SubjectProfile:
     event_glob: str | None = None
     contact_pads: bool = False
     profile_path: Path | None = None
+    profile_mode: str = "file"
 
     def __post_init__(self) -> None:
         if self.height_cm <= 0:
@@ -223,6 +224,7 @@ def subject_profile_from_dict(
         event_glob=_resolve_glob(base_dir, merged.get("event_glob")),
         contact_pads=bool(merged.get("contact_pads", False)),
         profile_path=profile_path,
+        profile_mode=str(merged.get("profile_mode", "file")),
     )
     return profile
 
@@ -240,6 +242,154 @@ def load_subject_profile(profile_path: Path, defaults: dict[str, Any] | None = N
         defaults=defaults,
         profile_path=profile_path,
     )
+
+
+def subject_profile_to_yaml_data(profile: SubjectProfile) -> dict[str, Any]:
+    """Materialize a profile into the canonical persisted YAML structure."""
+    data: dict[str, Any] = {
+        "subject_id": profile.subject_id,
+        "input_dir": str(profile.input_dir.resolve()),
+        "model_variant": profile.model_variant,
+        "fps": profile.fps,
+        "output_fps": profile.output_fps,
+        "coordinate_transform": profile.coordinate_transform,
+        "contact_source": profile.contact_source,
+        "trial_glob": profile.trial_glob,
+        "speed_source": profile.speed_source,
+        "profile_mode": profile.profile_mode,
+        "anthropometry": {
+            "height_cm": profile.height_cm,
+            "pelvis_width_m": profile.pelvis_width_m,
+            "thigh_length_m": profile.thigh_length_m,
+            "shank_length_m": profile.shank_length_m,
+            "foot_length_m": profile.foot_length_m,
+        },
+    }
+
+    if profile.mass_kg is not None:
+        data["mass_kg"] = profile.mass_kg
+    if profile.foot_width_m is not None:
+        data["foot_width_m"] = profile.foot_width_m
+    if profile.left_thigh_length_m is not None:
+        data["left_thigh_length_m"] = profile.left_thigh_length_m
+    if profile.right_thigh_length_m is not None:
+        data["right_thigh_length_m"] = profile.right_thigh_length_m
+    if profile.left_shank_length_m is not None:
+        data["left_shank_length_m"] = profile.left_shank_length_m
+    if profile.right_shank_length_m is not None:
+        data["right_shank_length_m"] = profile.right_shank_length_m
+    if profile.left_foot_length_m is not None:
+        data["left_foot_length_m"] = profile.left_foot_length_m
+    if profile.right_foot_length_m is not None:
+        data["right_foot_length_m"] = profile.right_foot_length_m
+    if profile.left_foot_width_m is not None:
+        data["left_foot_width_m"] = profile.left_foot_width_m
+    if profile.right_foot_width_m is not None:
+        data["right_foot_width_m"] = profile.right_foot_width_m
+    if profile.grf_glob is not None:
+        data["grf_glob"] = profile.grf_glob
+    if profile.event_glob is not None:
+        data["event_glob"] = profile.event_glob
+    if profile.contact_pads:
+        data["contact_pads"] = True
+    if profile.trial_speed_overrides:
+        data["trial_speed_overrides"] = dict(profile.trial_speed_overrides)
+
+    anthropometry = data["anthropometry"]
+    if profile.foot_width_m is not None:
+        anthropometry["foot_width_m"] = profile.foot_width_m
+    if profile.left_thigh_length_m is not None:
+        anthropometry["left_thigh_length_m"] = profile.left_thigh_length_m
+    if profile.right_thigh_length_m is not None:
+        anthropometry["right_thigh_length_m"] = profile.right_thigh_length_m
+    if profile.left_shank_length_m is not None:
+        anthropometry["left_shank_length_m"] = profile.left_shank_length_m
+    if profile.right_shank_length_m is not None:
+        anthropometry["right_shank_length_m"] = profile.right_shank_length_m
+    if profile.left_foot_length_m is not None:
+        anthropometry["left_foot_length_m"] = profile.left_foot_length_m
+    if profile.right_foot_length_m is not None:
+        anthropometry["right_foot_length_m"] = profile.right_foot_length_m
+    if profile.left_foot_width_m is not None:
+        anthropometry["left_foot_width_m"] = profile.left_foot_width_m
+    if profile.right_foot_width_m is not None:
+        anthropometry["right_foot_width_m"] = profile.right_foot_width_m
+
+    return data
+
+
+def _load_template_profile(template_path: Path) -> dict[str, Any]:
+    data = yaml.safe_load(template_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"template profile at {template_path} must be a mapping")
+    return data
+
+
+def materialize_height_subject_profile(
+    *,
+    input_dir: Path,
+    output_path: Path,
+    height_cm: int,
+    subject_id: str | None,
+    model_variant: str,
+    fps: int,
+    output_fps: int,
+    coordinate_transform: str,
+    contact_source: str,
+    template_profile_path: Path | None = None,
+) -> SubjectProfile:
+    """Generate and persist a canonical height-only subject profile."""
+    if height_cm <= 0:
+        raise ValueError(f"height_cm must be positive, got {height_cm}")
+
+    if template_profile_path is None:
+        template_profile_path = (
+            Path(__file__).resolve().parent
+            / "profiles"
+            / "templates"
+            / "generic_lower_body.yaml"
+        )
+    template = _load_template_profile(template_profile_path)
+    anthropometry = dict(template.get("anthropometry") or {})
+    base_height_cm = int(anthropometry["height_cm"])
+    scale = float(height_cm) / float(base_height_cm)
+
+    resolved_subject_id = subject_id or f"H{height_cm}"
+    profile = SubjectProfile(
+        subject_id=resolved_subject_id,
+        input_dir=input_dir.resolve(),
+        height_cm=height_cm,
+        pelvis_width_m=float(anthropometry["pelvis_width_m"]) * scale,
+        thigh_length_m=float(anthropometry["thigh_length_m"]) * scale,
+        shank_length_m=float(anthropometry["shank_length_m"]) * scale,
+        foot_length_m=float(anthropometry["foot_length_m"]) * scale,
+        model_variant=model_variant,
+        fps=fps,
+        output_fps=output_fps,
+        coordinate_transform=coordinate_transform,
+        contact_source=contact_source,
+        trial_glob=str(template.get("trial_glob", "*.txt")),
+        speed_source=str(template.get("speed_source", "filename")),
+        mass_kg=(
+            float(template["mass_kg"])
+            if template.get("mass_kg") is not None
+            else None
+        ),
+        foot_width_m=(
+            float(anthropometry["foot_width_m"]) * scale
+            if anthropometry.get("foot_width_m") is not None
+            else None
+        ),
+        profile_path=output_path.resolve(),
+        profile_mode="generated_from_height",
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        yaml.safe_dump(subject_profile_to_yaml_data(profile), sort_keys=False),
+        encoding="utf-8",
+    )
+    return profile
 
 
 def load_study_manifest(manifest_path: Path) -> StudyManifest:

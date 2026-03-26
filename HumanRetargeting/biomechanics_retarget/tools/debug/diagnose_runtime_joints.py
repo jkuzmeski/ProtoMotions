@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2025 The ProtoMotions Developers
 # SPDX-License-Identifier: Apache-2.0
-"""
+r"""
 Runtime joint diagnostic for env_kinematic_playback.
 
 Runs a short kinematic playback and prints:
@@ -16,7 +16,7 @@ mismatched legs.
 Usage:
     cd D:\Biomotions\newton\ProtoMotions
 
-    ..\.venv\Scripts\python.exe HumanRetargeting\biomechanics_retarget\diagnose_runtime_joints.py ^
+    ..\.venv\Scripts\python.exe HumanRetargeting\biomechanics_retarget\tools\debug\diagnose_runtime_joints.py ^
         --experiment-path examples\experiments\mimic\mlp.py ^
         --motion-file HumanRetargeting\biomechanics_retarget\processed_data\S_GENERIC\packaged_data\S_GENERIC.pt ^
         --robot-name smpl_lower_body_subject_S_GENERIC ^
@@ -29,6 +29,11 @@ Usage:
 import argparse
 import sys
 from pathlib import Path
+
+# Add repository root to path so the tool can be launched from anywhere.
+REPO_ROOT = Path(__file__).resolve().parents[4]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 def create_parser():

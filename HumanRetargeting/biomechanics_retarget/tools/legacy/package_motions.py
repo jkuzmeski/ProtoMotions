@@ -8,7 +8,7 @@ This script packages individual .motion files (or a YAML config pointing to them
 into a single .pt file that can be used for training with ProtoMotions.
 
 Usage:
-    python package_motions.py motion.yaml output.pt --model-xml model.xml
+    python HumanRetargeting/biomechanics_retarget/tools/legacy/package_motions.py motion.yaml output.pt --model-xml model.xml
 
 Author: BioMotions Team
 """
@@ -22,8 +22,10 @@ import typer
 
 app = typer.Typer(pretty_exceptions_enable=False)
 
-# Add protomotions to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Add repository root to path so the tool can be launched from anywhere.
+REPO_ROOT = Path(__file__).resolve().parents[4]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from protomotions.components.motion_lib import MotionLib, MotionLibConfig
 
@@ -48,15 +50,15 @@ def package_motions(
     print(f"Packaging motions from: {yaml_file}")
     print(f"Motion directory: {motion_dir}")
     print(f"Model XML: {model_xml}")
-    
+
     # Create MotionLib config
     config = MotionLibConfig(
         motion_file=str(yaml_file),
     )
-    
+
     # Load motion library
     motion_lib = MotionLib(config, device=device)
-    
+
     # Package and save
     output_file.parent.mkdir(parents=True, exist_ok=True)
     motion_lib.save(str(output_file))
@@ -86,12 +88,12 @@ def main(
     Package motions from a YAML config into a MotionLib .pt file.
     
     Example:
-        python package_motions.py motions.yaml output.pt \\
+        python HumanRetargeting/biomechanics_retarget/tools/legacy/package_motions.py motions.yaml output.pt \\
             --model-xml ./rescale/smpl_humanoid_lower_body_adjusted_pd.xml
     """
     if motion_dir is None:
         motion_dir = yaml_file.parent
-    
+
     package_motions(
         yaml_file=yaml_file,
         output_file=output_file,

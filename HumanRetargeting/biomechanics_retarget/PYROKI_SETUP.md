@@ -1,189 +1,113 @@
 # PyRoki Integration Guide
 
-## Overview
+This pipeline now treats PyRoki as an external dependency again.
 
-The pipeline now supports **automatic PyRoki environment switching**. You don't need to manually activate the PyRoki environment before running the pipeline.
+Two things are required for the retarget step:
 
-## Quick Start
+1. A dedicated Python interpreter with upstream `pyroki` installed.
+2. The lower-body PyRoki wrapper script used by the production pipeline.
 
-### Option 1: Auto-detection (Recommended)
+The biomechanics pipeline no longer falls back to the local in-repo lower-body
+solver. It defaults to the production paths below, prints the exact paths it is
+using, and stops with a clear error instead of silently using a different
+implementation.
 
-If you have PyRoki installed in a conda environment named `pyroki`:
+## Upstream Install
 
-```bash
-python pipeline.py ./treadmill_data/S02 ./processed_data/S02 --height 160
-```
-
-The pipeline will automatically find and use the `pyroki` environment.
-
-### Option 2: Explicit PyRoki Path
-
-If your PyRoki environment is in a different location:
+Upstream `pyroki` still installs as an editable package from the GitHub repo:
 
 ```bash
-python pipeline.py ./treadmill_data/S02 ./processed_data/S02 \
-    --height 160 \
-    --pyroki-python "C:\path\to\pyroki\env\Scripts\python.exe"
-```
-
-## How It Works
-
-When you run the `retarget` step, the pipeline:
-
-1. **Auto-finds** the PyRoki Python interpreter by searching conda environments for one named `pyroki`
-2. **Spawns a subprocess** using that interpreter to run `batch_retarget_to_smpl_lower_body.py`
-3. **Extracts contact labels** in a second subprocess call
-4. **Returns to the main environment** automatically
-
-No manual environment switching needed!
-
-## Setting Up PyRoki
-
-If you don't have PyRoki installed yet:
-
-```bash
-# Create a new conda environment for PyRoki
-conda create -n pyroki python=3.10 -y
-
-# Activate it
-conda activate pyroki
-
-# Clone and install PyRoki
 git clone https://github.com/chungmin99/pyroki.git
 cd pyroki
 pip install -e .
-
-# Verify installation
-python -c "import pyroki; print(pyroki.__version__)"
 ```
 
-## Usage Examples
+At the time of writing, upstream declares `requires-python >=3.10` and depends on
+`jax`, `jaxlib`, `jaxls`, `yourdfpy`, `viser`, and related packages via its
+`pyproject.toml`.
 
-### Run only retargeting (step 3)
-```bash
-python pipeline.py ./treadmill_data/S02 ./processed_data/S02 \
-    --height 160 \
-    --step retarget
-```
+## Recommended Local Setup
 
-### Run full pipeline (all steps) with explicit PyRoki path
-```bash
-python pipeline.py ./treadmill_data/S02 ./processed_data/S02 \
-    --height 160 \
-    --pyroki-python "C:\Users\username\miniconda3\envs\pyroki\Scripts\python.exe"
-```
-
-### Use different model variant
-```bash
-python pipeline.py ./treadmill_data/S02 ./processed_data/S02 \
-    --height 160 \
-    --variant adjusted_torque \
-    --step retarget
-```
-
-## Troubleshooting
-
-### PyRoki environment not found
-
-**Error message:**
-```
-⚠️ PyRoki environment not found. Provide path with --pyroki-python.
-```
-
-**Solution:** Either:
-1. Create a conda environment named `pyroki` with PyRoki installed
-2. Provide explicit path using `--pyroki-python`
+This repo now includes a helper script that creates a dedicated virtualenv,
+clones upstream PyRoki, and installs it:
 
 ```bash
-# Find your PyRoki Python path
-conda run -n pyroki python -c "import sys; print(sys.executable)"
-
-# Use that path
-python pipeline.py ./input ./output --height 160 \
-    --pyroki-python "C:\Users\...\pyroki\Scripts\python.exe"
+./scripts/setup_pyroki_env.sh
 ```
 
-### Import errors when running retarget step
+Defaults:
 
-The pipeline runs PyRoki in a subprocess, so ensure your PyRoki environment has all dependencies:
+- Python executable: `python3`
+- virtualenv: `.venvs/pyroki`
+- upstream checkout: `third_party/pyroki`
+
+Custom locations are also supported:
 
 ```bash
-conda activate pyroki
-pip install jax jax-dataclasses jaxlie jaxls yourdfpy numpy scipy
+./scripts/setup_pyroki_env.sh python3.12 .venvs/pyroki third_party/pyroki
 ```
 
-### Contact labels not extracted
-
-If you see warnings about contact extraction, the main retargeting still completes. You can:
-
-1. Check that the PyRoki environment has all dependencies installed
-2. Run extraction manually:
-   ```bash
-   conda activate pyroki
-   python pyroki/batch_retarget_to_smpl_lower_body.py \
-       --keypoints-folder-path ./processed_data/S02/keypoints \
-       --contacts-dir ./processed_data/S02/contacts \
-       --source-type treadmill \
-       --save-contacts-only
-   ```
-
-## Full Pipeline with PyRoki
-
-The complete workflow:
+The final interpreter path will be:
 
 ```bash
-# 1. Extract keypoints (uses main environment)
-python pipeline.py ./treadmill_data/S02 ./processed_data/S02 \
-    --height 160 --step keypoints
-
-# 2. Retarget with PyRoki (auto-switches environment)
-python pipeline.py ./treadmill_data/S02 ./processed_data/S02 \
-    --height 160 --step retarget
-
-# 3. Convert to ProtoMotions format (uses main environment)
-python pipeline.py ./treadmill_data/S02 ./processed_data/S02 \
-    --height 160 --step convert
-
-# 4. Package into MotionLib (uses main environment)
-python pipeline.py ./treadmill_data/S02 ./processed_data/S02 \
-    --height 160 --step package
-
-# Or run all steps at once
-python pipeline.py ./treadmill_data/S02 ./processed_data/S02 \
-    --height 160  # Auto-runs all steps
+.venvs/pyroki/bin/python
 ```
 
-## Advanced: Manual PyRoki Execution
+## Running The Biomechanics Pipeline
 
-If you need to run PyRoki manually (not through the pipeline):
+For the lower-body biomechanics flow, the production defaults are:
+
+- interpreter: `./.venvs/pyroki/bin/python`
+- wrapper script: `./pyroki/batch_retarget_to_smpl_lower_body.py`
+
+Example:
 
 ```bash
-# Activate PyRoki environment
-conda activate pyroki
-
-# Run retargeting
-python pyroki/batch_retarget_to_smpl_lower_body.py \
-    --keypoints-folder-path ./processed_data/S02/keypoints \
-    --output-dir ./processed_data/S02/retargeted_motions \
-    --source-type treadmill \
-    --no-visualize \
-    --skip-existing
-
-# Extract contacts
-python pyroki/batch_retarget_to_smpl_lower_body.py \
-    --keypoints-folder-path ./processed_data/S02/keypoints \
-    --contacts-dir ./processed_data/S02/contacts \
-    --source-type treadmill \
-    --save-contacts-only \
-    --skip-existing
-
-# Switch back to main environment
-conda deactivate
+python HumanRetargeting/biomechanics_retarget/pipeline.py \
+    ./HumanRetargeting/biomechanics_retarget/treadmill_data/S_GENERIC \
+    ./HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC \
+    --subject-profile HumanRetargeting/biomechanics_retarget/profiles/S_GENERIC.yaml
 ```
 
-## See Also
+Override flags are still available if you need them:
 
-- PyRoki GitHub: https://github.com/chungmin99/pyroki
-- Pipeline README: `README.md` in this directory
-- Keypoint extraction: `extract_keypoints_from_overground.py`
-- Retargeting script: `pyroki/batch_retarget_to_smpl_lower_body.py`
+```bash
+--pyroki-python
+--pyroki-script
+```
+
+## What The Pipeline Validates
+
+Before launching the retarget step, the pipeline now verifies that the selected
+interpreter can import:
+
+- `pyroki`
+- `jax`
+- `jaxls`
+- `yourdfpy`
+
+If that import check fails, the pipeline aborts before any retargeting work runs.
+
+## Legacy Study Runner
+
+The old batch study helper now lives under `tools/legacy/` for auditability.
+It is not the supported production entrypoint.
+
+If you still need it for a migration or comparison run, invoke:
+
+```bash
+python HumanRetargeting/biomechanics_retarget/tools/legacy/study_pipeline.py \
+    --manifest /path/to/study.yaml \
+    --pyroki-python ./.venvs/pyroki/bin/python \
+    --pyroki-script ./pyroki/batch_retarget_to_smpl_lower_body.py
+```
+
+## Robot Retargeting
+
+The G1 and H1_2 retargeting scripts under `pyroki/` still use upstream `pyroki`
+as a library and should also be run with the dedicated PyRoki interpreter.
+
+See:
+
+- `scripts/retarget_single_motion_to_robot.sh`
+- `scripts/retarget_amass_to_robot.sh`

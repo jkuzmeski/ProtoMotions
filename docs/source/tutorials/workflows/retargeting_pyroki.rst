@@ -70,14 +70,18 @@ Installing PyRoki
 ~~~~~~~~~~~~~~~~~
 
 PyRoki requires a separate Python environment from ProtoMotions due to different 
-JAX/CUDA dependencies. Install it as follows:
+JAX/CUDA dependencies. The recommended local setup in this repo is:
 
 .. code-block:: bash
 
-   # Create a new environment for PyRoki
-   conda create -n pyroki python=3.10
-   conda activate pyroki
-   
+   ./scripts/setup_pyroki_env.sh
+
+This creates ``.venvs/pyroki`` and installs upstream ``pyroki`` from GitHub.
+
+Manual installation is also fine:
+
+.. code-block:: bash
+
    # Clone and install PyRoki
    git clone https://github.com/chungmin99/pyroki.git
    cd pyroki
