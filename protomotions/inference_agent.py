@@ -107,6 +107,24 @@ def create_parser():
         help="Path to motion file for inference. If not provided, will use the motion file from the checkpoint.",
     )
     parser.add_argument(
+        "--target-speed",
+        type=float,
+        default=1.0,
+        help="Fixed forward speed for speed-only deployment experiments.",
+    )
+    parser.add_argument(
+        "--heading-theta",
+        type=float,
+        default=0.0,
+        help="Fixed world-frame heading angle for speed-only deployment experiments.",
+    )
+    parser.add_argument(
+        "--standing-reset-steps",
+        type=int,
+        default=0,
+        help="Post-reset steps to hold zero speed before activating the target speed.",
+    )
+    parser.add_argument(
         "--scenes-file", type=str, default=None, help="Path to scenes file (optional)"
     )
     parser.add_argument(
@@ -115,12 +133,19 @@ def create_parser():
         default=[],
         help="Config overrides in format key=value (e.g., env.max_episode_length=5000 simulator.headless=True)",
     )
+    parser.add_argument(
+        "--deployment-mode",
+        action="store_true",
+        default=False,
+        help="Run the speed-only deployment path and reject motion-backed configs.",
+    )
 
     return parser
 
 
 # Parse arguments first (argparse is safe, doesn't import torch)
 import argparse  # noqa: E402
+import importlib.util  # noqa: E402
 
 parser = create_parser()
 args, unknown_args = parser.parse_known_args()
@@ -145,6 +170,20 @@ from protomotions.utils.config_utils import clean_dict_for_storage  # noqa: E402
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s: %(message)s")
 
 log = logging.getLogger(__name__)
+
+
+def load_experiment_module(experiment_path: Path):
+    """Load the checkpoint's copied experiment module for inference overrides."""
+    if not experiment_path.exists():
+        raise FileNotFoundError(f"Experiment file not found: {experiment_path}")
+
+    spec = importlib.util.spec_from_file_location("experiment_module", experiment_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Failed to load experiment module from {experiment_path}")
+
+    experiment_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(experiment_module)
+    return experiment_module
 
 
 # def tmp_enable_domain_randomization(robot_cfg, simulator_cfg, env_cfg):
@@ -185,6 +224,9 @@ def main():
     global parser, args
     args = parser.parse_args()
 
+    if args.deployment_mode and args.motion_file is not None:
+        raise ValueError("Deployment mode forbids --motion-file")
+
     checkpoint = Path(args.checkpoint)
 
     # Load frozen configs from resolved_configs.pt (exact reproducibility)
@@ -197,6 +239,12 @@ def main():
     resolved_configs = torch.load(
         resolved_configs_path, map_location="cpu", weights_only=False
     )
+
+    experiment_config_path = checkpoint.parent / "experiment_config.py"
+    experiment_module = None
+    if experiment_config_path.exists():
+        log.info(f"Loading experiment module from {experiment_config_path}")
+        experiment_module = load_experiment_module(experiment_config_path)
 
     robot_config = resolved_configs["robot"]
     simulator_config = resolved_configs["simulator"]
@@ -225,10 +273,42 @@ def main():
             new_simulator=args.simulator,
             robot_config=robot_config,
         )
+    if args.deployment_mode and experiment_module is None:
+        raise ValueError(
+            "Deployment mode requires experiment_config.py next to the checkpoint."
+        )
+
+    if args.deployment_mode:
+        if not hasattr(experiment_module, "motion_lib_config") or not hasattr(
+            experiment_module, "env_config"
+        ):
+            raise ValueError(
+                "Deployment mode requires experiment module motion_lib_config() and env_config()."
+            )
+        motion_lib_config = experiment_module.motion_lib_config(args)
+        env_config = experiment_module.env_config(robot_config, args)
+
     # Apply backward compatibility fixes for old checkpoints
     from protomotions.utils.inference_utils import apply_backward_compatibility_fixes
 
     apply_backward_compatibility_fixes(robot_config, simulator_config, env_config)
+
+    if experiment_module is not None:
+        apply_inference_overrides_fn = getattr(
+            experiment_module, "apply_inference_overrides", None
+        )
+        if apply_inference_overrides_fn is not None:
+            log.info("Applying experiment inference overrides")
+            apply_inference_overrides_fn(
+                robot_config,
+                simulator_config,
+                env_config,
+                agent_config,
+                terrain_config,
+                motion_lib_config,
+                scene_lib_config,
+                args,
+            )
 
     # # Temporary: Enable domain randomization for testing (uncomment to use)
     # tmp_enable_domain_randomization(robot_config, simulator_config, env_config)
@@ -270,6 +350,38 @@ def main():
             scene_lib_config,
         )
 
+    if args.deployment_mode:
+        motion_file = getattr(motion_lib_config, "motion_file", None)
+        if motion_file is not None:
+            raise ValueError(
+                "Deployment mode requires motion_lib.motion_file to be None"
+            )
+        control_components = getattr(env_config, "control_components", None) or {}
+        if "masked_mimic" in control_components:
+            raise ValueError(
+                "Deployment mode refuses motion-backed masked_mimic control"
+            )
+        if "speed" not in control_components:
+            raise ValueError("Deployment mode requires speed control")
+
+        from protomotions.agents.masked_mimic.model import MaskedMimicModel
+        from protomotions.agents.masked_mimic.agent import MaskedMimic
+
+        MaskedMimicModel.forward = MaskedMimicModel.forward_inference
+
+        class _NoOpOptimizer:
+            def load_state_dict(self, state_dict):
+                return None
+
+            def state_dict(self):
+                return {}
+
+        def _deployment_create_optimizers(self, model):
+            self.model = model
+            self.maskedmimic_optimizer = _NoOpOptimizer()
+
+        MaskedMimic.create_optimizers = _deployment_create_optimizers
+
     # Create fabric config for inference (simplified)
     fabric_config = FabricConfig(
         devices=1,
@@ -277,7 +389,7 @@ def main():
         loggers=[],  # No loggers needed for inference
         callbacks=[],  # No callbacks needed for inference
     )
-    fabric: Fabric = Fabric(**asdict(fabric_config))
+    fabric: Fabric = Fabric(**fabric_config.to_fabric_kwargs())
     fabric.launch()
 
     # Setup IsaacLab simulation_app if using IsaacLab simulator

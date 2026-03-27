@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import json
+from collections import defaultdict
 from pathlib import Path
 import shutil
 import sys
@@ -38,6 +39,7 @@ from HumanRetargeting.biomechanics_retarget.stages.overground import (
 )
 from HumanRetargeting.biomechanics_retarget.stages.package import (
     create_motion_manifest,
+    generate_experiment_matrix_manifests,
     package_motion_library,
 )
 from HumanRetargeting.biomechanics_retarget.stages.retarget import (
@@ -47,6 +49,12 @@ from HumanRetargeting.biomechanics_retarget.stages.retarget import (
 )
 from HumanRetargeting.biomechanics_retarget.subject_assets import SubjectAssets
 from HumanRetargeting.biomechanics_retarget.subject_profiles import SubjectProfile
+from HumanRetargeting.biomechanics_retarget.subject_profiles import (
+    build_trial_metadata_payload,
+    load_json_metadata,
+    resolve_trial_speed_mps,
+    speed_mps_slug,
+)
 from HumanRetargeting.biomechanics_retarget.validation import (
     ensure_validation_passed,
     validate_motion_file,
@@ -200,6 +208,7 @@ class ProductionPipeline:
         self.config = config
         self.config.create_directories()
         self.context: SubjectContext | None = None
+        self._trial_metadata: dict[str, dict[str, Any]] = {}
         self.summary: dict[str, Any] = {
             "status": "running",
             "step": self.config.step.value,
@@ -212,6 +221,32 @@ class ProductionPipeline:
     def _write_json(self, output_file: Path, payload: dict[str, Any]) -> None:
         output_file.parent.mkdir(parents=True, exist_ok=True)
         output_file.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+    def _trial_metadata_path(self, base_dir: Path, trial_name: str) -> Path:
+        return base_dir / "metadata" / f"{trial_name}.json"
+
+    def _load_trial_metadata(self, trial_name: str) -> dict[str, Any]:
+        cached = self._trial_metadata.get(trial_name)
+        if cached is not None:
+            return cached
+
+        for base_dir in (self.config.motion_dir, self.config.overground_dir):
+            metadata = load_json_metadata(self._trial_metadata_path(base_dir, trial_name))
+            if metadata:
+                return metadata
+        return {}
+
+    def _write_trial_metadata(self, base_dir: Path, trial_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        metadata_path = self._trial_metadata_path(base_dir, trial_name)
+        existing = load_json_metadata(metadata_path)
+        merged = {**existing, **payload}
+        self._write_json(metadata_path, merged)
+        self._trial_metadata[trial_name] = merged
+        return merged
+
+    def _trial_speed_mps(self, trial_name: str) -> float | None:
+        metadata = self._load_trial_metadata(trial_name)
+        return resolve_trial_speed_mps(trial_name, metadata=metadata)
 
     def _write_subject_summary(self) -> None:
         self._write_json(self.config.subject_summary_path, self.summary)
@@ -389,6 +424,24 @@ class ProductionPipeline:
         for motion_file in self._find_input_trials():
             output_file = self.config.overground_dir / f"{motion_file.stem}.npy"
             if output_file.exists() and not self.config.force:
+                overground_positions = np.load(output_file, mmap_mode="r")
+                speed_mps = resolve_trial_speed_mps(
+                    motion_file.stem,
+                    speed_mps=context.profile.trial_speed_override(motion_file.stem),
+                )
+                overground_metadata = build_trial_metadata_payload(
+                    subject_id=context.profile.subject_id,
+                    trial_name=motion_file.stem,
+                    speed_mps=speed_mps,
+                    source_file=motion_file.resolve(),
+                    fps=context.profile.fps,
+                    duration_seconds=(
+                        float(overground_positions.shape[0]) / float(context.profile.fps)
+                        if overground_positions.shape[0] > 0
+                        else 0.0
+                    ),
+                )
+                self._write_trial_metadata(self.config.overground_dir, motion_file.stem, overground_metadata)
                 output_files.append(output_file)
                 continue
             converted = run_overground_trial(
@@ -400,6 +453,24 @@ class ProductionPipeline:
             )
             if converted is None:
                 raise RuntimeError(f"Overground conversion failed for {motion_file.name}")
+            overground_positions = np.load(converted, mmap_mode="r")
+            speed_mps = resolve_trial_speed_mps(
+                motion_file.stem,
+                speed_mps=context.profile.trial_speed_override(motion_file.stem),
+            )
+            overground_metadata = build_trial_metadata_payload(
+                subject_id=context.profile.subject_id,
+                trial_name=motion_file.stem,
+                speed_mps=speed_mps,
+                source_file=motion_file.resolve(),
+                fps=context.profile.fps,
+                duration_seconds=(
+                    float(overground_positions.shape[0]) / float(context.profile.fps)
+                    if overground_positions.shape[0] > 0
+                    else 0.0
+                ),
+            )
+            self._write_trial_metadata(self.config.overground_dir, motion_file.stem, overground_metadata)
             output_files.append(converted)
 
         self.summary["completed_step"] = PipelineStep.OVERGROUND.value
@@ -494,6 +565,23 @@ class ProductionPipeline:
                     contact_file=contact_file if contact_file.exists() else None,
                     apply_motion_filter=False,
                 )
+            trial_metadata = self._load_trial_metadata(trial_stem)
+            motion_data = torch.load(output_file, map_location="cpu", weights_only=False)
+            speed_mps = resolve_trial_speed_mps(trial_stem, metadata=trial_metadata)
+            motion_metadata = build_trial_metadata_payload(
+                subject_id=context.profile.subject_id,
+                trial_name=trial_stem,
+                speed_mps=speed_mps,
+                source_file=trial_metadata.get("source_file", npz_file.resolve()),
+                fps=context.profile.output_fps,
+                duration_seconds=(
+                    (int(motion_data["rigid_body_pos"].shape[0]) - 1)
+                    / float(context.profile.output_fps)
+                    if int(motion_data["rigid_body_pos"].shape[0]) > 0
+                    else 0.0
+                ),
+            )
+            self._write_trial_metadata(self.config.motion_dir, trial_stem, motion_metadata)
             report = validate_motion_file(
                 motion_file=output_file,
                 model_xml=context.model_xml,
@@ -523,6 +611,32 @@ class ProductionPipeline:
             motion_files=motion_files,
             output_file=manifest_file,
             fps=context.profile.output_fps,
+            subject_id=context.profile.subject_id,
+            subset_name="all_8",
+        )
+
+        speed_subset_dir = self.config.yaml_dir / "subsets"
+        grouped_motion_files: dict[str, list[Path]] = defaultdict(list)
+        for motion_file in motion_files:
+            speed_mps = self._trial_speed_mps(motion_file.stem)
+            grouped_motion_files[speed_mps_slug(speed_mps)].append(motion_file)
+
+        subset_manifests: dict[str, str] = {}
+        for speed_label, selected_motion_files in sorted(grouped_motion_files.items()):
+            subset_manifest = speed_subset_dir / f"motions_{context.profile.subject_id}_speed_{speed_label}.yaml"
+            create_motion_manifest(
+                motion_files=selected_motion_files,
+                output_file=subset_manifest,
+                fps=context.profile.output_fps,
+                subject_id=context.profile.subject_id,
+                subset_name=f"speed_{speed_label}",
+            )
+            subset_manifests[speed_label] = str(subset_manifest)
+
+        matrix_subset_dir = self.config.yaml_dir / "experiment_matrix"
+        matrix_manifests = generate_experiment_matrix_manifests(
+            master_manifest=manifest_file,
+            output_dir=matrix_subset_dir,
         )
 
         packaged_file = self.config.packaged_dir / f"{context.profile.subject_id}.pt"
@@ -547,6 +661,10 @@ class ProductionPipeline:
         self.summary["completed_step"] = PipelineStep.PACKAGE.value
         self.summary["packaged_file"] = str(packaged_file)
         self.summary["motion_manifest"] = str(manifest_file)
+        self.summary["motion_subset_manifests"] = {
+            "speed_grouped": subset_manifests,
+            "experiment_matrix": {name: str(path) for name, path in matrix_manifests.items()},
+        }
         self._write_subject_summary()
         return packaged_file
 

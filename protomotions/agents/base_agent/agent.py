@@ -80,6 +80,75 @@ class BaseAgent:
         evaluator: Evaluator for computing performance metrics.
     """
 
+    _TENSORBOARD_CUSTOM_LAYOUT = {
+        "Teacher Core": {
+            "Episode Reward": [
+                "Multiline",
+                [
+                    "info/episode_reward",
+                    "rewards/task_rewards",
+                    "rewards/unnormalized_task_rewards",
+                ],
+            ],
+            "Position Tracking Error": [
+                "Multiline",
+                [
+                    "eval_readable/mean_joint_position_error_m",
+                    "eval_readable/max_joint_position_error_m",
+                    "eval_readable/tracking_success_rate",
+                ],
+            ],
+            "Rotation And Smoothness": [
+                "Multiline",
+                [
+                    "eval_readable/mean_joint_position_error_m",
+                    "eval_readable/mean_joint_rotation_error_deg",
+                    "eval_readable/action_rate_mean_rad_s",
+                ],
+            ],
+            "Optimization": [
+                "Multiline",
+                [
+                    "losses/actor_loss",
+                    "losses/critic_loss",
+                    "actor/ppo_loss",
+                    "actor/clip_frac",
+                    "losses/masked_mimic_loss",
+                    "masked_mimic/bc_loss",
+                ],
+            ],
+        },
+        "Biomechanics": {
+            "Speed Recovery": [
+                "Multiline",
+                [
+                    "eval_readable/biomechanics_success_rate",
+                    "eval_readable/mean_stride_length_m",
+                    "eval_readable/mean_cadence_steps_per_min",
+                ],
+            ],
+            "Throughput": [
+                "Multiline",
+                [
+                    "times/fps_last_epoch",
+                    "times/fps_total",
+                    "times/last_epoch_seconds",
+                ],
+            ],
+        }
+    }
+
+    _READABLE_METRIC_ALIASES = {
+        "eval_mean/gt_err": "eval_readable/mean_joint_position_error_m",
+        "eval_mean/gr_err_degrees": "eval_readable/mean_joint_rotation_error_deg",
+        "eval_mean/max_joint_err": "eval_readable/max_joint_position_error_m",
+        "eval/action_rate_mean_rad_s": "eval_readable/action_rate_mean_rad_s",
+        "eval/tracking_success_rate": "eval_readable/tracking_success_rate",
+        "eval/biomechanics/success_rate": "eval_readable/biomechanics_success_rate",
+        "eval/biomechanics/mean_stride_length_m": "eval_readable/mean_stride_length_m",
+        "eval/biomechanics/mean_cadence_steps_per_min": "eval_readable/mean_cadence_steps_per_min",
+    }
+
     # -----------------------------
     # Initialization and Setup
     # -----------------------------
@@ -159,6 +228,8 @@ class BaseAgent:
         else:
             raise ValueError("No root_dir provided and no logger available")
 
+        self._register_tensorboard_custom_layout()
+
         EvaluatorClass = get_class(self.config.evaluator._target_)
         self.evaluator: BaseEvaluator = EvaluatorClass(
             agent=self, fabric=self.fabric, config=self.config.evaluator
@@ -169,6 +240,32 @@ class BaseAgent:
     @property
     def should_stop(self):
         return self.fabric.broadcast(self._should_stop)
+
+    def _register_tensorboard_custom_layout(self) -> None:
+        """Register a stable TensorBoard custom-scalars dashboard when available."""
+        if not self.fabric.loggers:
+            return
+
+        for logger in self.fabric.loggers:
+            experiment = getattr(logger, "experiment", None)
+            if experiment is None or not hasattr(experiment, "add_custom_scalars"):
+                continue
+            try:
+                experiment.add_custom_scalars(self._TENSORBOARD_CUSTOM_LAYOUT)
+            except Exception as exc:
+                log.debug(
+                    "Skipping TensorBoard custom layout registration for %s: %s",
+                    type(logger).__name__,
+                    exc,
+                )
+
+    def _add_readable_metric_aliases(self, log_dict: Dict) -> Dict:
+        """Add duplicate metric names that are easier to interpret in TensorBoard."""
+        aliased_log_dict = dict(log_dict)
+        for source_key, alias_key in self._READABLE_METRIC_ALIASES.items():
+            if source_key in log_dict and alias_key not in aliased_log_dict:
+                aliased_log_dict[alias_key] = log_dict[source_key]
+        return aliased_log_dict
 
     def setup(self):
         self.fabric.call("on_model_init_start")
@@ -311,8 +408,11 @@ class BaseAgent:
 
         # Save environment checkpoint for unique task IDs
         task_id = self.env.get_task_id()
-        per_rank_task_id = [None for _ in range(self.fabric.world_size)]
-        dist.all_gather_object(per_rank_task_id, task_id)
+        if self.fabric.world_size > 1 and dist.is_available() and dist.is_initialized():
+            per_rank_task_id = [None for _ in range(self.fabric.world_size)]
+            dist.all_gather_object(per_rank_task_id, task_id)
+        else:
+            per_rank_task_id = [task_id]
 
         # Only ranks with unique task IDs save the env checkpoint
         rank_to_task_id = {}
@@ -329,13 +429,15 @@ class BaseAgent:
             log.info(
                 f"Saved env checkpoint: {env_checkpoint}, rank {self.fabric.global_rank}"
             )
-        self.fabric.barrier()
+        if self.fabric.world_size > 1:
+            self.fabric.barrier()
 
         # Check if new high score flag is consistent across devices
-        gathered_high_score = self.fabric.all_gather(new_high_score)
-        assert all(
-            [x == gathered_high_score[0] for x in gathered_high_score]
-        ), "New high score flag should be the same across all ranks."
+        if self.fabric.world_size > 1:
+            gathered_high_score = self.fabric.all_gather(new_high_score)
+            assert all(
+                [x == gathered_high_score[0] for x in gathered_high_score]
+            ), "New high score flag should be the same across all ranks."
 
         if new_high_score:
             self.fabric.save(save_dir / "score_based.ckpt", state_dict)
@@ -795,6 +897,7 @@ class BaseAgent:
         if len(env_log_dict) > 0:
             log_dict.update(env_log_dict)
         log_dict.update(training_log_dict)
+        log_dict = self._add_readable_metric_aliases(log_dict)
 
         # Aggregate metrics across all devices before logging
         # This ensures wandb reports representative metrics from all ranks, not just rank 0

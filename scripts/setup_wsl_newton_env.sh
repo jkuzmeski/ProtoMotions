@@ -13,7 +13,25 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
 VENV_PATH="${VENV_PATH:-$REPO_ROOT/.venv}"
 NEWTON_REF="${NEWTON_REF:-8a2abf2}"
-NEWTON_DIR="${PROTOMOTIONS_NEWTON_DIR:-$HOME/.cache/protomotions/newton-$NEWTON_REF}"
+
+DEFAULT_CACHED_NEWTON_DIR="$HOME/.cache/protomotions/newton-$NEWTON_REF"
+PARENT_DIR="$(cd "$REPO_ROOT/.." && pwd)"
+SIBLING_NEWTON_DIR="$PARENT_DIR/newton"
+
+detect_local_newton_dir() {
+    local candidate
+
+    for candidate in "$PARENT_DIR" "$SIBLING_NEWTON_DIR"; do
+        if [[ -f "$candidate/pyproject.toml" ]] && grep -q '^name = "newton"' "$candidate/pyproject.toml"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    printf '%s\n' "$DEFAULT_CACHED_NEWTON_DIR"
+}
+
+NEWTON_DIR="${PROTOMOTIONS_NEWTON_DIR:-$(detect_local_newton_dir)}"
 
 mkdir -p "$(dirname "$NEWTON_DIR")"
 

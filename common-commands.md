@@ -36,6 +36,75 @@
     --simulator newton \
     --num-envs 1
 
+  Speed-conditioned masked-mimic experiment commands:
+
+  Package step now also writes explicit experiment manifests under
+  `HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/yaml_data/experiment_matrix/`.
+
+  If you need to regenerate those manifests from the master YAML:
+
+  python scripts/generate_experiment_manifests.py \
+    HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/yaml_data/motions_S_GENERIC.yaml \
+    HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/yaml_data/experiment_matrix
+
+  Train the teacher for one subset:
+
+  python protomotions/train_agent.py \
+    --robot-name smpl_lower_body_subject_S_GENERIC \
+    --simulator newton \
+    --experiment-path examples/experiments/mimic/mlp_bm.py \
+    --experiment-name s_generic_teacher_every_other \
+    --motion-file HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/yaml_data/experiment_matrix/every_other.yaml \
+    --num-envs 64 \
+    --batch-size 256
+
+  Train the speed-conditioned student on the same subset:
+
+  python protomotions/train_agent.py \
+    --robot-name smpl_lower_body_subject_S_GENERIC \
+    --simulator newton \
+    --experiment-path examples/experiments/masked_mimic/transformer_bm_speed.py \
+    --experiment-name s_generic_student_every_other \
+    --motion-file HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/yaml_data/experiment_matrix/every_other.yaml \
+    --expert-model-path results/s_generic_teacher_every_other/last.ckpt \
+    --num-envs 64 \
+    --batch-size 256
+
+  Run motion-backed biomechanics evaluation for a trained student:
+
+  python protomotions/inference_agent.py \
+    --checkpoint results/s_generic_student_every_other/last.ckpt \
+    --simulator newton \
+    --motion-file HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/yaml_data/experiment_matrix/every_other.yaml \
+    --num-envs 8 \
+    --full-eval \
+    --headless
+
+  Run speed-only deployment inference with no motion library:
+
+  python protomotions/inference_agent.py \
+    --checkpoint results/s_generic_student_every_other/last.ckpt \
+    --simulator newton \
+    --deployment-mode \
+    --target-speed 3.5 \
+    --num-envs 1
+
+  Swap the manifest path and experiment name for other subsets:
+
+  - `all_8.yaml`
+  - `anchor_3.yaml`
+  - `speed_2.yaml`
+  - `leave_edge_low.yaml`
+  - `leave_edge_high.yaml`
+  - `loo_15.yaml`
+  - `loo_20.yaml`
+  - `loo_25.yaml`
+  - `loo_30.yaml`
+  - `loo_35.yaml`
+  - `loo_40.yaml`
+  - `loo_45.yaml`
+  - `loo_50.yaml`
+
 windows powershell commands
 
   Full end-to-end biomechanics pipeline with the dedicated PyRoki env:
@@ -73,6 +142,75 @@ windows powershell commands
     --robot-name smpl_lower_body_subject_S_GENERIC `
     --simulator newton `
     --num-envs 1
+
+  Speed-conditioned masked-mimic experiment commands:
+
+  Package step now also writes explicit experiment manifests under
+  `.\HumanRetargeting\biomechanics_retarget\processed_data\S_GENERIC\yaml_data\experiment_matrix\`.
+
+  If you need to regenerate those manifests from the master YAML:
+
+  python .\scripts\generate_experiment_manifests.py `
+    .\HumanRetargeting\biomechanics_retarget\processed_data\S_GENERIC\yaml_data\motions_S_GENERIC.yaml `
+    .\HumanRetargeting\biomechanics_retarget\processed_data\S_GENERIC\yaml_data\experiment_matrix
+
+  Train the teacher for one subset:
+
+  python .\protomotions\train_agent.py `
+    --robot-name smpl_lower_body_subject_S_GENERIC `
+    --simulator newton `
+    --experiment-path .\examples\experiments\mimic\mlp_bm.py `
+    --experiment-name s_generic_teacher_every_other `
+    --motion-file .\HumanRetargeting\biomechanics_retarget\processed_data\S_GENERIC\yaml_data\experiment_matrix\every_other.yaml `
+    --num-envs 64 `
+    --batch-size 256
+
+  Train the speed-conditioned student on the same subset:
+
+  python .\protomotions\train_agent.py `
+    --robot-name smpl_lower_body_subject_S_GENERIC `
+    --simulator newton `
+    --experiment-path .\examples\experiments\masked_mimic\transformer_bm_speed.py `
+    --experiment-name s_generic_student_every_other `
+    --motion-file .\HumanRetargeting\biomechanics_retarget\processed_data\S_GENERIC\yaml_data\experiment_matrix\every_other.yaml `
+    --expert-model-path .\results\s_generic_teacher_every_other\last.ckpt `
+    --num-envs 64 `
+    --batch-size 256
+
+  Run motion-backed biomechanics evaluation for a trained student:
+
+  python .\protomotions\inference_agent.py `
+    --checkpoint .\results\s_generic_student_every_other\last.ckpt `
+    --simulator newton `
+    --motion-file .\HumanRetargeting\biomechanics_retarget\processed_data\S_GENERIC\yaml_data\experiment_matrix\every_other.yaml `
+    --num-envs 8 `
+    --full-eval `
+    --headless
+
+  Run speed-only deployment inference with no motion library:
+
+  python .\protomotions\inference_agent.py `
+    --checkpoint .\results\s_generic_student_every_other\last.ckpt `
+    --simulator newton `
+    --deployment-mode `
+    --target-speed 3.5 `
+    --num-envs 1
+
+  Swap the manifest path and experiment name for other subsets:
+
+  - `all_8.yaml`
+  - `anchor_3.yaml`
+  - `speed_2.yaml`
+  - `leave_edge_low.yaml`
+  - `leave_edge_high.yaml`
+  - `loo_15.yaml`
+  - `loo_20.yaml`
+  - `loo_25.yaml`
+  - `loo_30.yaml`
+  - `loo_35.yaml`
+  - `loo_40.yaml`
+  - `loo_45.yaml`
+  - `loo_50.yaml`
 
 
     

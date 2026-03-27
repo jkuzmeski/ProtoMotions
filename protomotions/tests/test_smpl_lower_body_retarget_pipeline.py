@@ -7,12 +7,19 @@ import json
 import numpy as np
 import pytest
 import torch
+import yaml
 
 from HumanRetargeting.biomechanics_retarget.convert_retargeted_to_motion import (
     convert_npz_to_motion,
     load_npz_file,
 )
 from HumanRetargeting.biomechanics_retarget.pipeline import PipelineStep, main as run_pipeline
+import HumanRetargeting.biomechanics_retarget.stages.package as package_module
+from HumanRetargeting.biomechanics_retarget.stages.package import (
+    create_motion_manifest,
+    generate_experiment_matrix_manifests,
+    package_motion_library,
+)
 from HumanRetargeting.biomechanics_retarget.retarget_qc import (
     evaluate_retargeted_motion,
 )
@@ -333,3 +340,196 @@ def test_pipeline_assets_step_materializes_profile_and_subject_assets(tmp_path):
     assert (assets_root / "usd" / "smpl_humanoid_lower_body_subject_H182.usda").exists()
     assert (assets_root / "urdf" / "for_retargeting" / "smpl_humanoid_lower_body_subject_H182.urdf").exists()
     assert (assets_root / "subjects" / "smpl_humanoid_lower_body_subject_H182.yaml").exists()
+
+
+def test_create_motion_manifest_preserves_explicit_metadata_and_fallback_speed(tmp_path):
+    motion_dir = tmp_path / "motion_files"
+    metadata_dir = motion_dir / "metadata"
+    metadata_dir.mkdir(parents=True)
+
+    explicit_motion_path = motion_dir / "custom_stride.motion"
+    fallback_motion_path = motion_dir / "S02_30ms_Long.motion"
+    torch.save({"rigid_body_pos": torch.zeros((5, 3, 3), dtype=torch.float32)}, explicit_motion_path)
+    torch.save({"rigid_body_pos": torch.zeros((4, 3, 3), dtype=torch.float32)}, fallback_motion_path)
+
+    explicit_source_file = tmp_path / "raw" / "subject_trial.csv"
+    explicit_source_file.parent.mkdir(parents=True, exist_ok=True)
+    metadata_dir.joinpath("custom_stride.json").write_text(
+        json.dumps(
+            {
+                "subject_id": "S02",
+                "trial_name": "custom_stride",
+                "speed_mps": 2.75,
+                "source_file": str(explicit_source_file),
+                "fps": 120,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manifest_path = tmp_path / "motions_S02.yaml"
+    create_motion_manifest(
+        motion_files=[fallback_motion_path, explicit_motion_path],
+        output_file=manifest_path,
+        fps=30,
+        subject_id="S02",
+        subset_name="speed_subset",
+    )
+
+    payload = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    assert payload["manifest_version"] == 1
+    assert payload["subject_id"] == "S02"
+    assert payload["subset_name"] == "speed_subset"
+    assert payload["fps"] == 30
+    assert payload["selected_files"] == ["S02_30ms_Long.motion", "custom_stride.motion"]
+
+    fallback_entry, explicit_entry = payload["motions"]
+    assert fallback_entry["trial_name"] == "S02_30ms_Long"
+    assert fallback_entry["speed_mps"] == pytest.approx(3.0)
+    assert fallback_entry["subject_id"] == "S02"
+    assert fallback_entry["duration_seconds"] == pytest.approx((4 - 1) / 30.0)
+    assert fallback_entry["weight"] == 1.0
+    assert fallback_entry["sub_motions"][0]["timings"]["end"] == pytest.approx((4 - 1) / 30.0)
+
+    assert explicit_entry["trial_name"] == "custom_stride"
+    assert explicit_entry["speed_mps"] == pytest.approx(2.75)
+    assert explicit_entry["subject_id"] == "S02"
+    assert explicit_entry["fps"] == 120
+    assert explicit_entry["source_file"] == str(explicit_source_file.resolve())
+    assert explicit_entry["duration_seconds"] == pytest.approx((5 - 1) / 30.0)
+    assert explicit_entry["file"] == str(explicit_motion_path.resolve())
+
+
+def test_package_motion_library_uses_manifest_path_and_device(tmp_path, monkeypatch):
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text("manifest_version: 1\nmotions: []\n", encoding="utf-8")
+    output_path = tmp_path / "packaged" / "motions.pt"
+
+    captured: dict[str, object] = {}
+
+    class FakeMotionLib:
+        def __init__(self, config, device):
+            captured["motion_file"] = config.motion_file
+            captured["device"] = device
+
+        def save_to_file(self, output_file):
+            captured["output_file"] = output_file
+            Path(output_file).write_text("fake-packaged", encoding="utf-8")
+
+    monkeypatch.setattr(package_module, "MotionLib", FakeMotionLib)
+
+    result = package_motion_library(
+        manifest_file=manifest_path,
+        output_file=output_path,
+        device="cpu",
+    )
+
+    assert result == output_path
+    assert output_path.read_text(encoding="utf-8") == "fake-packaged"
+    assert captured["motion_file"] == str(manifest_path)
+    assert captured["device"] == "cpu"
+    assert captured["output_file"] == str(output_path)
+
+
+def test_generate_experiment_matrix_manifests_uses_explicit_filename_subsets(tmp_path):
+    motion_dir = tmp_path / "motion_files"
+    metadata_dir = motion_dir / "metadata"
+    metadata_dir.mkdir(parents=True)
+
+    trial_names = [
+        "S02_15ms_Long",
+        "S02_20ms_Long",
+        "S02_25ms_Long",
+        "S02_30ms_Long",
+        "S02_35ms_Long",
+        "S02_40ms_Long",
+        "S02_45ms_Long",
+        "S02_50ms_Long",
+    ]
+
+    motion_files = []
+    for trial_name in trial_names:
+        motion_path = motion_dir / f"{trial_name}.motion"
+        torch.save(
+            {"rigid_body_pos": torch.zeros((5, 3, 3), dtype=torch.float32)},
+            motion_path,
+        )
+        metadata_dir.joinpath(f"{trial_name}.json").write_text(
+            json.dumps(
+                {
+                    "subject_id": "S02",
+                    "trial_name": trial_name,
+                    "speed_mps": float(trial_name.split("_")[1].replace("ms", "")) / 10.0,
+                    "source_file": str((tmp_path / "raw" / f"{trial_name}.csv").resolve()),
+                    "fps": 30,
+                }
+            ),
+            encoding="utf-8",
+        )
+        motion_files.append(motion_path)
+
+    master_manifest = tmp_path / "motions_S02.yaml"
+    create_motion_manifest(
+        motion_files=motion_files,
+        output_file=master_manifest,
+        fps=30,
+        subject_id="S02",
+        subset_name="all_8",
+    )
+
+    output_dir = tmp_path / "experiment_matrix"
+    result = generate_experiment_matrix_manifests(
+        master_manifest=master_manifest,
+        output_dir=output_dir,
+    )
+
+    assert set(result.keys()) == {
+        "all_8",
+        "every_other",
+        "anchor_3",
+        "speed_2",
+        "leave_edge_low",
+        "leave_edge_high",
+        "loo_15",
+        "loo_20",
+        "loo_25",
+        "loo_30",
+        "loo_35",
+        "loo_40",
+        "loo_45",
+        "loo_50",
+    }
+
+    every_other_payload = yaml.safe_load(result["every_other"].read_text(encoding="utf-8"))
+    speed_2_payload = yaml.safe_load(result["speed_2"].read_text(encoding="utf-8"))
+    leave_edge_low_payload = yaml.safe_load(result["leave_edge_low"].read_text(encoding="utf-8"))
+    loo_35_payload = yaml.safe_load(result["loo_35"].read_text(encoding="utf-8"))
+
+    assert every_other_payload["selected_files"] == [
+        "S02_20ms_Long.motion",
+        "S02_30ms_Long.motion",
+        "S02_40ms_Long.motion",
+        "S02_50ms_Long.motion",
+    ]
+    assert speed_2_payload["selected_files"] == [
+        "S02_15ms_Long.motion",
+        "S02_35ms_Long.motion",
+    ]
+    assert leave_edge_low_payload["selected_files"] == [
+        "S02_20ms_Long.motion",
+        "S02_25ms_Long.motion",
+        "S02_30ms_Long.motion",
+        "S02_35ms_Long.motion",
+        "S02_40ms_Long.motion",
+        "S02_45ms_Long.motion",
+        "S02_50ms_Long.motion",
+    ]
+    assert loo_35_payload["selected_files"] == [
+        "S02_15ms_Long.motion",
+        "S02_20ms_Long.motion",
+        "S02_25ms_Long.motion",
+        "S02_30ms_Long.motion",
+        "S02_40ms_Long.motion",
+        "S02_45ms_Long.motion",
+        "S02_50ms_Long.motion",
+    ]

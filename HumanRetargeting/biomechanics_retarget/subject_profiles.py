@@ -6,10 +6,15 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import json
+import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
+
+
+_SPEED_FILENAME_RE = re.compile(r"(?P<speed>\d+(?:\.\d+)?)ms(?:[_.-]|$)", re.IGNORECASE)
 
 
 def _resolve_path(base_dir: Path, value: str | None) -> Path | None:
@@ -26,6 +31,72 @@ def _resolve_glob(base_dir: Path, value: str | None) -> str | None:
     if path.is_absolute():
         return value
     return str((base_dir / value).resolve())
+
+
+def load_json_metadata(metadata_path: Path) -> dict[str, Any]:
+    """Load a JSON sidecar if present, returning an empty mapping when absent."""
+    if not metadata_path.exists():
+        return {}
+
+    data = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"metadata sidecar at {metadata_path} must be a JSON object")
+    return data
+
+
+def parse_speed_mps_from_filename(filename: str) -> float | None:
+    """Parse a treadmill speed from a trial filename as a fallback only."""
+    match = _SPEED_FILENAME_RE.search(filename)
+    if not match:
+        return None
+    raw_speed = match.group("speed")
+    speed = float(raw_speed)
+    return speed if "." in raw_speed else speed / 10.0
+
+
+def resolve_trial_speed_mps(
+    trial_name: str,
+    *,
+    speed_mps: float | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> float | None:
+    """Resolve a trial speed from explicit metadata, then filename fallback."""
+    if speed_mps is not None:
+        return float(speed_mps)
+
+    if metadata is not None:
+        metadata_speed = metadata.get("speed_mps")
+        if metadata_speed is not None:
+            return float(metadata_speed)
+
+    return parse_speed_mps_from_filename(trial_name)
+
+
+def speed_mps_slug(speed_mps: float | None) -> str:
+    """Return a stable filename-safe slug for a speed value."""
+    if speed_mps is None:
+        return "unknown"
+    return f"{speed_mps:g}".replace("-", "neg").replace(".", "p")
+
+
+def build_trial_metadata_payload(
+    *,
+    subject_id: str,
+    trial_name: str,
+    speed_mps: float | None,
+    source_file: Path | str,
+    fps: int,
+    duration_seconds: float,
+) -> dict[str, Any]:
+    """Build the canonical per-trial metadata payload."""
+    return {
+        "subject_id": subject_id,
+        "trial_name": trial_name,
+        "speed_mps": float(speed_mps) if speed_mps is not None else None,
+        "source_file": str(Path(source_file).resolve()),
+        "fps": int(fps),
+        "duration_seconds": float(duration_seconds),
+    }
 
 
 @dataclass(slots=True)

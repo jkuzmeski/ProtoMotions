@@ -686,8 +686,8 @@ def main():
         loggers=loggers,
         callbacks=callbacks,
     )
-    print(asdict(fabric_config))
-    fabric: Fabric = Fabric(**asdict(fabric_config))
+    print(fabric_config.to_fabric_kwargs())
+    fabric: Fabric = Fabric(**fabric_config.to_fabric_kwargs())
     fabric.launch()
 
     # ===================================================================

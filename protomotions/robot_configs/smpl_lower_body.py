@@ -171,7 +171,20 @@ class SmplLowerBodyRobotConfig(RobotConfig):
                 ),
             ),
             genesis=GenesisSimParams(fps=60, decimation=2, substeps=2),
-            newton=NewtonSimParams(fps=120, decimation=4, ccd_iterations=100),
+            # Lower-body treadmill/contact tracking is more contact-heavy than the
+            # default humanoid configs and can exhaust Newton/MuJoCo solver budgets,
+            # especially with many parallel environments. Use more conservative
+            # defaults here so single-GPU bootstrap training is less likely to enter
+            # unrecoverable foot-ground contact states. Cluster runs can still
+            # override these per experiment if needed.
+            newton=NewtonSimParams(
+                fps=120,
+                decimation=4,
+                iterations=200,
+                njmax=2000,
+                nconmax=1000,
+                ccd_iterations=1000,
+            ),
         )
     )
 

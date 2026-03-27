@@ -86,6 +86,7 @@ from protomotions.envs.obs.masked_mimic_obs_functions import (
 from protomotions.envs.obs.prior_obs_functions import prior_historical_obs_factory
 from protomotions.envs.obs.steering_obs_functions import steering_obs_factory
 from protomotions.envs.obs.path_obs_functions import path_obs_factory
+from protomotions.envs.obs.speed_obs_functions import speed_obs_factory
 
 __all__ = [
     # General utilities
@@ -148,4 +149,5 @@ __all__ = [
     # Other
     "steering_obs_factory",
     "path_obs_factory",
+    "speed_obs_factory",
 ]

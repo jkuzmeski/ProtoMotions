@@ -87,3 +87,24 @@ class FabricConfig:
                 else:
                     callbacks.append(callback)
             self.callbacks = callbacks
+
+    def to_fabric_kwargs(self) -> Dict[str, Any]:
+        """Return kwargs suitable for ``lightning.fabric.Fabric``.
+
+        Lightning expects omitted optional kwargs rather than explicit ``None`` for
+        fields like ``strategy``. Keep the config object expressive internally, but
+        drop unsupported ``None`` values when constructing Fabric.
+        """
+        kwargs: Dict[str, Any] = {
+            "accelerator": self.accelerator,
+            "devices": self.devices,
+            "num_nodes": self.num_nodes,
+            "precision": self.precision,
+        }
+        if self.strategy is not None:
+            kwargs["strategy"] = self.strategy
+        if self.loggers is not None:
+            kwargs["loggers"] = self.loggers
+        if self.callbacks is not None:
+            kwargs["callbacks"] = self.callbacks
+        return kwargs

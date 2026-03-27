@@ -1,0 +1,77 @@
+manifest_version: 1
+subject_id: null
+subset_name: loo_40
+source_manifest: /mnt/d/Biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/yaml_data/motions_S_GENERIC.yaml
+fps: null
+selected_files:
+- S02_15ms_Long.motion
+- S02_20ms_Long.motion
+- S02_25ms_Long.motion
+- S02_30ms_Long.motion
+- S02_35ms_Long.motion
+- S02_45ms_Long.motion
+- S02_50ms_Long.motion
+motions:
+- file: /mnt/d/Biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/motion_files/S02_15ms_Long.motion
+  fps: 30
+  weight: 1.0
+  sub_motions:
+  - idx: 0
+    timings:
+      start: 0.0
+      end: 18.166666666666668
+    weight: 1.0
+- file: /mnt/d/Biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/motion_files/S02_20ms_Long.motion
+  fps: 30
+  weight: 1.0
+  sub_motions:
+  - idx: 0
+    timings:
+      start: 0.0
+      end: 18.533333333333335
+    weight: 1.0
+- file: /mnt/d/Biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/motion_files/S02_25ms_Long.motion
+  fps: 30
+  weight: 1.0
+  sub_motions:
+  - idx: 0
+    timings:
+      start: 0.0
+      end: 18.966666666666665
+    weight: 1.0
+- file: /mnt/d/Biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/motion_files/S02_30ms_Long.motion
+  fps: 30
+  weight: 1.0
+  sub_motions:
+  - idx: 0
+    timings:
+      start: 0.0
+      end: 19.3
+    weight: 1.0
+- file: /mnt/d/Biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/motion_files/S02_35ms_Long.motion
+  fps: 30
+  weight: 1.0
+  sub_motions:
+  - idx: 0
+    timings:
+      start: 0.0
+      end: 18.5
+    weight: 1.0
+- file: /mnt/d/Biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/motion_files/S02_45ms_Long.motion
+  fps: 30
+  weight: 1.0
+  sub_motions:
+  - idx: 0
+    timings:
+      start: 0.0
+      end: 19.166666666666668
+    weight: 1.0
+- file: /mnt/d/Biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/motion_files/S02_50ms_Long.motion
+  fps: 30
+  weight: 1.0
+  sub_motions:
+  - idx: 0
+    timings:
+      start: 0.0
+      end: 18.833333333333332
+    weight: 1.0
