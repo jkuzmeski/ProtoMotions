@@ -40,3 +40,6 @@ HumanRetargeting/biomechanics_retarget/processed_data/**/overground_data/*.npy
 HumanRetargeting/biomechanics_retarget/processed_data/**/overground_data/metadata/*
 HumanRetargeting/biomechanics_retarget/processed_data/**/packaged_data/*.pt
 HumanRetargeting/biomechanics_retarget/processed_data/**/retargeted_motions/*.npz
+
+# Pretrained checkpoints and large model artifacts
+data/pretrained_models/
