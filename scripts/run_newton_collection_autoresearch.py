@@ -24,15 +24,18 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import time
 from typing import Iterable
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_PROGRAM = REPO_ROOT / "scripts" / "newton_collection_program.md"
+DEFAULT_DASHBOARD_SCRIPT = REPO_ROOT / "scripts" / "newton_collection_dashboard.py"
 DEFAULT_ALLOWED_FILES = (
     "protomotions/simulator/newton/simulator.py",
     "protomotions/simulator/newton/config.py",
 )
+HEARTBEAT_POLL_SECONDS = 10
 
 
 def _parse_args() -> argparse.Namespace:
@@ -220,12 +223,183 @@ def _render_prompt(
     )
 
 
+def _artifact_relpath(results_dir: pathlib.Path, path: pathlib.Path) -> str:
+    return str(path.relative_to(results_dir))
+
+
+def _now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def _append_jsonl(path: pathlib.Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def _write_heartbeat(
+    results_dir: pathlib.Path,
+    *,
+    phase: str,
+    status: str,
+    iteration: int | None = None,
+    detail: str | None = None,
+    artifact: str | None = None,
+    agent_output_bytes: int | None = None,
+) -> None:
+    payload: dict[str, object] = {
+        "updated_at": _now_iso(),
+        "phase": phase,
+        "status": status,
+    }
+    if iteration is not None:
+        payload["iteration"] = iteration
+    if detail:
+        payload["detail"] = detail
+    if artifact:
+        payload["artifact"] = artifact
+    if agent_output_bytes is not None:
+        payload["agent_output_bytes"] = agent_output_bytes
+    _write_json(results_dir / "heartbeat.json", payload)
+
+
+def _record_activity(
+    results_dir: pathlib.Path,
+    *,
+    event: str,
+    phase: str,
+    status: str,
+    iteration: int | None = None,
+    detail: str | None = None,
+    artifact: str | None = None,
+) -> None:
+    payload: dict[str, object] = {
+        "at": _now_iso(),
+        "event": event,
+        "phase": phase,
+        "status": status,
+    }
+    if iteration is not None:
+        payload["iteration"] = iteration
+    if detail:
+        payload["detail"] = detail
+    if artifact:
+        payload["artifact"] = artifact
+    _append_jsonl(results_dir / "activity.jsonl", payload)
+
+
+def _refresh_dashboard(repo_root: pathlib.Path, results_root: pathlib.Path) -> None:
+    if not DEFAULT_DASHBOARD_SCRIPT.exists():
+        return
+    result = _run(
+        [
+            sys.executable,
+            str(DEFAULT_DASHBOARD_SCRIPT),
+            "--repo-root",
+            str(repo_root),
+            "--results-dir",
+            str(results_root),
+        ],
+        cwd=repo_root,
+    )
+    if result.returncode != 0:
+        print(
+            "Warning: dashboard refresh failed:\n"
+            f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}",
+            file=sys.stderr,
+        )
+
+
+def _update_dashboard_progress(
+    repo_root: pathlib.Path,
+    results_root: pathlib.Path,
+    results_dir: pathlib.Path,
+    *,
+    event: str | None = None,
+    phase: str,
+    status: str,
+    iteration: int | None = None,
+    detail: str | None = None,
+    artifact: str | None = None,
+    agent_output_bytes: int | None = None,
+) -> None:
+    _write_heartbeat(
+        results_dir,
+        phase=phase,
+        status=status,
+        iteration=iteration,
+        detail=detail,
+        artifact=artifact,
+        agent_output_bytes=agent_output_bytes,
+    )
+    if event:
+        _record_activity(
+            results_dir,
+            event=event,
+            phase=phase,
+            status=status,
+            iteration=iteration,
+            detail=detail,
+            artifact=artifact,
+        )
+    _refresh_dashboard(repo_root, results_root)
+
+
+def _run_with_heartbeat(
+    cmd: list[str],
+    *,
+    cwd: pathlib.Path,
+    repo_root: pathlib.Path,
+    results_root: pathlib.Path,
+    results_dir: pathlib.Path,
+    phase: str,
+    detail: str,
+    iteration: int | None = None,
+    artifact_path: pathlib.Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    while True:
+        try:
+            stdout, stderr = process.communicate(timeout=HEARTBEAT_POLL_SECONDS)
+            return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+        except subprocess.TimeoutExpired:
+            artifact_relpath = None
+            artifact_bytes = None
+            heartbeat_detail = detail
+            if artifact_path is not None and artifact_path.exists():
+                artifact_bytes = artifact_path.stat().st_size
+                artifact_relpath = _artifact_relpath(results_dir, artifact_path)
+                heartbeat_detail = f"{detail} | {artifact_path.name} {artifact_bytes} B"
+            _update_dashboard_progress(
+                repo_root,
+                results_root,
+                results_dir,
+                phase=phase,
+                status="running",
+                iteration=iteration,
+                detail=heartbeat_detail,
+                artifact=artifact_relpath,
+                agent_output_bytes=artifact_bytes,
+            )
+
+
 def _run_codex_iteration(
     *,
     codex_bin: str,
     cwd: pathlib.Path,
+    repo_root: pathlib.Path,
+    results_root: pathlib.Path,
+    results_dir: pathlib.Path,
     prompt: str,
     model: str,
+    iteration: int,
     output_file: pathlib.Path,
 ) -> subprocess.CompletedProcess[str]:
     cmd = [
@@ -242,11 +416,40 @@ def _run_codex_iteration(
     if model:
         cmd.extend(["-m", model])
     cmd.append(prompt)
-    return _run(cmd, cwd=cwd)
+    return _run_with_heartbeat(
+        cmd,
+        cwd=cwd,
+        repo_root=repo_root,
+        results_root=results_root,
+        results_dir=results_dir,
+        phase="codex_running",
+        detail="Codex iteration is still running",
+        iteration=iteration,
+        artifact_path=output_file,
+    )
 
 
-def _run_benchmark(root: pathlib.Path, benchmark_cmd: str) -> dict[str, float]:
-    result = _run(["bash", "-lc", benchmark_cmd], cwd=root)
+def _run_benchmark(
+    root: pathlib.Path,
+    benchmark_cmd: str,
+    *,
+    repo_root: pathlib.Path,
+    results_root: pathlib.Path,
+    results_dir: pathlib.Path,
+    phase: str,
+    detail: str,
+    iteration: int | None = None,
+) -> dict[str, float]:
+    result = _run_with_heartbeat(
+        ["bash", "-lc", benchmark_cmd],
+        cwd=root,
+        repo_root=repo_root,
+        results_root=results_root,
+        results_dir=results_dir,
+        phase=phase,
+        detail=detail,
+        iteration=iteration,
+    )
     if result.returncode != 0:
         raise RuntimeError(
             f"Benchmark command failed with code {result.returncode}:\n"
@@ -290,16 +493,69 @@ def main() -> None:
         "program": str(args.program),
     }
     _write_json(results_dir / "run_config.json", metadata)
+    _update_dashboard_progress(
+        repo_root,
+        args.results_dir,
+        results_dir,
+        event="run_started",
+        phase="initializing",
+        status="running",
+        detail="Run directory created",
+    )
 
     try:
         status_entries = _git_status_entries(repo_root)
         _prepare_workspace(repo_root, workspace)
+        _update_dashboard_progress(
+            repo_root,
+            args.results_dir,
+            results_dir,
+            event="workspace_prepared",
+            phase="preparing_workspace",
+            status="running",
+            detail="Temporary worktree prepared",
+        )
         if status_entries:
             _sync_working_tree_changes(repo_root, workspace, status_entries)
+            _update_dashboard_progress(
+                repo_root,
+                args.results_dir,
+                results_dir,
+                event="workspace_synced",
+                phase="preparing_workspace",
+                status="running",
+                detail=f"Synchronized {len(status_entries)} working tree changes",
+            )
         accepted_snapshot = _capture_files(workspace, allowed_files)
 
-        best_result = _run_benchmark(workspace, args.benchmark_cmd)
+        _update_dashboard_progress(
+            repo_root,
+            args.results_dir,
+            results_dir,
+            event="baseline_benchmark_started",
+            phase="baseline_benchmark",
+            status="running",
+            detail="Measuring baseline benchmark",
+        )
+        best_result = _run_benchmark(
+            workspace,
+            args.benchmark_cmd,
+            repo_root=repo_root,
+            results_root=args.results_dir,
+            results_dir=results_dir,
+            phase="baseline_benchmark",
+            detail="Baseline benchmark still running",
+        )
         _write_json(results_dir / "baseline.json", best_result)
+        _update_dashboard_progress(
+            repo_root,
+            args.results_dir,
+            results_dir,
+            event="baseline_benchmark_completed",
+            phase="baseline_benchmark",
+            status="running",
+            detail=f"Baseline {args.metric}={best_result.get(args.metric, 'n/a')}",
+        )
 
         history: list[dict[str, object]] = []
         for iteration in range(1, args.iterations + 1):
@@ -313,14 +569,52 @@ def main() -> None:
             )
             prompt_path = results_dir / f"iteration_{iteration:02d}_prompt.txt"
             prompt_path.write_text(prompt, encoding="utf-8")
+            _update_dashboard_progress(
+                repo_root,
+                args.results_dir,
+                results_dir,
+                event="prompt_written",
+                phase="iteration_prompt",
+                status="running",
+                iteration=iteration,
+                detail=f"Prompt written for iteration {iteration:02d}",
+                artifact=_artifact_relpath(results_dir, prompt_path),
+            )
 
             agent_summary_path = results_dir / f"iteration_{iteration:02d}_agent.txt"
+            _update_dashboard_progress(
+                repo_root,
+                args.results_dir,
+                results_dir,
+                event="codex_started",
+                phase="codex_running",
+                status="running",
+                iteration=iteration,
+                detail=f"Codex iteration {iteration:02d} started",
+                artifact=_artifact_relpath(results_dir, agent_summary_path),
+            )
             codex_result = _run_codex_iteration(
                 codex_bin=args.codex_bin,
                 cwd=workspace,
+                repo_root=repo_root,
+                results_root=args.results_dir,
+                results_dir=results_dir,
                 prompt=prompt,
                 model=args.model,
+                iteration=iteration,
                 output_file=agent_summary_path,
+            )
+            _update_dashboard_progress(
+                repo_root,
+                args.results_dir,
+                results_dir,
+                event="codex_finished",
+                phase="codex_completed",
+                status="running",
+                iteration=iteration,
+                detail=f"Codex exited with code {codex_result.returncode}",
+                artifact=_artifact_relpath(results_dir, agent_summary_path),
+                agent_output_bytes=agent_summary_path.stat().st_size if agent_summary_path.exists() else None,
             )
 
             changed_files = _git_diff_names(workspace)
@@ -331,26 +625,80 @@ def main() -> None:
                 "codex_returncode": codex_result.returncode,
                 "changed_files": changed_files,
                 "unexpected_files": unexpected,
+                "agent_file": _artifact_relpath(results_dir, agent_summary_path),
             }
 
             if codex_result.returncode != 0:
                 record["status"] = "agent_failed"
                 record["stderr"] = codex_result.stderr
                 history.append(record)
+                _write_json(results_dir / "history.json", history)
+                _update_dashboard_progress(
+                    repo_root,
+                    args.results_dir,
+                    results_dir,
+                    event="iteration_failed",
+                    phase="codex_completed",
+                    status="failed",
+                    iteration=iteration,
+                    detail="Codex returned a non-zero exit code",
+                    artifact=_artifact_relpath(results_dir, agent_summary_path),
+                )
                 break
 
             if unexpected:
                 record["status"] = "unexpected_files_changed"
                 history.append(record)
+                _write_json(results_dir / "history.json", history)
+                _update_dashboard_progress(
+                    repo_root,
+                    args.results_dir,
+                    results_dir,
+                    event="iteration_failed",
+                    phase="validating_changes",
+                    status="failed",
+                    iteration=iteration,
+                    detail=f"Unexpected files changed: {', '.join(unexpected)}",
+                )
                 break
 
+            _update_dashboard_progress(
+                repo_root,
+                args.results_dir,
+                results_dir,
+                event="benchmark_started",
+                phase="iteration_benchmark",
+                status="running",
+                iteration=iteration,
+                detail=f"Benchmarking iteration {iteration:02d}",
+            )
             try:
-                benchmark_result = _run_benchmark(workspace, args.benchmark_cmd)
+                benchmark_result = _run_benchmark(
+                    workspace,
+                    args.benchmark_cmd,
+                    repo_root=repo_root,
+                    results_root=args.results_dir,
+                    results_dir=results_dir,
+                    phase="iteration_benchmark",
+                    detail=f"Benchmark still running for iteration {iteration:02d}",
+                    iteration=iteration,
+                )
             except RuntimeError as exc:
                 _restore_files(workspace, accepted_snapshot)
                 record["status"] = "benchmark_failed"
                 record["error"] = str(exc)
                 history.append(record)
+                _write_json(results_dir / "history.json", history)
+                _update_dashboard_progress(
+                    repo_root,
+                    args.results_dir,
+                    results_dir,
+                    event="iteration_failed",
+                    phase="iteration_benchmark",
+                    status="failed",
+                    iteration=iteration,
+                    detail="Benchmark failed",
+                )
                 continue
 
             record["benchmark"] = benchmark_result
@@ -362,15 +710,52 @@ def main() -> None:
                 best_result = benchmark_result
                 record["status"] = "accepted"
                 _write_json(results_dir / "best_result.json", best_result)
+                event_name = "iteration_accepted"
+                event_detail = (
+                    f"Accepted iteration {iteration:02d} with delta {improvement:+.2f} "
+                    f"{args.metric}"
+                )
             else:
                 _restore_files(workspace, accepted_snapshot)
                 record["status"] = "rejected"
+                event_name = "iteration_rejected"
+                event_detail = (
+                    f"Rejected iteration {iteration:02d} with delta {improvement:+.2f} "
+                    f"{args.metric}"
+                )
 
             history.append(record)
             _write_json(results_dir / "history.json", history)
+            _update_dashboard_progress(
+                repo_root,
+                args.results_dir,
+                results_dir,
+                event=event_name,
+                phase="iteration_complete",
+                status="running",
+                iteration=iteration,
+                detail=event_detail,
+                artifact=_artifact_relpath(results_dir, agent_summary_path),
+            )
 
         _write_json(results_dir / "history.json", history)
         _write_json(results_dir / "final_best.json", best_result)
+        final_status = "completed"
+        final_detail = "Run completed successfully"
+        if history:
+            latest_status = str(history[-1].get("status", "completed"))
+            if latest_status in {"agent_failed", "benchmark_failed", "unexpected_files_changed"}:
+                final_status = "failed"
+                final_detail = f"Run stopped after {latest_status}"
+        _update_dashboard_progress(
+            repo_root,
+            args.results_dir,
+            results_dir,
+            event="run_finished",
+            phase="run_complete",
+            status=final_status,
+            detail=final_detail,
+        )
         print(json.dumps(best_result, indent=2, sort_keys=True))
     finally:
         if not args.keep_workspace:
