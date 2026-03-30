@@ -160,7 +160,7 @@ def _prepare_workspace(repo_root: pathlib.Path, workspace: pathlib.Path) -> None
         )
 
     worktree = _run(
-        ["git", "worktree", "add", "--detach", str(workspace), "HEAD"],
+        ["git", "-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", str(workspace), "HEAD"],
         cwd=repo_root,
     )
     if worktree.returncode != 0:
@@ -561,6 +561,7 @@ def main() -> None:
                 status="running",
                 detail=f"Synchronized {len(status_entries)} working tree changes",
             )
+        baseline_dirty_files = _git_diff_names(workspace)
         accepted_snapshot = _capture_files(workspace, allowed_files)
 
         _update_dashboard_progress(
@@ -656,12 +657,13 @@ def main() -> None:
             )
 
             changed_files = _git_diff_names(workspace)
-            unexpected = sorted(set(changed_files) - set(allowed_files))
+            iteration_changed_files = sorted(set(changed_files) - set(baseline_dirty_files))
+            unexpected = sorted(set(iteration_changed_files) - set(allowed_files))
 
             record: dict[str, object] = {
                 "iteration": iteration,
                 "codex_returncode": codex_result.returncode,
-                "changed_files": changed_files,
+                "changed_files": iteration_changed_files,
                 "unexpected_files": unexpected,
                 "agent_file": _artifact_relpath(results_dir, agent_summary_path),
             }
@@ -748,6 +750,7 @@ def main() -> None:
                 best_result = benchmark_result
                 record["status"] = "accepted"
                 _write_json(results_dir / "best_result.json", best_result)
+                baseline_dirty_files = _git_diff_names(workspace)
                 event_name = "iteration_accepted"
                 event_detail = (
                     f"Accepted iteration {iteration:02d} with delta {improvement:+.2f} "
@@ -756,6 +759,7 @@ def main() -> None:
             else:
                 _restore_files(workspace, accepted_snapshot)
                 record["status"] = "rejected"
+                baseline_dirty_files = _git_diff_names(workspace)
                 event_name = "iteration_rejected"
                 event_detail = (
                     f"Rejected iteration {iteration:02d} with delta {improvement:+.2f} "
