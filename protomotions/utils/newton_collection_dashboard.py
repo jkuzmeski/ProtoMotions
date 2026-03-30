@@ -55,6 +55,12 @@ def _read_jsonl(path: pathlib.Path) -> list[dict[str, Any]]:
     return records
 
 
+def _read_text(path: pathlib.Path) -> str | None:
+    if not path.exists():
+        return None
+    return path.read_text(encoding="utf-8")
+
+
 def _coerce_float(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
@@ -111,6 +117,16 @@ def _format_event_timestamp(value: Any) -> str:
     if parsed is None:
         return "n/a"
     return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _extract_delegation_summary(text: str | None) -> str | None:
+    if not text:
+        return None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("delegation summary:"):
+            return stripped.split(":", 1)[1].strip() or "none"
+    return None
 
 
 def _format_age(seconds: float | None) -> str:
@@ -194,6 +210,10 @@ def _heartbeat_freshness(age_seconds: float | None, finalized: bool) -> str:
 def _collect_run(run_dir: pathlib.Path, results_root: pathlib.Path, now: dt.datetime) -> dict[str, Any]:
     config = _read_json(run_dir / "run_config.json") or {}
     history = _read_json(run_dir / "history.json") or []
+    for record in history:
+        agent_file = record.get("agent_file")
+        if isinstance(agent_file, str):
+            record["delegation_summary"] = _extract_delegation_summary(_read_text(run_dir / agent_file))
     baseline = _read_json(run_dir / "baseline.json") or {}
     best_result = (
         _read_json(run_dir / "final_best.json")
@@ -332,6 +352,7 @@ def _render_iteration(record: dict[str, Any], metric: str) -> str:
         if record.get(key):
             artifact_links.append(f'<a href="{html.escape(str(record[key]))}">{label}</a>')
     artifacts_html = " · ".join(artifact_links) if artifact_links else "n/a"
+    delegation_summary = str(record.get("delegation_summary", "unknown"))
 
     return (
         '<article class="iteration">'
@@ -345,6 +366,7 @@ def _render_iteration(record: dict[str, Any], metric: str) -> str:
         f"{_render_metric_pair('commit', commit)}"
         "</div>"
         f'<p class="iteration-meta"><strong>Changed:</strong> {html.escape(changed_text)}</p>'
+        f'<p class="iteration-meta"><strong>Delegation:</strong> {html.escape(delegation_summary)}</p>'
         f'<p class="iteration-meta"><strong>Artifacts:</strong> {artifacts_html}</p>'
         "</article>"
     )
@@ -376,7 +398,7 @@ def _render_iteration_chart(run: dict[str, Any]) -> str:
             {
                 "iteration": int(record["iteration"]),
                 "status": str(record.get("status", "unknown")),
-                "baseline_delta": benchmark_metric - baseline_metric,
+                "metric_value": benchmark_metric,
             }
         )
 
@@ -392,93 +414,106 @@ def _render_iteration_chart(run: dict[str, Any]) -> str:
     plot_width = width - left - right
     plot_height = height - top - bottom
 
-    delta_values = [record["baseline_delta"] for record in chart_records]
-    min_delta = min(min(delta_values), 0.0)
-    max_delta = max(max(delta_values), 0.0)
-    if min_delta == max_delta:
-        max_delta = min_delta + 1.0
-    scale_range = max_delta - min_delta
-    tick_values = [min_delta + scale_range * step / 4 for step in range(5)]
-    zero_y = top + plot_height - ((0.0 - min_delta) / scale_range) * plot_height
+    metric_values = [baseline_metric, *[record["metric_value"] for record in chart_records]]
+    min_metric = min(metric_values)
+    max_metric = max(metric_values)
+    padding = max((max_metric - min_metric) * 0.08, max(abs(max_metric), 1.0) * 0.002)
+    chart_min = min_metric - padding
+    chart_max = max_metric + padding
+    if chart_min == chart_max:
+        chart_max = chart_min + 1.0
+    scale_range = chart_max - chart_min
+    tick_values = [chart_min + scale_range * step / 4 for step in range(5)]
 
-    if len(chart_records) == 1:
+    if len(chart_records) == 0:
+        point_gap = 0.0
+        start_x = left
+    elif len(chart_records) == 1:
         point_gap = 0.0
         start_x = left + plot_width / 2
     else:
-        point_gap = plot_width / (len(chart_records) - 1)
+        point_gap = plot_width / len(chart_records)
         start_x = left
 
     svg_parts = [
         (
             f'<svg class="iteration-chart" viewBox="0 0 {int(width)} {int(height)}" '
-            'role="img" aria-label="Scatter plot showing each iteration delta from the run baseline">'
+            'role="img" aria-label="Scatter plot showing samples per second for each iteration">'
         )
     ]
 
     for value in tick_values:
-        y = top + plot_height - ((value - min_delta) / scale_range) * plot_height
+        y = top + plot_height - ((value - chart_min) / scale_range) * plot_height
         svg_parts.append(
             f'<line x1="{left:.1f}" y1="{y:.1f}" x2="{width - right:.1f}" y2="{y:.1f}" '
             'style="stroke: rgba(24, 34, 45, 0.12); stroke-width: 1;" />'
         )
         svg_parts.append(
             f'<text x="{left - 10:.1f}" y="{y + 4:.1f}" text-anchor="end" class="chart-axis">'
-            f'{html.escape(_format_signed_float(value))}'
+            f'{html.escape(_format_float(value))}'
             "</text>"
         )
 
-    svg_parts.append(
-        f'<line x1="{left:.1f}" y1="{zero_y:.1f}" x2="{width - right:.1f}" '
-        f'y2="{zero_y:.1f}" style="stroke: rgba(24, 34, 45, 0.28); stroke-width: 1.5;" />'
-    )
-
-    points: list[dict[str, Any]] = []
-    accepted_points: list[str] = []
+    baseline_x = left
+    baseline_y = top + plot_height - ((baseline_metric - chart_min) / scale_range) * plot_height
+    points: list[dict[str, Any]] = [
+        {"iteration": 0, "metric_value": baseline_metric, "status": "baseline", "x": baseline_x, "y": baseline_y}
+    ]
+    running_best = baseline_metric
+    step_segments: list[str] = [f"{baseline_x:.1f},{baseline_y:.1f}"]
     for index, record in enumerate(chart_records):
-        delta = record["baseline_delta"]
-        x = start_x + index * point_gap
-        y = top + plot_height - ((delta - min_delta) / scale_range) * plot_height
+        x = left + (index + 1) * point_gap if len(chart_records) > 1 else start_x
+        y = top + plot_height - ((record["metric_value"] - chart_min) / scale_range) * plot_height
         point = {
             "iteration": record["iteration"],
-            "delta": delta,
+            "metric_value": record["metric_value"],
             "status": record["status"],
             "x": x,
             "y": y,
         }
         points.append(point)
-        if record["status"] == "accepted":
-            accepted_points.append(f"{x:.1f},{y:.1f}")
+        step_segments.append(f"{x:.1f},{top + plot_height - ((running_best - chart_min) / scale_range) * plot_height:.1f}")
+        if record["status"] == "accepted" and record["metric_value"] > running_best:
+            running_best = record["metric_value"]
+            step_segments.append(f"{x:.1f},{top + plot_height - ((running_best - chart_min) / scale_range) * plot_height:.1f}")
 
-    if len(accepted_points) >= 2:
+    if len(step_segments) >= 2:
         svg_parts.append(
-            f'<polyline points="{" ".join(accepted_points)}" '
-            'style="fill: none; stroke: var(--ok); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round;" />'
+            f'<polyline points="{" ".join(step_segments)}" '
+            'style="fill: none; stroke: var(--ok); stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; opacity: 0.9;" />'
         )
 
     for point in points:
-        fill = _chart_fill_for_status(point["status"]) if point["status"] == "accepted" else "rgba(255, 253, 248, 0.92)"
-        stroke = _chart_fill_for_status(point["status"])
-        opacity = "0.98" if point["status"] == "accepted" else "0.55"
+        if point["status"] == "baseline":
+            fill = "var(--ok)"
+            stroke = "var(--ok)"
+            opacity = "0.92"
+        else:
+            fill = _chart_fill_for_status(point["status"]) if point["status"] == "accepted" else "rgba(255, 253, 248, 0.92)"
+            stroke = _chart_fill_for_status(point["status"])
+            opacity = "0.98" if point["status"] == "accepted" else "0.55"
+        point_label = "Baseline" if point["iteration"] == 0 else f"Iteration {point['iteration']:02d}"
+        x_label = "B" if point["iteration"] == 0 else f"{point['iteration']:02d}"
         svg_parts.append(
             f'<circle cx="{point["x"]:.1f}" cy="{point["y"]:.1f}" r="6.5" '
             f'style="fill: {fill}; stroke: {stroke}; stroke-width: 2.5; opacity: {opacity};" >'
-            f"<title>Iteration {point['iteration']:02d}: {_format_signed_float(point['delta'])} {html.escape(metric)} vs baseline ({html.escape(point['status'])})</title>"
+            f"<title>{point_label}: {_format_float(point['metric_value'])} {html.escape(metric)} ({html.escape(point['status'])})</title>"
             "</circle>"
         )
         svg_parts.append(
             f'<text x="{point["x"]:.1f}" y="{height - 14:.1f}" text-anchor="middle" class="chart-caption">'
-            f"{point['iteration']:02d}"
+            f"{x_label}"
             "</text>"
         )
 
     svg_parts.append(
         f'<text x="{left:.1f}" y="{top - 8:.1f}" text-anchor="start" class="chart-caption">'
-        f"Baseline {html.escape(_format_float(baseline_metric))} {html.escape(metric)}"
+        f"Y axis: {html.escape(metric)}"
         "</text>"
     )
     svg_parts.append(
         f'<text x="{width - right:.1f}" y="{top - 8:.1f}" text-anchor="end" class="chart-caption">'
-        "Filled points and solid line: accepted"
+        "Filled points and running-best line: kept"
         "</text>"
     )
     svg_parts.append(
@@ -489,18 +524,19 @@ def _render_iteration_chart(run: dict[str, Any]) -> str:
     svg_parts.append("</svg>")
 
     latest_iteration = chart_records[-1]
-    best_iteration = max(chart_records, key=lambda record: record["baseline_delta"])
-    average_delta = sum(delta_values) / len(delta_values)
+    best_iteration = max(chart_records, key=lambda record: record["metric_value"])
+    average_metric = sum(record["metric_value"] for record in chart_records) / len(chart_records)
     return (
         '<div class="run-chart">'
-        '<p class="eyebrow">Iteration Delta Vs Baseline</p>'
+        '<p class="eyebrow">Samples Per Second By Iteration</p>'
         '<div class="metric-stack">'
-        f"{_render_metric_pair('best delta', _format_signed_float(best_iteration['baseline_delta']))}"
-        f"{_render_metric_pair('latest delta', _format_signed_float(latest_iteration['baseline_delta']))}"
+        f"{_render_metric_pair('baseline', _format_float(baseline_metric))}"
+        f"{_render_metric_pair('best', _format_float(best_iteration['metric_value']))}"
+        f"{_render_metric_pair('latest', _format_float(latest_iteration['metric_value']))}"
         f"{_render_metric_pair('charted iterations', str(len(chart_records)))}"
-        f"{_render_metric_pair('average delta', _format_signed_float(average_delta))}"
+        f"{_render_metric_pair('average', _format_float(average_metric))}"
         "</div>"
-        '<p class="iteration-meta">Each point shows iteration benchmark minus the original run baseline.</p>'
+        '<p class="iteration-meta">Every iteration benchmark is plotted, including worse ones. The solid line tracks the running best.</p>'
         f'{"".join(svg_parts)}'
         "</div>"
     )
@@ -553,6 +589,8 @@ def _render_run_details(run: dict[str, Any], is_latest: bool) -> str:
         f"{_render_metric_pair('heartbeat', str(run['heartbeat_age_text']))}"
         f"{_render_metric_pair('heartbeat status', heartbeat_status)}"
         f"{_render_metric_pair('events', str(len(run.get('activity') or [])))}"
+        f"{_render_metric_pair('delegation mode', 'enabled' if run['config'].get('delegate_to_mini') else 'off')}"
+        f"{_render_metric_pair('subagent model', str(run['config'].get('subagent_model', 'n/a')))}"
         "</div>"
         f'<p class="iteration-meta"><span class="badge {run["heartbeat_freshness"]}">'
         f'{html.escape(run["heartbeat_freshness"])}'

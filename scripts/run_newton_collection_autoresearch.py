@@ -81,7 +81,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--subagent-model",
         type=str,
-        default="",
+        default="gpt-5.3-codex",
         help="Preferred subagent model name when delegation guidance is enabled.",
     )
     parser.add_argument(
@@ -238,6 +238,9 @@ def _render_prompt(
             "\nDelegation guidance:\n"
             "- If there are bounded side tasks that can run in parallel, prefer delegating them.\n"
             "- Keep the main critical-path implementation local.\n"
+            "- In your final note, include exactly one line starting with `Delegation summary:`.\n"
+            "- If you delegated, list the subagent model and task briefly on that line.\n"
+            "- If you did not delegate, write `Delegation summary: none`.\n"
         )
         if subagent_model:
             delegation_text += f"- Preferred subagent model: {subagent_model}\n"
@@ -539,6 +542,7 @@ def main() -> None:
     )
 
     try:
+        accepted_any = False
         status_entries = _git_status_entries(repo_root)
         _prepare_workspace(repo_root, workspace)
         _update_dashboard_progress(
@@ -750,6 +754,7 @@ def main() -> None:
                 best_result = benchmark_result
                 record["status"] = "accepted"
                 _write_json(results_dir / "best_result.json", best_result)
+                accepted_any = True
                 baseline_dirty_files = _git_diff_names(workspace)
                 event_name = "iteration_accepted"
                 event_detail = (
@@ -782,6 +787,17 @@ def main() -> None:
 
         _write_json(results_dir / "history.json", history)
         _write_json(results_dir / "final_best.json", best_result)
+        if accepted_any:
+            _restore_files(repo_root, accepted_snapshot)
+            _update_dashboard_progress(
+                repo_root,
+                args.results_dir,
+                results_dir,
+                event="best_applied_to_repo",
+                phase="run_complete",
+                status="completed",
+                detail="Applied best accepted files back to the main worktree",
+            )
         final_status = "completed"
         final_detail = "Run completed successfully"
         if history:

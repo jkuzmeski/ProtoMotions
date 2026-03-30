@@ -120,6 +120,10 @@ def test_write_dashboard_includes_git_run_heartbeat_and_activity(tmp_path: Path)
         + "\n",
         encoding="utf-8",
     )
+    (run_dir / "iteration_01_agent.txt").write_text(
+        "Optimized simulator path.\nDelegation summary: none\n",
+        encoding="utf-8",
+    )
     (run_dir / "final_best.json").write_text(
         json.dumps({"samples_per_s": 1125.0}, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -142,8 +146,9 @@ def test_write_dashboard_includes_git_run_heartbeat_and_activity(tmp_path: Path)
     assert "Newton Collection Autoresearch" in html_output
     assert "Run Heartbeat" in html_output
     assert "Recent Activity" in html_output
-    assert "Iteration Delta Vs Baseline" in html_output
+    assert "Samples Per Second By Iteration" in html_output
     assert 'class="iteration-chart"' in html_output
-    assert "Scatter plot showing each iteration delta from the run baseline" in html_output
+    assert "Scatter plot showing samples per second for each iteration" in html_output
     assert "Codex iteration is still running" in html_output
     assert "Accepted iteration 01 with delta +125.00 samples_per_s" in html_output
+    assert "Delegation:" in html_output
