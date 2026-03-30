@@ -68,6 +68,23 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model", type=str, default="")
     parser.add_argument(
+        "--reasoning-effort",
+        type=str,
+        default="",
+        help="Codex reasoning effort to request, for example low, medium, high, or xhigh.",
+    )
+    parser.add_argument(
+        "--delegate-to-mini",
+        action="store_true",
+        help="Encourage the agent to delegate suitable side tasks to a smaller subagent.",
+    )
+    parser.add_argument(
+        "--subagent-model",
+        type=str,
+        default="",
+        help="Preferred subagent model name when delegation guidance is enabled.",
+    )
+    parser.add_argument(
         "--codex-bin",
         type=str,
         default="codex",
@@ -210,9 +227,20 @@ def _render_prompt(
     baseline_result: dict[str, float],
     iteration: int,
     allowed_files: list[str],
+    delegate_to_mini: bool,
+    subagent_model: str,
 ) -> str:
     program_text = program_path.read_text(encoding="utf-8").strip()
     allowed_text = "\n".join(f"- {path}" for path in allowed_files)
+    delegation_text = ""
+    if delegate_to_mini:
+        delegation_text = (
+            "\nDelegation guidance:\n"
+            "- If there are bounded side tasks that can run in parallel, prefer delegating them.\n"
+            "- Keep the main critical-path implementation local.\n"
+        )
+        if subagent_model:
+            delegation_text += f"- Preferred subagent model: {subagent_model}\n"
     return (
         f"{program_text}\n\n"
         f"Current iteration: {iteration}\n"
@@ -220,6 +248,7 @@ def _render_prompt(
         f"Metric to maximize: {metric}\n"
         f"Current best result:\n{json.dumps(baseline_result, indent=2, sort_keys=True)}\n\n"
         f"Editable files:\n{allowed_text}\n"
+        f"{delegation_text}"
     )
 
 
@@ -399,6 +428,7 @@ def _run_codex_iteration(
     results_dir: pathlib.Path,
     prompt: str,
     model: str,
+    reasoning_effort: str,
     iteration: int,
     output_file: pathlib.Path,
 ) -> subprocess.CompletedProcess[str]:
@@ -415,6 +445,8 @@ def _run_codex_iteration(
     ]
     if model:
         cmd.extend(["-m", model])
+    if reasoning_effort:
+        cmd.extend(["-c", f"model_reasoning_effort={reasoning_effort}"])
     cmd.append(prompt)
     return _run_with_heartbeat(
         cmd,
@@ -490,6 +522,9 @@ def main() -> None:
         "allowed_files": allowed_files,
         "iterations": args.iterations,
         "model": args.model,
+        "reasoning_effort": args.reasoning_effort,
+        "delegate_to_mini": args.delegate_to_mini,
+        "subagent_model": args.subagent_model,
         "program": str(args.program),
     }
     _write_json(results_dir / "run_config.json", metadata)
@@ -566,6 +601,8 @@ def main() -> None:
                 baseline_result=best_result,
                 iteration=iteration,
                 allowed_files=allowed_files,
+                delegate_to_mini=args.delegate_to_mini,
+                subagent_model=args.subagent_model,
             )
             prompt_path = results_dir / f"iteration_{iteration:02d}_prompt.txt"
             prompt_path.write_text(prompt, encoding="utf-8")
@@ -601,6 +638,7 @@ def main() -> None:
                 results_dir=results_dir,
                 prompt=prompt,
                 model=args.model,
+                reasoning_effort=args.reasoning_effort,
                 iteration=iteration,
                 output_file=agent_summary_path,
             )
