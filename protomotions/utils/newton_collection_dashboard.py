@@ -15,6 +15,8 @@ from typing import Any
 
 REFRESH_SECONDS = 15
 RECENT_ACTIVITY_LIMIT = 10
+MASTER_CHANGE_LOG_JSONL = "master_change_log.jsonl"
+MASTER_CHANGE_LOG_MD = "master_change_log.md"
 
 
 def _run_git(repo_root: pathlib.Path, args: list[str]) -> str:
@@ -295,6 +297,7 @@ def collect_dashboard_data(repo_root: pathlib.Path, results_root: pathlib.Path) 
         tracked_branch = latest_run["config"].get("branch_name", tracked_branch)
         base_branch = latest_run["config"].get("base_branch", base_branch)
 
+    master_log_records = _read_jsonl(results_root / MASTER_CHANGE_LOG_JSONL)
     return {
         "generated_at": now.isoformat(timespec="seconds"),
         "repo_root": str(repo_root),
@@ -304,6 +307,11 @@ def collect_dashboard_data(repo_root: pathlib.Path, results_root: pathlib.Path) 
         "git": _collect_git_state(repo_root, tracked_branch=tracked_branch, base_branch=base_branch),
         "runs": runs,
         "latest_run_id": latest_run["run_id"] if latest_run else None,
+        "master_change_log_link": MASTER_CHANGE_LOG_MD if (results_root / MASTER_CHANGE_LOG_MD).exists() else None,
+        "master_change_log_jsonl_link": (
+            MASTER_CHANGE_LOG_JSONL if (results_root / MASTER_CHANGE_LOG_JSONL).exists() else None
+        ),
+        "master_change_log_count": len(master_log_records),
     }
 
 
@@ -542,6 +550,129 @@ def _render_iteration_chart(run: dict[str, Any]) -> str:
     )
 
 
+def _render_runs_chart(runs: list[dict[str, Any]]) -> str:
+    chart_runs = [run for run in reversed(runs) if _coerce_float(run.get("best_metric")) is not None]
+    if not chart_runs:
+        return '<p class="empty">No completed runs are available yet.</p>'
+
+    width = 900.0
+    height = 280.0
+    left = 68.0
+    right = 24.0
+    top = 24.0
+    bottom = 54.0
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+
+    metric = str(chart_runs[-1].get("metric", "samples_per_s"))
+    metric_values = [_coerce_float(run["best_metric"]) or 0.0 for run in chart_runs]
+    min_metric = min(metric_values)
+    max_metric = max(metric_values)
+    padding = max((max_metric - min_metric) * 0.08, max(abs(max_metric), 1.0) * 0.002)
+    chart_min = min_metric - padding
+    chart_max = max_metric + padding
+    if chart_min == chart_max:
+        chart_max = chart_min + 1.0
+    scale_range = chart_max - chart_min
+    tick_values = [chart_min + scale_range * step / 4 for step in range(5)]
+
+    point_gap = plot_width / max(len(chart_runs) - 1, 1)
+    step_segments: list[str] = []
+    points: list[dict[str, Any]] = []
+    running_best = metric_values[0]
+    for index, run in enumerate(chart_runs):
+        x = left + index * point_gap if len(chart_runs) > 1 else left + plot_width / 2
+        y = top + plot_height - ((metric_values[index] - chart_min) / scale_range) * plot_height
+        points.append(
+            {
+                "index": index + 1,
+                "run_id": str(run["run_id"]),
+                "metric_value": metric_values[index],
+                "status": str(run.get("latest_status", "unknown")),
+                "x": x,
+                "y": y,
+            }
+        )
+        step_segments.append(
+            f"{x:.1f},{top + plot_height - ((running_best - chart_min) / scale_range) * plot_height:.1f}"
+        )
+        if metric_values[index] > running_best:
+            running_best = metric_values[index]
+            step_segments.append(
+                f"{x:.1f},{top + plot_height - ((running_best - chart_min) / scale_range) * plot_height:.1f}"
+            )
+
+    svg_parts = [
+        (
+            f'<svg class="iteration-chart" viewBox="0 0 {int(width)} {int(height)}" '
+            'role="img" aria-label="Scatter plot showing best samples per second across runs">'
+        )
+    ]
+    for value in tick_values:
+        y = top + plot_height - ((value - chart_min) / scale_range) * plot_height
+        svg_parts.append(
+            f'<line x1="{left:.1f}" y1="{y:.1f}" x2="{width - right:.1f}" y2="{y:.1f}" '
+            'style="stroke: rgba(24, 34, 45, 0.12); stroke-width: 1;" />'
+        )
+        svg_parts.append(
+            f'<text x="{left - 10:.1f}" y="{y + 4:.1f}" text-anchor="end" class="chart-axis">'
+            f"{html.escape(_format_float(value))}"
+            "</text>"
+        )
+
+    if len(step_segments) >= 2:
+        svg_parts.append(
+            f'<polyline points="{" ".join(step_segments)}" '
+            'style="fill: none; stroke: var(--ok); stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; opacity: 0.9;" />'
+        )
+
+    for point in points:
+        fill = _chart_fill_for_status(point["status"]) if point["status"] == "accepted" else "rgba(255, 253, 248, 0.92)"
+        stroke = _chart_fill_for_status(point["status"])
+        opacity = "0.98" if point["status"] == "accepted" else "0.55"
+        svg_parts.append(
+            f'<circle cx="{point["x"]:.1f}" cy="{point["y"]:.1f}" r="6.5" '
+            f'style="fill: {fill}; stroke: {stroke}; stroke-width: 2.5; opacity: {opacity};" >'
+            f"<title>Run {html.escape(point['run_id'])}: {_format_float(point['metric_value'])} {html.escape(metric)} ({html.escape(point['status'])})</title>"
+            "</circle>"
+        )
+        svg_parts.append(
+            f'<text x="{point["x"]:.1f}" y="{height - 14:.1f}" text-anchor="middle" class="chart-caption">'
+            f"{point['index']}"
+            "</text>"
+        )
+
+    svg_parts.append(
+        f'<text x="{left:.1f}" y="{top - 8:.1f}" text-anchor="start" class="chart-caption">'
+        f"Y axis: {html.escape(metric)}"
+        "</text>"
+    )
+    svg_parts.append(
+        f'<text x="{width - right:.1f}" y="{top - 8:.1f}" text-anchor="end" class="chart-caption">'
+        "Filled points and running-best line: kept"
+        "</text>"
+    )
+    svg_parts.append(
+        f'<text x="{width / 2:.1f}" y="{height - 32:.1f}" text-anchor="middle" class="chart-caption">'
+        "Run index"
+        "</text>"
+    )
+    svg_parts.append("</svg>")
+
+    return (
+        '<div class="run-chart">'
+        '<p class="eyebrow">Across Runs</p>'
+        '<div class="metric-stack">'
+        f"{_render_metric_pair('runs charted', str(len(chart_runs)))}"
+        f"{_render_metric_pair('best run', _format_float(max(metric_values)))}"
+        f"{_render_metric_pair('latest run', _format_float(metric_values[-1]))}"
+        "</div>"
+        '<p class="iteration-meta">Best samples per second from each run. The solid line tracks the running best across runs.</p>'
+        f'{"".join(svg_parts)}'
+        "</div>"
+    )
+
+
 def _render_activity(run: dict[str, Any]) -> str:
     activity = run.get("recent_activity") or []
     if not activity:
@@ -668,6 +799,17 @@ def render_dashboard_html(payload: dict[str, Any]) -> str:
     status_lines_html = "".join(
         f"<li>{html.escape(line)}</li>" for line in git_state.get("status_lines", [])
     ) or "<li>clean</li>"
+    runs_chart_html = _render_runs_chart(payload["runs"])
+    master_log_links: list[str] = []
+    if payload.get("master_change_log_link"):
+        master_log_links.append(
+            f'<a href="{html.escape(str(payload["master_change_log_link"]))}">master change log</a>'
+        )
+    if payload.get("master_change_log_jsonl_link"):
+        master_log_links.append(
+            f'<a href="{html.escape(str(payload["master_change_log_jsonl_link"]))}">master change log jsonl</a>'
+        )
+    master_log_html = " · ".join(master_log_links) if master_log_links else "No master changelog yet."
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -898,6 +1040,12 @@ def render_dashboard_html(payload: dict[str, Any]) -> str:
     <section class="section">
       <h3>Branch Divergence</h3>
       {divergence_html}
+    </section>
+
+    <section class="section">
+      <h3>Cross-Run Progress</h3>
+      <p class="empty">Master changelog entries: {payload['master_change_log_count']}. {master_log_html}</p>
+      {runs_chart_html}
     </section>
 
     <section class="section">

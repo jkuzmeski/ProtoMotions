@@ -31,6 +31,8 @@ from typing import Iterable
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_PROGRAM = REPO_ROOT / "scripts" / "newton_collection_program.md"
 DEFAULT_DASHBOARD_SCRIPT = REPO_ROOT / "scripts" / "newton_collection_dashboard.py"
+MASTER_CHANGE_LOG_JSONL = "master_change_log.jsonl"
+MASTER_CHANGE_LOG_MD = "master_change_log.md"
 DEFAULT_ALLOWED_FILES = (
     "protomotions/simulator/newton/simulator.py",
     "protomotions/simulator/newton/config.py",
@@ -229,6 +231,7 @@ def _render_prompt(
     allowed_files: list[str],
     delegate_to_mini: bool,
     subagent_model: str,
+    prior_attempts_text: str,
 ) -> str:
     program_text = program_path.read_text(encoding="utf-8").strip()
     allowed_text = "\n".join(f"- {path}" for path in allowed_files)
@@ -250,6 +253,7 @@ def _render_prompt(
         f"Benchmark command:\n{benchmark_cmd}\n\n"
         f"Metric to maximize: {metric}\n"
         f"Current best result:\n{json.dumps(baseline_result, indent=2, sort_keys=True)}\n\n"
+        f"Prior attempt summary:\n{prior_attempts_text}\n\n"
         f"Editable files:\n{allowed_text}\n"
         f"{delegation_text}"
     )
@@ -267,6 +271,22 @@ def _append_jsonl(path: pathlib.Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def _read_jsonl(path: pathlib.Path) -> list[dict[str, object]]:
+    if not path.exists():
+        return []
+    records: list[dict[str, object]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            records.append(payload)
+    return records
 
 
 def _write_heartbeat(
@@ -508,6 +528,133 @@ def _write_json(path: pathlib.Path, payload: object) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _load_master_change_records(results_root: pathlib.Path) -> list[dict[str, object]]:
+    path = results_root / MASTER_CHANGE_LOG_JSONL
+    if path.exists():
+        return _read_jsonl(path)
+    records: list[dict[str, object]] = []
+    for run_dir in sorted(path for path in results_root.iterdir() if path.is_dir()):
+        config_path = run_dir / "run_config.json"
+        history_path = run_dir / "history.json"
+        if not config_path.exists() or not history_path.exists():
+            continue
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        history = json.loads(history_path.read_text(encoding="utf-8"))
+        metric = str(config.get("metric", "samples_per_s"))
+        for record in history:
+            benchmark = record.get("benchmark") if isinstance(record.get("benchmark"), dict) else {}
+            records.append(
+                {
+                    "run_id": run_dir.name,
+                    "iteration": record.get("iteration"),
+                    "status": record.get("status"),
+                    "metric": metric,
+                    "metric_value": benchmark.get(metric, "n/a") if isinstance(benchmark, dict) else "n/a",
+                    "improvement": record.get("improvement", "n/a"),
+                    "changed_files": record.get("changed_files", []),
+                    "unexpected_files": record.get("unexpected_files", []),
+                    "delegation_summary": "unknown",
+                }
+            )
+    return records
+
+
+def _extract_delegation_summary(text: str | None) -> str | None:
+    if not text:
+        return None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("delegation summary:"):
+            return stripped.split(":", 1)[1].strip() or "none"
+    return None
+
+
+def _build_master_change_context(results_root: pathlib.Path, metric: str, limit: int = 12) -> str:
+    records = [record for record in _load_master_change_records(results_root) if record.get("metric") == metric]
+    if not records:
+        return "No prior logged attempts yet."
+
+    lines: list[str] = []
+    for record in records[-limit:]:
+        changed_files = record.get("changed_files") or []
+        changed_text = ", ".join(str(path) for path in changed_files) if changed_files else "none"
+        lines.append(
+            f"- run {record.get('run_id')} iter {record.get('iteration'):02d} | "
+            f"status={record.get('status')} | "
+            f"samples_per_s={record.get('metric_value', 'n/a')} | "
+            f"delta={record.get('improvement', 'n/a')} | "
+            f"files={changed_text} | "
+            f"delegation={record.get('delegation_summary', 'unknown')}"
+        )
+    return "\n".join(lines)
+
+
+def _write_master_change_log(results_root: pathlib.Path) -> None:
+    records = _load_master_change_records(results_root)
+    lines = [
+        "# Newton Collection Master Change Log",
+        "",
+        "Persistent summary of every autoresearch iteration across runs.",
+        "",
+    ]
+    if not records:
+        lines.append("No entries yet.")
+    else:
+        for record in records:
+            changed_files = record.get("changed_files") or []
+            changed_text = ", ".join(str(path) for path in changed_files) if changed_files else "none"
+            lines.extend(
+                [
+                    f"## {record.get('run_id')} iteration {int(record.get('iteration', 0)):02d}",
+                    f"- Status: `{record.get('status', 'unknown')}`",
+                    f"- Metric: `{record.get('metric', 'n/a')}`",
+                    f"- Value: `{record.get('metric_value', 'n/a')}`",
+                    f"- Delta vs current best at the time: `{record.get('improvement', 'n/a')}`",
+                    f"- Changed files: `{changed_text}`",
+                    f"- Delegation: `{record.get('delegation_summary', 'unknown')}`",
+                    "",
+                ]
+            )
+    (results_root / MASTER_CHANGE_LOG_MD).write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def _ensure_master_change_log_seeded(results_root: pathlib.Path) -> None:
+    jsonl_path = results_root / MASTER_CHANGE_LOG_JSONL
+    if jsonl_path.exists():
+        return
+    records = _load_master_change_records(results_root)
+    if not records:
+        return
+    with jsonl_path.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+    _write_master_change_log(results_root)
+
+
+def _append_master_change_record(
+    results_root: pathlib.Path,
+    *,
+    run_id: str,
+    metric: str,
+    record: dict[str, object],
+    agent_summary_text: str | None,
+) -> None:
+    benchmark = record.get("benchmark") if isinstance(record.get("benchmark"), dict) else {}
+    entry = {
+        "run_id": run_id,
+        "iteration": record.get("iteration"),
+        "status": record.get("status"),
+        "metric": metric,
+        "metric_value": benchmark.get(metric, "n/a") if isinstance(benchmark, dict) else "n/a",
+        "improvement": record.get("improvement", "n/a"),
+        "changed_files": record.get("changed_files", []),
+        "unexpected_files": record.get("unexpected_files", []),
+        "delegation_summary": _extract_delegation_summary(agent_summary_text) or "unknown",
+    }
+    _append_jsonl(results_root / MASTER_CHANGE_LOG_JSONL, entry)
+    _write_master_change_log(results_root)
+
+
 def main() -> None:
     args = _parse_args()
     repo_root = REPO_ROOT
@@ -515,6 +662,7 @@ def main() -> None:
     run_id = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     results_dir = args.results_dir / run_id
     results_dir.mkdir(parents=True, exist_ok=False)
+    _ensure_master_change_log_seeded(args.results_dir)
 
     workspace = args.workspace
     metadata = {
@@ -608,6 +756,7 @@ def main() -> None:
                 allowed_files=allowed_files,
                 delegate_to_mini=args.delegate_to_mini,
                 subagent_model=args.subagent_model,
+                prior_attempts_text=_build_master_change_context(args.results_dir, args.metric),
             )
             prompt_path = results_dir / f"iteration_{iteration:02d}_prompt.txt"
             prompt_path.write_text(prompt, encoding="utf-8")
@@ -647,6 +796,7 @@ def main() -> None:
                 iteration=iteration,
                 output_file=agent_summary_path,
             )
+            agent_summary_text = agent_summary_path.read_text(encoding="utf-8") if agent_summary_path.exists() else None
             _update_dashboard_progress(
                 repo_root,
                 args.results_dir,
@@ -677,6 +827,13 @@ def main() -> None:
                 record["stderr"] = codex_result.stderr
                 history.append(record)
                 _write_json(results_dir / "history.json", history)
+                _append_master_change_record(
+                    args.results_dir,
+                    run_id=run_id,
+                    metric=args.metric,
+                    record=record,
+                    agent_summary_text=agent_summary_text,
+                )
                 _update_dashboard_progress(
                     repo_root,
                     args.results_dir,
@@ -694,6 +851,13 @@ def main() -> None:
                 record["status"] = "unexpected_files_changed"
                 history.append(record)
                 _write_json(results_dir / "history.json", history)
+                _append_master_change_record(
+                    args.results_dir,
+                    run_id=run_id,
+                    metric=args.metric,
+                    record=record,
+                    agent_summary_text=agent_summary_text,
+                )
                 _update_dashboard_progress(
                     repo_root,
                     args.results_dir,
@@ -733,6 +897,13 @@ def main() -> None:
                 record["error"] = str(exc)
                 history.append(record)
                 _write_json(results_dir / "history.json", history)
+                _append_master_change_record(
+                    args.results_dir,
+                    run_id=run_id,
+                    metric=args.metric,
+                    record=record,
+                    agent_summary_text=agent_summary_text,
+                )
                 _update_dashboard_progress(
                     repo_root,
                     args.results_dir,
@@ -773,6 +944,13 @@ def main() -> None:
 
             history.append(record)
             _write_json(results_dir / "history.json", history)
+            _append_master_change_record(
+                args.results_dir,
+                run_id=run_id,
+                metric=args.metric,
+                record=record,
+                agent_summary_text=agent_summary_text,
+            )
             _update_dashboard_progress(
                 repo_root,
                 args.results_dir,

@@ -120,6 +120,24 @@ def test_write_dashboard_includes_git_run_heartbeat_and_activity(tmp_path: Path)
         + "\n",
         encoding="utf-8",
     )
+    (results_root / "master_change_log.jsonl").write_text(
+        json.dumps(
+            {
+                "run_id": "20260327_181300",
+                "iteration": 1,
+                "status": "accepted",
+                "metric": "samples_per_s",
+                "metric_value": 1125.0,
+                "improvement": 125.0,
+                "changed_files": ["protomotions/simulator/newton/simulator.py"],
+                "delegation_summary": "none",
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (results_root / "master_change_log.md").write_text("# master log\n", encoding="utf-8")
     (run_dir / "iteration_01_agent.txt").write_text(
         "Optimized simulator path.\nDelegation summary: none\n",
         encoding="utf-8",
@@ -146,9 +164,12 @@ def test_write_dashboard_includes_git_run_heartbeat_and_activity(tmp_path: Path)
     assert "Newton Collection Autoresearch" in html_output
     assert "Run Heartbeat" in html_output
     assert "Recent Activity" in html_output
+    assert "Cross-Run Progress" in html_output
     assert "Samples Per Second By Iteration" in html_output
     assert 'class="iteration-chart"' in html_output
     assert "Scatter plot showing samples per second for each iteration" in html_output
+    assert "Scatter plot showing best samples per second across runs" in html_output
     assert "Codex iteration is still running" in html_output
     assert "Accepted iteration 01 with delta +125.00 samples_per_s" in html_output
     assert "Delegation:" in html_output
+    assert "master change log" in html_output
