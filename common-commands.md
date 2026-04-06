@@ -58,6 +58,21 @@
     --num-envs 64 \
     --batch-size 256
 
+  Visual check the trained teacher (viewer on, no --headless):
+
+  python protomotions/inference_agent.py \
+    --checkpoint results/s_generic_teacher_every_other/last.ckpt \
+    --simulator newton \
+    --motion-file HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/yaml_data/experiment_matrix/every_other.yaml \
+    --num-envs 1
+
+  python protomotions/inference_agent.py \
+    --checkpoint results/s_generic_teacher_every_other/last.ckpt \
+    --simulator newton \
+    --motion-file HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/yaml_data/experiment_matrix/every_other.yaml \
+    --num-envs 1 \
+    
+
   Train the speed-conditioned student on the same subset:
 
   python protomotions/train_agent.py \
@@ -69,6 +84,14 @@
     --expert-model-path results/s_generic_teacher_every_other/last.ckpt \
     --num-envs 64 \
     --batch-size 256
+
+  Visual check the trained student (viewer on, no --headless):
+
+  python protomotions/inference_agent.py \
+    --checkpoint results/s_generic_student_every_other/last.ckpt \
+    --simulator newton \
+    --motion-file HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/yaml_data/experiment_matrix/every_other.yaml \
+    --num-envs 1
 
   Run motion-backed biomechanics evaluation for a trained student:
 
@@ -165,6 +188,14 @@ windows powershell commands
     --num-envs 64 `
     --batch-size 256
 
+  Visual check the trained teacher (viewer on, no --headless):
+
+  python .\protomotions\inference_agent.py `
+    --checkpoint .\results\s_generic_teacher_every_other\last.ckpt `
+    --simulator newton `
+    --motion-file .\HumanRetargeting\biomechanics_retarget\processed_data\S_GENERIC\yaml_data\experiment_matrix\every_other.yaml `
+    --num-envs 1
+
   Train the speed-conditioned student on the same subset:
 
   python .\protomotions\train_agent.py `
@@ -176,6 +207,14 @@ windows powershell commands
     --expert-model-path .\results\s_generic_teacher_every_other\last.ckpt `
     --num-envs 64 `
     --batch-size 256
+
+  Visual check the trained student (viewer on, no --headless):
+
+  python .\protomotions\inference_agent.py `
+    --checkpoint .\results\s_generic_student_every_other\last.ckpt `
+    --simulator newton `
+    --motion-file .\HumanRetargeting\biomechanics_retarget\processed_data\S_GENERIC\yaml_data\experiment_matrix\every_other.yaml `
+    --num-envs 1
 
   Run motion-backed biomechanics evaluation for a trained student:
 

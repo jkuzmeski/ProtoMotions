@@ -106,6 +106,8 @@ class _EpisodeTracker:
 class BiomechanicsEvaluator(BaseEvaluator):
     """Speed-conditioned gait evaluator for biomechanics analysis."""
 
+    _CYCLE_NORMALIZED_JOINTS: Tuple[str, ...] = ("hip", "knee", "ankle")
+
     def __init__(self, agent: Any, fabric: Any, config: BiomechanicsEvaluatorConfig):
         super().__init__(agent, fabric, config)
         self.config: BiomechanicsEvaluatorConfig = config
@@ -256,6 +258,25 @@ class BiomechanicsEvaluator(BaseEvaluator):
         names = ["pelvis_flex", "pelvis_add", "pelvis_rot"]
         names.extend(sorted(self._dof_feature_indices.keys()))
         return names
+
+    def _cycle_normalized_joint_plot_specs(
+        self, feature_names: Optional[Iterable[str]] = None
+    ) -> List[Tuple[str, Dict[str, str]]]:
+        available = set(self._feature_names if feature_names is None else feature_names)
+        specs: List[Tuple[str, Dict[str, str]]] = []
+
+        for joint_name in self._CYCLE_NORMALIZED_JOINTS:
+            side_features: Dict[str, str] = {}
+            left_feature = f"left_{joint_name}_flex"
+            right_feature = f"right_{joint_name}_flex"
+            if left_feature in available:
+                side_features["Left"] = left_feature
+            if right_feature in available:
+                side_features["Right"] = right_feature
+            if side_features:
+                specs.append((joint_name.capitalize(), side_features))
+
+        return specs
 
     def _cache_eval_state(self) -> None:
         self._cached_robot_state = self.env.simulator.get_robot_state()
@@ -886,6 +907,14 @@ class BiomechanicsEvaluator(BaseEvaluator):
             phase,
             waveform_exports,
         )
+        self._log_cycle_normalized_joint_figure(
+            speed_tag=speed_tag,
+            target_speed=speed_result.target_speed,
+            phase=phase,
+            waveform_exports=waveform_exports,
+            post_burn_in_cycle_count=len(post_burn_in_cycles),
+            feature_names=feature_names,
+        )
 
         with open(speed_dir / "summary.json", "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, sort_keys=True)
@@ -937,6 +966,131 @@ class BiomechanicsEvaluator(BaseEvaluator):
         fig.tight_layout()
         fig.savefig(output_path, dpi=160, bbox_inches="tight")
         plt.close(fig)
+
+    def _log_cycle_normalized_joint_figure(
+        self,
+        speed_tag: str,
+        target_speed: float,
+        phase: np.ndarray,
+        waveform_exports: Dict[str, np.ndarray],
+        post_burn_in_cycle_count: int,
+        feature_names: Optional[Iterable[str]] = None,
+    ) -> None:
+        if not self.fabric.loggers:
+            return
+
+        figure = self._create_cycle_normalized_joint_figure(
+            target_speed=target_speed,
+            phase=phase,
+            waveform_exports=waveform_exports,
+            post_burn_in_cycle_count=post_burn_in_cycle_count,
+            feature_names=feature_names,
+        )
+        if figure is None:
+            return
+
+        tag = f"eval/biomechanics/cycle_normalized_joints/{speed_tag}"
+        self._log_tensorboard_figure(tag, figure)
+
+    def _create_cycle_normalized_joint_figure(
+        self,
+        target_speed: float,
+        phase: np.ndarray,
+        waveform_exports: Dict[str, np.ndarray],
+        post_burn_in_cycle_count: int,
+        feature_names: Optional[Iterable[str]] = None,
+    ):
+        joint_specs = self._cycle_normalized_joint_plot_specs(feature_names)
+        if not joint_specs:
+            return None
+
+        try:
+            import matplotlib.pyplot as plt
+        except Exception:
+            return None
+
+        phase_percent = np.asarray(phase, dtype=np.float32) * 100.0
+        fig, axes = plt.subplots(
+            1,
+            len(joint_specs),
+            figsize=(5.2 * len(joint_specs), 4.0),
+            squeeze=False,
+        )
+        fig.suptitle(
+            f"Cycle-normalized lower-body joints @ {target_speed:.2f} m/s",
+            fontsize=14,
+        )
+
+        if post_burn_in_cycle_count <= 0:
+            for ax, (joint_label, _) in zip(axes[0], joint_specs):
+                ax.set_title(joint_label)
+                ax.set_xlim(0.0, 100.0)
+                ax.set_xlabel("Gait cycle (%)")
+                ax.set_ylabel("Angle (deg)")
+                ax.text(
+                    0.5,
+                    0.5,
+                    "No post-burn-in cycles",
+                    ha="center",
+                    va="center",
+                    transform=ax.transAxes,
+                )
+                ax.grid(True, alpha=0.2)
+            fig.tight_layout()
+            return fig
+
+        side_colors = {"Left": "tab:blue", "Right": "tab:orange"}
+        for ax, (joint_label, side_features) in zip(axes[0], joint_specs):
+            for side_label, feature_name in side_features.items():
+                mean = waveform_exports.get(f"mean__{feature_name}")
+                std = waveform_exports.get(f"std__{feature_name}")
+                if mean is None or std is None:
+                    continue
+                mean_deg = np.rad2deg(np.asarray(mean, dtype=np.float32))
+                std_deg = np.rad2deg(np.asarray(std, dtype=np.float32))
+                color = side_colors.get(side_label, "black")
+                ax.plot(
+                    phase_percent,
+                    mean_deg,
+                    label=side_label,
+                    color=color,
+                    linewidth=1.8,
+                )
+                ax.fill_between(
+                    phase_percent,
+                    mean_deg - std_deg,
+                    mean_deg + std_deg,
+                    color=color,
+                    alpha=0.18,
+                )
+
+            ax.set_title(joint_label)
+            ax.set_xlim(0.0, 100.0)
+            ax.set_xlabel("Gait cycle (%)")
+            ax.set_ylabel("Angle (deg)")
+            ax.grid(True, alpha=0.2)
+            if side_features:
+                ax.legend(frameon=False)
+
+        fig.tight_layout()
+        return fig
+
+    def _log_tensorboard_figure(self, tag: str, figure: Any) -> None:
+        try:
+            import matplotlib.pyplot as plt
+        except Exception:
+            plt = None
+
+        step = getattr(self.agent, "current_epoch", self.eval_count)
+        try:
+            for logger in self.fabric.loggers:
+                experiment = getattr(logger, "experiment", None)
+                if experiment is None or not hasattr(experiment, "add_figure"):
+                    continue
+                experiment.add_figure(tag, figure, global_step=step, close=False)
+        finally:
+            if plt is not None:
+                plt.close(figure)
 
     def _build_logs_and_export(self) -> Tuple[Dict[str, float], Optional[float]]:
         if self._export_root is None:

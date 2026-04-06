@@ -4,6 +4,7 @@
 from pathlib import Path
 import shutil
 
+import newton
 import pytest
 
 from protomotions.robot_configs.factory import robot_config
@@ -22,6 +23,38 @@ def test_smpl_lower_body_base_robot_config_loads():
     assert config.kinematic_info.num_dofs == 24
     assert config.kinematic_info.num_bodies == 9
     assert Path(config.asset.asset_root, config.asset.asset_file_name).exists()
+
+
+def test_smpl_lower_body_ellipsoid_feet_robot_config_loads():
+    config = robot_config("smpl_lower_body_ellipsoid_feet")
+
+    assert config.kinematic_info.num_dofs == 24
+    assert config.kinematic_info.num_bodies == 9
+    assert Path(config.asset.asset_root, config.asset.asset_file_name).exists()
+    assert config.contact_bodies == ["R_Ankle", "L_Ankle", "R_Toe", "L_Toe"]
+
+
+def test_smpl_lower_body_ellipsoid_feet_asset_imports_all_foot_shapes():
+    config = robot_config("smpl_lower_body_ellipsoid_feet")
+
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    builder.default_joint_cfg = newton.ModelBuilder.JointDofConfig()
+    builder.add_mjcf(
+        str(Path(config.asset.asset_root) / config.asset.asset_file_name),
+        ignore_names=["floor", "ground"],
+        collapse_fixed_joints=False,
+        floating=True,
+        enable_self_collisions=False,
+    )
+
+    assert builder.shape_count == 11
+    shape_keys = list(builder.shape_key)
+    assert "L_Ankle_geom_0" in shape_keys
+    assert "L_Ankle_geom_1" in shape_keys
+    assert "L_Toe_geom_0" in shape_keys
+    assert "R_Ankle_geom_0" in shape_keys
+    assert "R_Ankle_geom_1" in shape_keys
+    assert "R_Toe_geom_0" in shape_keys
 
 
 def test_smpl_lower_body_subject_robot_config_loads_generated_assets(

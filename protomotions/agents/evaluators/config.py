@@ -61,6 +61,17 @@ class MimicEvaluatorConfig(EvaluatorConfig):
         default=600,
         metadata={"help": "Maximum steps per evaluation episode.", "min": 1}
     )
+    early_terminate_max_joint_err: Optional[float] = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Stop collecting evaluation frames for a motion once any joint "
+                "position error exceeds this threshold in meters. None disables "
+                "eval-only early termination."
+            ),
+            "min": 0.0,
+        },
+    )
     save_predicted_motion_lib_every: Optional[int] = field(
         default=3,
         metadata={"help": "Save pred_motion_lib every M evals. None = disabled.", "min": 1}

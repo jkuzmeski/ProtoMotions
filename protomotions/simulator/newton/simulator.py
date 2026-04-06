@@ -52,6 +52,10 @@ import copy
 from protomotions.simulator.newton.opengl_compat import (
     prepare_gl_viewer_compat,
 )
+from protomotions.simulator.newton.mujoco_compat import (
+    install_mujoco_joint_arg_coercion,
+    normalize_joint_dof_mujoco_attributes,
+)
 
 wp.config.enable_backward = False
 wp.config.quiet = True
@@ -182,8 +186,11 @@ class NewtonSimulator(Simulator):
 
         self.graph = None
         self.use_cuda_graph = False
+        disable_cuda_graph = os.environ.get("PROTO_DISABLE_NEWTON_CUDA_GRAPH") == "1"
 
-        if wp.get_device().is_cuda and wp.is_mempool_enabled(wp.get_device()):
+        if disable_cuda_graph:
+            print("[INFO] Newton CUDA graph disabled by PROTO_DISABLE_NEWTON_CUDA_GRAPH=1")
+        elif wp.get_device().is_cuda and wp.is_mempool_enabled(wp.get_device()):
             print(f"[INFO] Using CUDA graph ({self.control_type.name})")
             self.use_cuda_graph = True
             zeros = torch.zeros(self.num_envs, 1, self.robot_config.number_of_actions,
@@ -590,6 +597,8 @@ class NewtonSimulator(Simulator):
     def _setup_sim(self) -> None:
         """Creates simulation using config parameters."""
         sim_params = self.config.sim
+        install_mujoco_joint_arg_coercion()
+        normalize_joint_dof_mujoco_attributes(self.model)
         self.solver = newton.solvers.SolverMuJoCo(
             self.model,
             solver=sim_params.solver,
@@ -920,7 +929,7 @@ class NewtonSimulator(Simulator):
             self.state_0, self.state_1 = self.state_1, self.state_0
 
         if self.decimation % 2 != 0:
-            self.state_0.assign(self.state_1)
+            self.state_1.assign(self.state_0)
 
     def _update_contact_sensors(self) -> None:
         """Update contact sensors after physics step. Must be called outside CUDA graph."""
@@ -967,6 +976,12 @@ class NewtonSimulator(Simulator):
             wp.capture_launch(self.graph)
         else:
             self._simulate()
+
+        # Refresh derived link transforms from the latest generalized state
+        # before any state reads. Newton reset paths already do this explicitly.
+        newton.eval_fk(
+            self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0
+        )
 
         self._update_contact_sensors()
         self.sim_time += self.frame_dt

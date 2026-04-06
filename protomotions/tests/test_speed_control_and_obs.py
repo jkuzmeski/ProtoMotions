@@ -4,10 +4,14 @@
 from types import SimpleNamespace
 import math
 import json
+import importlib
+from pathlib import Path
+import sys
 
 import pytest
 import torch
 
+import protomotions
 from protomotions.envs.control.speed_control import SpeedControl, SpeedControlConfig
 from protomotions.envs.obs.speed_obs_functions import compute_speed_obs, speed_obs_factory
 
@@ -153,3 +157,22 @@ def test_speed_control_can_source_command_from_motion_metadata(tmp_path):
 
     control.step()
     assert torch.allclose(control.get_context()["tar_speed"], torch.tensor([1.5, 2.75]))
+
+
+def test_protomotions_bootstraps_repo_root_for_human_retargeting_import():
+    repo_root = str(Path(__file__).resolve().parents[2])
+    original_sys_path = list(sys.path)
+
+    try:
+        sys.path[:] = [path for path in sys.path if path != repo_root]
+        assert repo_root not in sys.path
+
+        importlib.reload(protomotions)
+
+        assert repo_root in sys.path
+        import HumanRetargeting.biomechanics_retarget.subject_profiles as subject_profiles
+
+        assert subject_profiles is not None
+    finally:
+        sys.path[:] = original_sys_path
+        importlib.reload(protomotions)

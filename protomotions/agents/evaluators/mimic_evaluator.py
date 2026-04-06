@@ -21,6 +21,10 @@ import math
 
 from protomotions.agents.evaluators.base_evaluator import BaseEvaluator
 from protomotions.agents.evaluators.metrics import MotionMetrics
+from protomotions.agents.evaluators.eval_pruning import (
+    get_eval_termination_mask,
+    prune_completed_eval_envs,
+)
 from protomotions.components.motion_lib import MotionLib
 from protomotions.agents.evaluators.config import MimicEvaluatorConfig
 from protomotions.envs.motion_manager.mimic_motion_manager import MimicMotionManager
@@ -274,12 +278,48 @@ class MimicEvaluator(BaseEvaluator):
 
             obs_td = self.agent.obs_dict_to_tensordict(obs)
             # Update metrics (including actions for smoothness computation)
-            self.update_metrics_from_env_extras(
+            tracking_errors = self.update_metrics_from_env_extras(
                 metrics, extras, active_env_ids, active_motion_ids, actions=actions
             )
+            active_env_ids, active_motion_ids = self._prune_completed_eval_envs(
+                active_env_ids=active_env_ids,
+                active_motion_ids=active_motion_ids,
+                dones=dones,
+                terminated=terminated,
+                tracking_errors=tracking_errors,
+            )
+            if active_env_ids.numel() == 0:
+                break
 
     def add_extra_obs_to_agent(self, obs: Tensor):
         return obs
+
+    def _get_eval_termination_mask(
+        self, tracking_errors: Dict[str, Tensor]
+    ) -> Tensor:
+        """Return which active evaluation envs should stop collecting frames."""
+        return get_eval_termination_mask(
+            max_joint_err=tracking_errors["max_joint_err"],
+            threshold=self.config.early_terminate_max_joint_err,
+        )
+
+    def _prune_completed_eval_envs(
+        self,
+        active_env_ids: Tensor,
+        active_motion_ids: Tensor,
+        dones: Tensor,
+        terminated: Tensor,
+        tracking_errors: Dict[str, Tensor],
+    ) -> Tuple[Tensor, Tensor]:
+        """Drop active evaluation envs that are done or have clearly failed."""
+        return prune_completed_eval_envs(
+            active_env_ids=active_env_ids,
+            active_motion_ids=active_motion_ids,
+            dones=dones,
+            terminated=terminated,
+            max_joint_err=tracking_errors["max_joint_err"],
+            early_terminate_max_joint_err=self.config.early_terminate_max_joint_err,
+        )
 
     def _compute_tracking_errors(
         self,
@@ -338,7 +378,7 @@ class MimicEvaluator(BaseEvaluator):
         active_env_ids: Tensor,
         active_motion_ids: Tensor,
         actions: Tensor = None,
-    ) -> None:
+    ) -> Dict[str, Tensor]:
         """Update metrics by computing tracking errors directly and looking up extras.
 
         Computes tracking error metrics (gt_err, gr_err, etc.) directly from the
@@ -351,6 +391,9 @@ class MimicEvaluator(BaseEvaluator):
             active_env_ids: Environment IDs being evaluated
             active_motion_ids: Motion IDs being evaluated
             actions: Actions taken this step (for action smoothness computation)
+
+        Returns:
+            Tracking error tensors for the active evaluation envs.
         """
         assert len(active_env_ids) == len(active_motion_ids)
 
@@ -378,6 +421,8 @@ class MimicEvaluator(BaseEvaluator):
                 continue
 
             metrics[k].update(active_motion_ids, value)
+
+        return tracking_errors
 
     def process_eval_results(self, metrics: Dict) -> Tuple[Dict, Optional[float]]:
         """

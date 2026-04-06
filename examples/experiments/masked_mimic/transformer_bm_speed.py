@@ -772,43 +772,47 @@ def configure_robot_and_simulator(
 
     robot_cfg.update_fields(contact_bodies=["all_left_foot_bodies", "all_right_foot_bodies"])
 
+    friction_dr = FrictionDomainRandomizationConfig(
+        num_buckets=64,
+        static_friction_range=(0.0, 1.0),
+        dynamic_friction_range=(0.0, 1.0),
+        restitution_range=(0.0, 0.0),
+        body_names=[".*"],
+        body_indices=None,
+    )
+    if args.simulator == "newton":
+        # Newton currently becomes numerically unstable with this whole-body
+        # friction randomization under the low-friction BeyondMimic terrain.
+        friction_dr = None
+
     simulator_cfg.domain_randomization = DomainRandomizationConfig(
         action_noise=ActionNoiseDomainRandomizationConfig(
             action_noise_range=(-0.01, 0.01),
             dof_names=[".*"],
             dof_indices=None,
         ),
-        friction=FrictionDomainRandomizationConfig(
-            num_buckets=64,
-            static_friction_range=(0.0, 1.0),
-            dynamic_friction_range=(0.0, 1.0),
-            restitution_range=(0.0, 0.0),
-            body_names=[".*"],
+        friction=friction_dr,
+        center_of_mass=CenterOfMassDomainRandomizationConfig(
+            com_range={"x": (-0.01, 0.01), "y": (-0.01, 0.01), "z": (-0.01, 0.01)},
+            body_names=robot_cfg.common_naming_to_robot_body_names["torso_body_name"],
             body_indices=None,
         ),
-        center_of_mass=CenterOfMassDomainRandomizationConfig(
-            com_displacement_range=(-0.01, 0.01),
-        ),
         observation_noise=ObservationNoiseDomainRandomizationConfig(
-            noise_level=0.01,
-            global_root_pos_noise_level=0.005,
-            global_root_vel_noise_level=0.01,
-            global_body_pos_noise_level=0.005,
-            global_body_vel_noise_level=0.01,
-            dof_pos_noise_level=0.005,
-            dof_vel_noise_level=0.01,
-            root_rot_noise_level=0.01,
-            root_ang_vel_noise_level=0.01,
-            body_rot_noise_level=0.01,
-            body_ang_vel_noise_level=0.01,
-            contact_body_pos_noise_level=0.005,
-            contact_body_vel_noise_level=0.01,
-            body_contact_force_noise_level=0.01,
-            ground_heights_noise_level=0.005,
+            dof_pos_noise=0.005,
+            dof_vel_noise=0.01,
+            root_rot_noise=0.01,
+            root_ang_vel_noise=0.01,
+            anchor_rot_noise=0.01,
+            anchor_ang_vel_noise=0.01,
+            body_pos_noise=0.005,
+            body_rot_noise=0.01,
+            body_vel_noise=0.01,
+            body_ang_vel_noise=0.01,
+            ground_height_noise=0.005,
         ),
         push=PushDomainRandomizationConfig(
-            push_interval_s=(3.0, 5.0),
-            push_vel_range=(-0.5, 0.5),
-            push_strength_range=(0.5, 1.0),
+            push_interval_range=(3.0, 5.0),
+            max_linear_velocity=(0.5, 0.5, 0.0),
+            max_angular_velocity=(0.0, 0.0, 0.5),
         ),
     )
