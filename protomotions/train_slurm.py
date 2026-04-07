@@ -52,6 +52,7 @@ import argparse
 import datetime
 import os
 from pathlib import Path
+import shlex
 import subprocess
 
 
@@ -165,18 +166,49 @@ def create_parser():
     parser.add_argument("--nodes", type=int, default=1, help="Number of nodes")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("--overrides", nargs="*", default=[], help="Config overrides (key=value)")
+    parser.add_argument(
+        "--extra-args",
+        nargs=argparse.REMAINDER,
+        default=[],
+        help=(
+            "Additional raw CLI args appended to protomotions/train_agent.py. "
+            "This option must be last because it captures all remaining tokens."
+        ),
+    )
+    parser.add_argument(
+        "--sync-paths",
+        nargs="*",
+        default=[],
+        help=(
+            "Additional local repo-relative paths to rsync into the remote experiment "
+            "folder before submission, for example results/my_teacher_run"
+        ),
+    )
 
     # SLURM arguments
     parser.add_argument("-t", "--slurm-time", default="4:00:00", help="Job time limit")
     parser.add_argument("-a", "--account", default=DEFAULT_SLURM_ACCOUNT, help="SLURM account")
     parser.add_argument("-p", "--partition", default=DEFAULT_SLURM_PARTITION, help="SLURM partition")
     parser.add_argument("--array-size", type=int, default=5, help="Job array size for auto-resume")
+    parser.add_argument(
+        "--slurm-begin",
+        default=None,
+        help="Optional SBATCH --begin value, for example now+12hours",
+    )
+    parser.add_argument(
+        "--remote-dir-name",
+        default=None,
+        help=(
+            "Stable remote directory name under CLUSTER_BASE_DIR/<user>/ to reuse "
+            "the same synced repo across related jobs. Defaults to exp-<timestamp>."
+        ),
+    )
     parser.add_argument("--only-upload-code", action="store_true", help="Only sync code, don't submit")
 
     return parser
 
 
-def sync_code_to_cluster(user, exp_folder, local_repo):
+def sync_code_to_cluster(user, exp_folder, local_repo, extra_sync_paths=None):
     """Sync local code to cluster, excluding unnecessary files."""
     exclude_patterns = [
         ".git", ".idea", "**/__pycache__", "**/*.egg-info",
@@ -194,42 +226,81 @@ def sync_code_to_cluster(user, exp_folder, local_repo):
     print(f"Syncing code: {rsync_cmd}")
     subprocess_run(rsync_cmd, shell=True)
 
+    extra_sync_paths = extra_sync_paths or []
+    for raw_path in extra_sync_paths:
+        local_path = Path(raw_path).expanduser()
+        if not local_path.is_absolute():
+            local_path = (local_repo / local_path).resolve()
+        else:
+            local_path = local_path.resolve()
+
+        if not local_path.exists():
+            raise FileNotFoundError(f"Sync path does not exist: {local_path}")
+
+        try:
+            relative_path = local_path.relative_to(local_repo)
+        except ValueError as exc:
+            raise ValueError(
+                f"Sync path must live under the local repo root {local_repo}: {local_path}"
+            ) from exc
+
+        remote_parent = os.path.join(exp_folder, str(relative_path.parent))
+        subprocess_run(
+            f"ssh {user}@{CLUSTER_LOGIN_NODE} mkdir -p {shlex.quote(remote_parent)}",
+            shell=True,
+        )
+
+        source = f"{local_path}/" if local_path.is_dir() else str(local_path)
+        destination = f"{user}@{CLUSTER_LOGIN_NODE}:{remote_parent}/"
+        rsync_extra_cmd = f"rsync -az --partial --chmod=775 {shlex.quote(source)} {shlex.quote(destination)}"
+        print(f"Syncing extra path: {rsync_extra_cmd}")
+        subprocess_run(rsync_extra_cmd, shell=True)
+
 
 def build_job_command(args, exp_folder, python_path):
     """Build the training command to run inside the container."""
+    def q(value):
+        return shlex.quote(str(value))
+
     # Install package
-    job_cmd = f"pip uninstall -y protomotions 2>/dev/null; cd {exp_folder}; pip install -e . --no-dependencies; "
+    job_cmd = (
+        "pip uninstall -y protomotions 2>/dev/null; "
+        f"cd {q(exp_folder)}; "
+        "pip install -e . --no-dependencies; "
+    )
 
     # Add WANDB API key if needed
     if args.use_wandb:
         wandb_key = check_wandb_credentials(args.user)
         if wandb_key:
-            job_cmd += f"WANDB_API_KEY={wandb_key} "
+            job_cmd += f"WANDB_API_KEY={q(wandb_key)} "
 
     # Build training command
     job_cmd += (
         f"PYTHONUNBUFFERED=1 {python_path} -u protomotions/train_agent.py "
-        f"--robot-name={args.robot_name} "
-        f"--simulator={args.simulator} "
-        f"--motion-file={args.motion_file} "
-        f"--ngpu={args.ngpu} "
-        f"--nodes={args.nodes} "
-        f"--training-max-steps={args.training_max_steps} "
-        f"--experiment-name={args.experiment_name} "
-        f"--experiment-path={args.experiment_path} "
-        f"--num-envs={args.num_envs} "
-        f"--batch-size={args.batch_size} "
+        f"--robot-name={q(args.robot_name)} "
+        f"--simulator={q(args.simulator)} "
+        f"--motion-file={q(args.motion_file)} "
+        f"--ngpu={q(args.ngpu)} "
+        f"--nodes={q(args.nodes)} "
+        f"--training-max-steps={q(args.training_max_steps)} "
+        f"--experiment-name={q(args.experiment_name)} "
+        f"--experiment-path={q(args.experiment_path)} "
+        f"--num-envs={q(args.num_envs)} "
+        f"--batch-size={q(args.batch_size)} "
         f"--use-slurm "
     )
 
     if args.scenes_file:
-        job_cmd += f"--scenes-file={args.scenes_file} "
+        job_cmd += f"--scenes-file={q(args.scenes_file)} "
     if args.use_wandb:
         job_cmd += "--use-wandb "
     if args.checkpoint:
-        job_cmd += f"--checkpoint={args.checkpoint} "
+        job_cmd += f"--checkpoint={q(args.checkpoint)} "
     if args.overrides:
-        job_cmd += f"--overrides {' '.join(args.overrides)} "
+        job_cmd += "--overrides " + " ".join(q(value) for value in args.overrides) + " "
+    if args.extra_args:
+        job_cmd += " ".join(q(value) for value in args.extra_args) + " "
 
     return job_cmd
 
@@ -257,7 +328,11 @@ def generate_slurm_script(args, exp_folder, job_cmd, container_image):
 #SBATCH --output={log_file}
 #SBATCH --error={log_file}
 #SBATCH --array=0-{args.array_size}%1
+"""
+    if args.slurm_begin:
+        script += f"#SBATCH --begin={args.slurm_begin}\n"
 
+    script += f"""
 # Job array enables automatic resume: if job times out, next array task continues
 
 {srun_cmd}
@@ -272,13 +347,14 @@ def main():
     # Setup paths
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     local_repo = Path(__file__).parent.parent
-    exp_folder = os.path.join(CLUSTER_BASE_DIR, args.user, f"exp-{timestamp}")
+    remote_dir_name = args.remote_dir_name or f"exp-{timestamp}"
+    exp_folder = os.path.join(CLUSTER_BASE_DIR, args.user, remote_dir_name)
 
     print(f"Local repository: {local_repo}")
     print(f"Remote experiment folder: {exp_folder}")
 
     # Sync code
-    sync_code_to_cluster(args.user, exp_folder, local_repo)
+    sync_code_to_cluster(args.user, exp_folder, local_repo, args.sync_paths)
 
     if args.only_upload_code:
         print("Code uploaded. Exiting (--only-upload-code).")

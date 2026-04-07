@@ -108,6 +108,20 @@ callback. This callback:
 The default ``autoresume_after=12600`` (3.5 hours) works well with 4-hour job limits, 
 providing buffer time for checkpoint saving.
 
+Recent launcher additions
+-------------------------
+
+``protomotions/train_slurm.py`` also supports a few workflow helpers beyond the original
+template:
+
+* ``--remote-dir-name`` reuses a stable remote sync directory across related jobs
+* ``--sync-paths`` rsyncs extra repo-local paths such as ``results/my_teacher_run``
+* ``--slurm-begin`` adds ``#SBATCH --begin=...`` for delayed submission
+* ``--extra-args`` passes the remaining raw CLI tokens straight to
+  ``protomotions/train_agent.py``
+
+Because ``--extra-args`` captures the remainder of the command line, keep it last.
+
 Understanding Scaling Parameters
 --------------------------------
 
@@ -187,6 +201,32 @@ Once configured, launch training from your local machine:
    * - ``--use-wandb``
      - Enable Weights & Biases logging
 
+S_GENERIC Pressure-Field Example
+--------------------------------
+
+For the pressure-field contact experiment described in
+:doc:`contact_model_experiment`, the current default Slurm workflow is:
+
+.. code-block:: bash
+
+   python scripts/submit_s_generic_teacher_pressure_slurm.py \
+       --user my_cluster_username \
+       --subset every_other \
+       --remote-dir-name s_generic_every_other_pressure_suite \
+       --slurm-time 12:00:00 \
+       --partition gpu
+
+   python scripts/submit_s_generic_student_pressure_slurm.py \
+       --user my_cluster_username \
+       --subset every_other \
+       --remote-dir-name s_generic_every_other_pressure_suite \
+       --slurm-time 12:00:00 \
+       --partition gpu
+
+The student wrapper defaults to ``--slurm-begin=now+12hours`` and looks for the teacher
+checkpoint at ``results/s_generic_teacher_every_other_pressure/last.ckpt`` inside the shared
+remote directory.
+
 Multi-Node Training
 -------------------
 
@@ -233,4 +273,5 @@ Next Steps
 * :doc:`configuration` - Configuration system details
 * :doc:`experiments` - Creating custom experiments
 * :doc:`../tutorials/workflows/domain_randomization` - Domain randomization for robust policies
+* :doc:`contact_model_experiment` - SMPL foot-contact comparison and S_GENERIC Slurm wrappers
 

@@ -62,6 +62,18 @@ class NewtonSimParams(SimParams):
         default=35,
         metadata={"help": "Max CCD iterations for MuJoCo contact resolution.", "min": 1}
     )
+    pressure_field_feet: bool = field(
+        default=False,
+        metadata={"help": "Enable pressure-field contact on contact_bodies against rigid flat terrain."}
+    )
+    pressure_field_foot_sdf_max_resolution: int = field(
+        default=32,
+        metadata={"help": "Sparse SDF grid resolution for pressure-field foot shapes.", "min": 8}
+    )
+    pressure_field_foot_kh: float = field(
+        default=1.0e8,
+        metadata={"help": "Hydroelastic contact stiffness for pressure-field foot shapes."}
+    )
 
 
 @dataclass

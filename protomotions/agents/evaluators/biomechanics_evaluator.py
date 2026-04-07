@@ -51,6 +51,7 @@ class CycleRecord:
     stride_length_m: float
     cadence_steps_per_min: float
     feature_waveforms: Dict[str, np.ndarray] = field(default_factory=dict)
+    contact_maps: Dict[str, np.ndarray] = field(default_factory=dict)
 
 
 @dataclass
@@ -100,6 +101,8 @@ class _EpisodeTracker:
     cycle_buffers: Dict[str, List[float]] = field(
         default_factory=lambda: defaultdict(list)
     )
+    cycle_contact_maps: Dict[str, np.ndarray] = field(default_factory=dict)
+    cycle_contact_counts: Dict[str, int] = field(default_factory=dict)
     cycles: List[CycleRecord] = field(default_factory=list)
 
 
@@ -117,6 +120,8 @@ class BiomechanicsEvaluator(BaseEvaluator):
         self._primary_speed_control: Optional[Any] = None
         self._target_speeds: List[float] = []
         self._export_root: Optional[Path] = None
+        self._contact_feature_names: List[str] = []
+        self._contact_analysis_metadata: Optional[Dict[str, Any]] = None
 
         self._cached_robot_state = None
         self._cached_progress_buf = None
@@ -278,6 +283,60 @@ class BiomechanicsEvaluator(BaseEvaluator):
 
         return specs
 
+    def _resolve_contact_analysis_metadata(self) -> None:
+        """Discover optional simulator-side contact-analysis support."""
+        self._contact_feature_names = []
+        self._contact_analysis_metadata = None
+
+        metadata_getter = getattr(
+            self.env.simulator, "get_contact_analysis_metadata", None
+        )
+        if metadata_getter is None:
+            return
+
+        metadata = metadata_getter()
+        if not metadata:
+            return
+
+        side_names = [str(name) for name in metadata.get("side_names", [])]
+        if not side_names:
+            return
+
+        feature_names: List[str] = []
+        for side_name in side_names:
+            feature_names.extend(
+                [
+                    f"{side_name}_grf_x",
+                    f"{side_name}_grf_y",
+                    f"{side_name}_grf_z",
+                    f"{side_name}_cop_x_norm",
+                    f"{side_name}_cop_y_norm",
+                    f"{side_name}_cop_valid",
+                ]
+            )
+
+        self._contact_feature_names = feature_names
+        self._contact_analysis_metadata = metadata
+
+    def _get_contact_analysis_frame(self, current_state) -> Optional[Dict[str, np.ndarray]]:
+        """Fetch one simulator analysis frame if the backend supports it."""
+        frame_getter = getattr(self.env.simulator, "get_contact_analysis_frame", None)
+        if frame_getter is None or self._contact_analysis_metadata is None:
+            return None
+
+        return frame_getter(
+            current_state,
+            num_bins_x=self.config.contact_analysis_num_bins_x,
+            num_bins_y=self.config.contact_analysis_num_bins_y,
+        )
+
+    def _batch_scalar(self, values: Any, index: int) -> float:
+        """Read a scalar from either a torch tensor or a numpy array."""
+        value = values[index]
+        if isinstance(value, torch.Tensor):
+            return float(value.item())
+        return float(np.asarray(value).item())
+
     def _cache_eval_state(self) -> None:
         self._cached_robot_state = self.env.simulator.get_robot_state()
         self._cached_progress_buf = self.env.progress_buf.clone()
@@ -379,6 +438,7 @@ class BiomechanicsEvaluator(BaseEvaluator):
         self._target_speeds = self._resolve_target_speeds()
         self._primary_speed_control = self._get_speed_control_component()
         self._dof_feature_indices = self._infer_dof_features()
+        self._resolve_contact_analysis_metadata()
         self._feature_names = self._build_feature_names()
         self._export_root = self.root_dir / "results" / "biomechanics"
         self._speed_results = []
@@ -430,7 +490,11 @@ class BiomechanicsEvaluator(BaseEvaluator):
         left_contact = self._get_left_contact(current_state)
         return {int(env_id): bool(left_contact[int(env_id)].item()) for env_id in env_ids}
 
-    def _compute_step_signals(self, current_state) -> Dict[str, torch.Tensor]:
+    def _compute_step_signals(
+        self,
+        current_state,
+        contact_frame: Optional[Dict[str, np.ndarray]] = None,
+    ) -> Dict[str, Any]:
         root_rot = current_state.root_rot
         root_lin_vel = current_state.rigid_body_vel[:, 0, :]
 
@@ -457,6 +521,27 @@ class BiomechanicsEvaluator(BaseEvaluator):
         if current_state.dof_pos is not None:
             for feature_name, dof_idx in self._dof_feature_indices.items():
                 signals[feature_name] = current_state.dof_pos[:, dof_idx]
+
+        if contact_frame is not None:
+            side_names = list(contact_frame["side_names"])
+            grf_world = contact_frame["grf_world"]
+            cop_normalized = contact_frame["cop_normalized"]
+            cop_valid = contact_frame["cop_valid"].astype(np.float32)
+
+            for side_idx, side_name in enumerate(side_names):
+                signals[f"{side_name}_grf_x"] = grf_world[:, side_idx, 0]
+                signals[f"{side_name}_grf_y"] = grf_world[:, side_idx, 1]
+                signals[f"{side_name}_grf_z"] = grf_world[:, side_idx, 2]
+
+                cop_x = np.nan_to_num(
+                    cop_normalized[:, side_idx, 0], nan=0.0, posinf=0.0, neginf=0.0
+                )
+                cop_y = np.nan_to_num(
+                    cop_normalized[:, side_idx, 1], nan=0.0, posinf=0.0, neginf=0.0
+                )
+                signals[f"{side_name}_cop_x_norm"] = cop_x
+                signals[f"{side_name}_cop_y_norm"] = cop_y
+                signals[f"{side_name}_cop_valid"] = cop_valid[:, side_idx]
 
         return signals
 
@@ -514,6 +599,16 @@ class BiomechanicsEvaluator(BaseEvaluator):
             for feature_name, values in cycle_buffers.items()
         }
 
+        contact_maps: Dict[str, np.ndarray] = {}
+        for map_name, map_sum in tracker.cycle_contact_maps.items():
+            stance_frames = tracker.cycle_contact_counts.get(map_name, 0)
+            if stance_frames > 0:
+                contact_maps[map_name] = (map_sum / float(stance_frames)).astype(
+                    np.float32
+                )
+            else:
+                contact_maps[map_name] = np.zeros_like(map_sum, dtype=np.float32)
+
         cycle_type = "burn_in" if not tracker.burn_in_complete else "post_burn_in"
         return CycleRecord(
             env_id=tracker.env_id,
@@ -526,6 +621,7 @@ class BiomechanicsEvaluator(BaseEvaluator):
             stride_length_m=stride_length,
             cadence_steps_per_min=cadence_steps_per_min,
             feature_waveforms=waveforms,
+            contact_maps=contact_maps,
         )
 
     def _record_cycle(self, tracker: _EpisodeTracker, cycle_record: CycleRecord) -> None:
@@ -553,6 +649,38 @@ class BiomechanicsEvaluator(BaseEvaluator):
                 tracker.finished = True
                 tracker.success = True
                 tracker.failure_reason = ""
+
+    def _reset_cycle_contact_maps(self, tracker: _EpisodeTracker) -> None:
+        """Clear any per-cycle pressure-map accumulation."""
+        tracker.cycle_contact_maps = {}
+        tracker.cycle_contact_counts = {}
+
+    def _accumulate_cycle_contact_maps(
+        self,
+        tracker: _EpisodeTracker,
+        contact_frame: Optional[Dict[str, np.ndarray]],
+        env_id: int,
+    ) -> None:
+        """Accumulate stance-only pressure maps for the current gait cycle."""
+        if contact_frame is None:
+            return
+
+        side_names = list(contact_frame["side_names"])
+        pressure_maps = contact_frame["pressure_maps"][env_id]
+        cop_valid = contact_frame["cop_valid"][env_id]
+
+        for side_idx, side_name in enumerate(side_names):
+            if not bool(cop_valid[side_idx]):
+                continue
+
+            map_name = f"{side_name}_pressure_map_pa"
+            pressure_map = pressure_maps[side_idx].astype(np.float32)
+            if map_name not in tracker.cycle_contact_maps:
+                tracker.cycle_contact_maps[map_name] = np.zeros_like(pressure_map)
+                tracker.cycle_contact_counts[map_name] = 0
+
+            tracker.cycle_contact_maps[map_name] += pressure_map
+            tracker.cycle_contact_counts[map_name] += 1
 
     def _run_episode_batch(
         self,
@@ -597,7 +725,8 @@ class BiomechanicsEvaluator(BaseEvaluator):
             _, _, dones, terminated, _ = self.env.step(actions)
 
             current_state = self.env.simulator.get_robot_state()
-            signals = self._compute_step_signals(current_state)
+            contact_frame = self._get_contact_analysis_frame(current_state)
+            signals = self._compute_step_signals(current_state, contact_frame)
             left_contact = self._get_left_contact(current_state)
 
             finished_env_ids: List[int] = []
@@ -618,8 +747,9 @@ class BiomechanicsEvaluator(BaseEvaluator):
                 if tracker.cycle_started:
                     for feature_name, feature_values in signals.items():
                         tracker.cycle_buffers[feature_name].append(
-                            float(feature_values[env_t].item())
+                            self._batch_scalar(feature_values, env_t)
                         )
+                    self._accumulate_cycle_contact_maps(tracker, contact_frame, env_t)
 
                     if strike:
                         cycle_record = self._finalize_cycle(
@@ -629,18 +759,22 @@ class BiomechanicsEvaluator(BaseEvaluator):
                             self._record_cycle(tracker, cycle_record)
 
                         tracker.cycle_buffers = defaultdict(list)
+                        self._reset_cycle_contact_maps(tracker)
                         for feature_name, feature_values in signals.items():
                             tracker.cycle_buffers[feature_name].append(
-                                float(feature_values[env_t].item())
+                                self._batch_scalar(feature_values, env_t)
                             )
+                        self._accumulate_cycle_contact_maps(tracker, contact_frame, env_t)
                         tracker.last_strike_step = tracker.steps
                 elif strike:
                     tracker.cycle_started = True
                     tracker.cycle_buffers = defaultdict(list)
+                    self._reset_cycle_contact_maps(tracker)
                     for feature_name, feature_values in signals.items():
                         tracker.cycle_buffers[feature_name].append(
-                            float(feature_values[env_t].item())
+                            self._batch_scalar(feature_values, env_t)
                         )
+                    self._accumulate_cycle_contact_maps(tracker, contact_frame, env_t)
                     tracker.last_strike_step = tracker.steps
 
                 tracker.prev_left_contact = current_left_contact
@@ -810,12 +944,34 @@ class BiomechanicsEvaluator(BaseEvaluator):
         for feature_name in feature_names:
             if raw_cycles[feature_name]:
                 stacked = np.stack(raw_cycles[feature_name], axis=0)
-                mean_std_exports[f"mean__{feature_name}"] = stacked.mean(axis=0).astype(
-                    np.float32
-                )
-                mean_std_exports[f"std__{feature_name}"] = stacked.std(axis=0).astype(
-                    np.float32
-                )
+                valid_feature_name = None
+                if feature_name.endswith("_cop_x_norm"):
+                    valid_feature_name = feature_name.replace("_cop_x_norm", "_cop_valid")
+                elif feature_name.endswith("_cop_y_norm"):
+                    valid_feature_name = feature_name.replace("_cop_y_norm", "_cop_valid")
+
+                if valid_feature_name is not None and raw_cycles.get(valid_feature_name):
+                    valid_stack = np.stack(raw_cycles[valid_feature_name], axis=0) > 0.5
+                    masked = stacked.astype(np.float32)
+                    masked[~valid_stack] = np.nan
+                    if np.isfinite(masked).any():
+                        mean = np.nanmean(masked, axis=0).astype(np.float32)
+                        std = np.nanstd(masked, axis=0).astype(np.float32)
+                        mean = np.nan_to_num(mean, nan=0.0)
+                        std = np.nan_to_num(std, nan=0.0)
+                    else:
+                        mean = np.zeros(
+                            (self.config.waveform_num_points,), dtype=np.float32
+                        )
+                        std = np.zeros(
+                            (self.config.waveform_num_points,), dtype=np.float32
+                        )
+                else:
+                    mean = stacked.mean(axis=0).astype(np.float32)
+                    std = stacked.std(axis=0).astype(np.float32)
+
+                mean_std_exports[f"mean__{feature_name}"] = mean
+                mean_std_exports[f"std__{feature_name}"] = std
             else:
                 mean_std_exports[f"mean__{feature_name}"] = np.zeros(
                     (self.config.waveform_num_points,), dtype=np.float32
@@ -847,6 +1003,13 @@ class BiomechanicsEvaluator(BaseEvaluator):
 
         feature_names, phase, waveform_exports = self._build_waveform_exports(
             post_burn_in_cycles, feature_names=self._feature_names
+        )
+        contact_feature_names, contact_phase, contact_waveform_exports = (
+            self._build_waveform_exports(
+                post_burn_in_cycles, feature_names=self._contact_feature_names
+            )
+            if self._contact_feature_names
+            else ([], phase, {})
         )
 
         cycles_npz: Dict[str, np.ndarray] = {
@@ -915,6 +1078,44 @@ class BiomechanicsEvaluator(BaseEvaluator):
             post_burn_in_cycle_count=len(post_burn_in_cycles),
             feature_names=feature_names,
         )
+
+        if self._contact_analysis_metadata is not None:
+            side_names = [
+                str(name)
+                for name in self._contact_analysis_metadata.get("side_names", [])
+            ]
+            pressure_exports = self._build_pressure_map_exports(
+                post_burn_in_cycles, side_names
+            )
+            support_bounds = self._contact_analysis_metadata.get("support_bounds_xy", [])
+
+            contact_npz: Dict[str, np.ndarray] = {
+                "phase": contact_phase.astype(np.float32),
+                "feature_names": np.array(contact_feature_names, dtype=np.str_),
+                "side_names": np.array(side_names, dtype=np.str_),
+                "support_bounds_xy": (
+                    np.stack(support_bounds, axis=0).astype(np.float32)
+                    if support_bounds
+                    else np.zeros((0, 4), dtype=np.float32)
+                ),
+            }
+            contact_npz.update(contact_waveform_exports)
+            contact_npz.update(pressure_exports)
+            np.savez_compressed(speed_dir / "contact_analysis.npz", **contact_npz)
+
+            self._save_contact_waveform_plot(
+                speed_dir / "contact_waveforms.png",
+                speed_result.target_speed,
+                contact_phase,
+                contact_waveform_exports,
+                side_names,
+            )
+            self._save_pressure_map_plot(
+                speed_dir / "pressure_maps.png",
+                speed_result.target_speed,
+                pressure_exports,
+                side_names,
+            )
 
         with open(speed_dir / "summary.json", "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, sort_keys=True)
@@ -1091,6 +1292,195 @@ class BiomechanicsEvaluator(BaseEvaluator):
         finally:
             if plt is not None:
                 plt.close(figure)
+
+    def _build_pressure_map_exports(
+        self,
+        cycles: List[CycleRecord],
+        side_names: List[str],
+    ) -> Dict[str, np.ndarray]:
+        """Aggregate per-cycle pressure maps into mean/std exports."""
+        exports: Dict[str, np.ndarray] = {}
+        num_bins_y = self.config.contact_analysis_num_bins_y
+        num_bins_x = self.config.contact_analysis_num_bins_x
+
+        for side_name in side_names:
+            map_key = f"{side_name}_pressure_map_pa"
+            maps = [
+                cycle.contact_maps[map_key]
+                for cycle in cycles
+                if map_key in cycle.contact_maps
+            ]
+            if maps:
+                stacked = np.stack(maps, axis=0).astype(np.float32)
+                exports[f"mean__{map_key}"] = stacked.mean(axis=0)
+                exports[f"std__{map_key}"] = stacked.std(axis=0)
+            else:
+                exports[f"mean__{map_key}"] = np.zeros(
+                    (num_bins_y, num_bins_x), dtype=np.float32
+                )
+                exports[f"std__{map_key}"] = np.zeros(
+                    (num_bins_y, num_bins_x), dtype=np.float32
+                )
+
+        return exports
+
+    def _save_contact_waveform_plot(
+        self,
+        output_path: Path,
+        target_speed: float,
+        phase: np.ndarray,
+        waveform_exports: Dict[str, np.ndarray],
+        side_names: List[str],
+    ) -> None:
+        """Plot XYZ GRF and normalized CoP waveforms for each foot."""
+        if not side_names:
+            return
+
+        try:
+            import matplotlib.pyplot as plt
+        except Exception:
+            return
+
+        fig, axes = plt.subplots(
+            len(side_names),
+            2,
+            figsize=(11.0, 3.6 * len(side_names)),
+            squeeze=False,
+        )
+        fig.suptitle(f"Contact analysis @ {target_speed:.2f} m/s", fontsize=14)
+
+        grf_colors = {
+            "x": "tab:red",
+            "y": "tab:green",
+            "z": "tab:blue",
+        }
+        cop_colors = {
+            "x": "tab:orange",
+            "y": "tab:purple",
+        }
+
+        for row_idx, side_name in enumerate(side_names):
+            grf_ax = axes[row_idx][0]
+            cop_ax = axes[row_idx][1]
+
+            for axis_name in ("x", "y", "z"):
+                mean = waveform_exports.get(f"mean__{side_name}_grf_{axis_name}")
+                std = waveform_exports.get(f"std__{side_name}_grf_{axis_name}")
+                if mean is None or std is None:
+                    continue
+                grf_ax.plot(
+                    phase,
+                    mean,
+                    linewidth=1.5,
+                    color=grf_colors[axis_name],
+                    label=f"GRF {axis_name.upper()}",
+                )
+                grf_ax.fill_between(
+                    phase,
+                    mean - std,
+                    mean + std,
+                    color=grf_colors[axis_name],
+                    alpha=0.18,
+                )
+            grf_ax.set_title(f"{side_name.title()} foot GRF")
+            grf_ax.set_xlim(0.0, 1.0)
+            grf_ax.set_xlabel("Cycle phase")
+            grf_ax.set_ylabel("Force [N]")
+            grf_ax.grid(True, alpha=0.2)
+            grf_ax.legend(loc="upper right", fontsize=8)
+
+            for axis_name in ("x", "y"):
+                mean = waveform_exports.get(f"mean__{side_name}_cop_{axis_name}_norm")
+                std = waveform_exports.get(f"std__{side_name}_cop_{axis_name}_norm")
+                if mean is None or std is None:
+                    continue
+                cop_ax.plot(
+                    phase,
+                    mean,
+                    linewidth=1.5,
+                    color=cop_colors[axis_name],
+                    label=f"CoP {axis_name.upper()}",
+                )
+                cop_ax.fill_between(
+                    phase,
+                    mean - std,
+                    mean + std,
+                    color=cop_colors[axis_name],
+                    alpha=0.18,
+                )
+            cop_ax.set_title(f"{side_name.title()} foot normalized CoP")
+            cop_ax.set_xlim(0.0, 1.0)
+            cop_ax.set_ylim(-1.05, 1.05)
+            cop_ax.set_xlabel("Cycle phase")
+            cop_ax.set_ylabel("Normalized position")
+            cop_ax.grid(True, alpha=0.2)
+            cop_ax.legend(loc="upper right", fontsize=8)
+
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=160, bbox_inches="tight")
+        plt.close(fig)
+
+    def _save_pressure_map_plot(
+        self,
+        output_path: Path,
+        target_speed: float,
+        pressure_exports: Dict[str, np.ndarray],
+        side_names: List[str],
+    ) -> None:
+        """Plot mean stance pressure maps for each foot on normalized coordinates."""
+        if not side_names:
+            return
+
+        try:
+            import matplotlib.pyplot as plt
+        except Exception:
+            return
+
+        max_pressure = 0.0
+        for side_name in side_names:
+            map_key = f"mean__{side_name}_pressure_map_pa"
+            if map_key in pressure_exports:
+                max_pressure = max(max_pressure, float(np.max(pressure_exports[map_key])))
+        vmax = max_pressure if max_pressure > 0.0 else 1.0
+
+        fig, axes = plt.subplots(
+            1,
+            len(side_names),
+            figsize=(5.5 * len(side_names), 4.8),
+            squeeze=False,
+        )
+        fig.suptitle(f"Foot-ground pressure map @ {target_speed:.2f} m/s", fontsize=14)
+
+        for col_idx, side_name in enumerate(side_names):
+            ax = axes[0][col_idx]
+            pressure_map = pressure_exports.get(f"mean__{side_name}_pressure_map_pa")
+            if pressure_map is None:
+                pressure_map = np.zeros(
+                    (
+                        self.config.contact_analysis_num_bins_y,
+                        self.config.contact_analysis_num_bins_x,
+                    ),
+                    dtype=np.float32,
+                )
+            image = ax.imshow(
+                pressure_map,
+                origin="lower",
+                extent=(-1.0, 1.0, -1.0, 1.0),
+                cmap="magma",
+                vmin=0.0,
+                vmax=vmax,
+                aspect="auto",
+            )
+            ax.set_title(f"{side_name.title()} foot")
+            ax.set_xlabel("Normalized fore-aft")
+            ax.set_ylabel("Normalized medial-lateral")
+            ax.set_xlim(-1.0, 1.0)
+            ax.set_ylim(-1.0, 1.0)
+
+        fig.colorbar(image, ax=axes.ravel().tolist(), shrink=0.82, label="Pressure [Pa]")
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=160, bbox_inches="tight")
+        plt.close(fig)
 
     def _build_logs_and_export(self) -> Tuple[Dict[str, float], Optional[float]]:
         if self._export_root is None:

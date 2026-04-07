@@ -143,3 +143,17 @@ class BiomechanicsEvaluatorConfig(EvaluatorConfig):
             "min": 8,
         },
     )
+    contact_analysis_num_bins_x: int = field(
+        default=24,
+        metadata={
+            "help": "Number of bins along the foot length for CoP/pressure exports.",
+            "min": 4,
+        },
+    )
+    contact_analysis_num_bins_y: int = field(
+        default=12,
+        metadata={
+            "help": "Number of bins along the foot width for CoP/pressure exports.",
+            "min": 4,
+        },
+    )

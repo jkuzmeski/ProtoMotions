@@ -88,6 +88,7 @@ Quick Links
 
    user_guide/configuration
    user_guide/experiments
+   user_guide/contact_model_experiment
    user_guide/slurm_training
    user_guide/developer_tips
 

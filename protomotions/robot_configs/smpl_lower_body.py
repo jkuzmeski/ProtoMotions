@@ -40,7 +40,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ASSETS_ROOT = REPO_ROOT / "protomotions" / "data" / "assets"
 DEFAULT_RESCALE_ROOT = REPO_ROOT / "HumanRetargeting" / "rescale"
 _HEIGHT_NAME_RE = re.compile(
-    r"^smpl_lower_body(?:_(?P<height_cm>\d+)cm)?(?P<contact_pads>_contact_pads)?(?P<torque>_torque)?$"
+    r"^smpl_lower_body(?:_(?P<height_cm>\d+)cm)?(?P<ellipsoid_feet>_ellipsoid_feet)?(?P<contact_pads>_contact_pads)?(?P<torque>_torque)?$"
 )
 _SUBJECT_NAME_RE = re.compile(r"^smpl_lower_body_subject_(?P<subject_id>.+)$")
 
@@ -198,6 +198,7 @@ class SmplLowerBodyConfigFactory:
         *,
         height_cm: int | None = None,
         variant: str = "adjusted_pd",
+        ellipsoid_feet: bool = False,
         asset_root: str | Path | None = None,
         contact_pads: bool = False,
         subject_id: str | None = None,
@@ -211,6 +212,7 @@ class SmplLowerBodyConfigFactory:
         asset_stem = cls._asset_stem_for_variant(
             height_cm=height_cm,
             variant=variant,
+            ellipsoid_feet=ellipsoid_feet,
             contact_pads=contact_pads,
         )
         return cls._create_from_asset_stem(
@@ -244,11 +246,13 @@ class SmplLowerBodyConfigFactory:
             raise ValueError(f"Invalid lower-body robot name: {robot_name}")
 
         height_cm = height_match.group("height_cm")
+        ellipsoid_feet = bool(height_match.group("ellipsoid_feet"))
         contact_pads = bool(height_match.group("contact_pads"))
         variant = "adjusted_torque" if height_match.group("torque") else "adjusted_pd"
         return cls.create(
             height_cm=int(height_cm) if height_cm is not None else None,
             variant=variant,
+            ellipsoid_feet=ellipsoid_feet,
             asset_root=assets_root,
             contact_pads=contact_pads,
         )
@@ -259,8 +263,18 @@ class SmplLowerBodyConfigFactory:
         *,
         height_cm: int | None,
         variant: str,
+        ellipsoid_feet: bool,
         contact_pads: bool,
     ) -> str:
+        if ellipsoid_feet:
+            if height_cm is not None:
+                raise ValueError("Ellipsoid-feet lower-body assets do not yet support height-specific variants.")
+            if contact_pads:
+                raise ValueError("Ellipsoid-feet lower-body assets do not yet support contact-pad variants.")
+            if variant != "adjusted_pd":
+                raise ValueError("Ellipsoid-feet lower-body assets currently require the adjusted_pd control variant.")
+            return "smpl_humanoid_lower_body_ellipsoid_feet"
+
         stem = f"smpl_humanoid_lower_body_{variant}"
         if height_cm is not None:
             stem += f"_height_{height_cm}cm"

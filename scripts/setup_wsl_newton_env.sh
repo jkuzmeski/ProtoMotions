@@ -28,19 +28,35 @@ detect_local_newton_dir() {
         fi
     done
 
-    printf '%s\n' "$DEFAULT_CACHED_NEWTON_DIR"
+    return 1
 }
 
-NEWTON_DIR="${PROTOMOTIONS_NEWTON_DIR:-$(detect_local_newton_dir)}"
+if [[ -n "${PROTOMOTIONS_NEWTON_DIR:-}" ]]; then
+    NEWTON_DIR="$PROTOMOTIONS_NEWTON_DIR"
+    MANAGED_NEWTON_DIR=0
+elif LOCAL_NEWTON_DIR="$(detect_local_newton_dir)"; then
+    NEWTON_DIR="$LOCAL_NEWTON_DIR"
+    MANAGED_NEWTON_DIR=0
+else
+    NEWTON_DIR="$DEFAULT_CACHED_NEWTON_DIR"
+    MANAGED_NEWTON_DIR=1
+fi
 
 mkdir -p "$(dirname "$NEWTON_DIR")"
 
-if [[ ! -d "$NEWTON_DIR/.git" ]]; then
-    git clone https://github.com/newton-physics/newton.git "$NEWTON_DIR"
-fi
+if [[ "$MANAGED_NEWTON_DIR" -eq 1 ]]; then
+    if [[ ! -d "$NEWTON_DIR/.git" ]]; then
+        git clone https://github.com/newton-physics/newton.git "$NEWTON_DIR"
+    fi
 
-git -C "$NEWTON_DIR" fetch --all --tags
-git -C "$NEWTON_DIR" checkout "$NEWTON_REF"
+    git -C "$NEWTON_DIR" fetch --all --tags
+    git -C "$NEWTON_DIR" checkout "$NEWTON_REF"
+else
+    if [[ ! -f "$NEWTON_DIR/pyproject.toml" ]] || ! grep -q '^name = "newton"' "$NEWTON_DIR/pyproject.toml"; then
+        echo "Local Newton checkout is invalid: $NEWTON_DIR" >&2
+        exit 1
+    fi
+fi
 
 uv venv --python "$PYTHON_VERSION" "$VENV_PATH"
 

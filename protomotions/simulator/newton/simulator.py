@@ -44,9 +44,8 @@ import warp as wp
 import newton
 from newton.selection import ArticulationView
 from newton import Contacts
-from newton.sensors import SensorContact, populate_contacts
+from newton.sensors import SensorContact
 from newton.solvers import SolverNotifyFlags
-from newton.utils import create_plane_mesh
 import copy
 
 from protomotions.simulator.newton.opengl_compat import (
@@ -69,6 +68,124 @@ def _get_primary_local_ip() -> Optional[str]:
             return sock.getsockname()[0]
     except OSError:
         return None
+
+
+def _shape_label_targets_body(shape_label: str, body_name: str) -> bool:
+    """Return whether an imported Newton shape label belongs to the target body."""
+    return (
+        f"/{body_name}/" in shape_label
+        or f"/{body_name}_geom_" in shape_label
+        or shape_label.startswith(f"{body_name}_geom_")
+    )
+
+
+def _configure_pressure_field_foot_shapes(
+    builder: newton.ModelBuilder,
+    contact_bodies: list[str],
+    sim_params,
+) -> list[int]:
+    """Mark the configured contact bodies as compliant pressure-field shapes."""
+    if not getattr(sim_params, "pressure_field_feet", False):
+        return []
+
+    foot_shape_ids = [
+        shape_id
+        for shape_id, shape_label in enumerate(builder.shape_label)
+        if any(_shape_label_targets_body(shape_label, body_name) for body_name in contact_bodies)
+    ]
+    if not foot_shape_ids:
+        raise ValueError(f"No foot shapes matched contact bodies {contact_bodies!r}")
+
+    hydro_flags = int(newton.ShapeFlags.HYDROELASTIC | newton.ShapeFlags.HYDROELASTIC_COMPLIANT)
+    rigid_flag = int(newton.ShapeFlags.HYDROELASTIC_RIGID)
+    workflow = int(newton.HydroelasticContactWorkflow.PRESSURE)
+
+    for shape_id in foot_shape_ids:
+        builder.shape_flags[shape_id] = (int(builder.shape_flags[shape_id]) | hydro_flags) & ~rigid_flag
+        builder.shape_sdf_max_resolution[shape_id] = sim_params.pressure_field_foot_sdf_max_resolution
+        builder.shape_sdf_target_voxel_size[shape_id] = None
+        builder.shape_material_kh[shape_id] = sim_params.pressure_field_foot_kh
+        builder.shape_hydroelastic_contact_workflow[shape_id] = workflow
+        builder.shape_hydroelastic_contact_workflow_user_set[shape_id] = True
+
+    return foot_shape_ids
+
+
+def _quat_xyzw_to_matrix_np(quat: np.ndarray) -> np.ndarray:
+    """Convert an xyzw quaternion into a 3x3 rotation matrix."""
+    x, y, z, w = [float(v) for v in quat]
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    return np.array(
+        [
+            [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
+            [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
+            [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _transform_points_np(
+    position: np.ndarray,
+    quat_xyzw: np.ndarray,
+    points: np.ndarray,
+) -> np.ndarray:
+    """Apply an xyzw rigid transform to row-major point coordinates."""
+    rotation = _quat_xyzw_to_matrix_np(quat_xyzw)
+    return points @ rotation.T + position[None, :]
+
+
+def _make_aabb_corners_np(lower: np.ndarray, upper: np.ndarray) -> np.ndarray:
+    """Enumerate the eight corners of an axis-aligned bounding box."""
+    return np.array(
+        [
+            [lower[0], lower[1], lower[2]],
+            [lower[0], lower[1], upper[2]],
+            [lower[0], upper[1], lower[2]],
+            [lower[0], upper[1], upper[2]],
+            [upper[0], lower[1], lower[2]],
+            [upper[0], lower[1], upper[2]],
+            [upper[0], upper[1], lower[2]],
+            [upper[0], upper[1], upper[2]],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _planar_axes_from_quat_xyzw(quat_xyzw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return world-frame foot axes projected onto the flat-ground plane."""
+    rotation = _quat_xyzw_to_matrix_np(quat_xyzw)
+    x_axis = rotation[:, 0].astype(np.float32)
+    x_axis[2] = 0.0
+    x_norm = float(np.linalg.norm(x_axis))
+    if x_norm < 1.0e-6:
+        x_axis = rotation[:, 1].astype(np.float32)
+        x_axis[2] = 0.0
+        x_norm = float(np.linalg.norm(x_axis))
+    if x_norm < 1.0e-6:
+        x_axis = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    else:
+        x_axis /= x_norm
+
+    z_axis = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    y_axis = np.cross(z_axis, x_axis)
+    y_norm = float(np.linalg.norm(y_axis))
+    if y_norm < 1.0e-6:
+        y_axis = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    else:
+        y_axis /= y_norm
+    return x_axis, y_axis
+
+
+def _normalize_to_unit_interval(value: float, lower: float, upper: float) -> float:
+    """Map a coordinate from [lower, upper] to [-1, 1] with graceful fallback."""
+    span = upper - lower
+    if abs(span) < 1.0e-6:
+        return 0.0
+    normalized = 2.0 * ((value - lower) / span) - 1.0
+    return float(np.clip(normalized, -1.0, 1.0))
 
 
 @wp.kernel
@@ -137,6 +254,29 @@ def convert_to_indexed_mesh(vertices, triangles):
     return unique_points, indexed_triangles
 
 
+def create_plane_mesh(width: float, length: float) -> tuple[np.ndarray, np.ndarray]:
+    """Return a simple centered XY plane mesh for viewer-only flat ground."""
+    half_width = 0.5 * width
+    half_length = 0.5 * length
+    vertices = np.array(
+        [
+            [-half_width, -half_length, 0.0],
+            [half_width, -half_length, 0.0],
+            [half_width, half_length, 0.0],
+            [-half_width, half_length, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    indices = np.array(
+        [
+            [0, 1, 2],
+            [0, 2, 3],
+        ],
+        dtype=np.int32,
+    )
+    return vertices, indices
+
+
 class NewtonSimulator(Simulator):
     """Newton physics engine wrapper for our simulation framework."""
 
@@ -170,17 +310,20 @@ class NewtonSimulator(Simulator):
 
         self._contact_sensors = {}
         self._contact_forces = {}  # Store contact forces per body
-        self.contacts = Contacts(0, 0)  # Initialize contacts storage
+        self.contacts = Contacts(0, 0)  # Replaced with model.contacts() after sensor setup.
         self._camera_initialized = False
         self._viewer_camera_pos = None
+        self._contact_analysis = None
 
     def _create_simulation(self) -> None:
         """Create the Newton simulation environment."""
         self._create_envs()
         self._setup_robot()
+        self._setup_contact_analysis_metadata()
         self._setup_sim()
         if self.robot_config.contact_bodies is not None:
             self._setup_contact_sensors()
+        self.contacts = self.model.contacts()
         self._set_robot_friction_to_minimum()
         self._apply_domain_randomization_if_needed()
 
@@ -193,13 +336,19 @@ class NewtonSimulator(Simulator):
         elif wp.get_device().is_cuda and wp.is_mempool_enabled(wp.get_device()):
             print(f"[INFO] Using CUDA graph ({self.control_type.name})")
             self.use_cuda_graph = True
-            zeros = torch.zeros(self.num_envs, 1, self.robot_config.number_of_actions,
-                                device=self.device, dtype=torch.float32)
 
             if self.control_type == ControlType.BUILT_IN_PD:
-                self.robot_view.set_attribute("joint_target_pos", self.control,
-                                              wp.from_torch(zeros, dtype=wp.float32))
+                zero_targets = wp.zeros_like(
+                    self.robot_view.get_attribute("joint_target_pos", self.control)
+                )
+                self.robot_view.set_attribute("joint_target_pos", self.control, zero_targets)
             else:
+                zeros = torch.zeros(
+                    self.num_envs,
+                    self.robot_config.number_of_actions,
+                    device=self.device,
+                    dtype=torch.float32,
+                )
                 self._update_pd_targets(zeros.squeeze(1))
 
             with wp.ScopedCapture() as capture:
@@ -226,7 +375,15 @@ class NewtonSimulator(Simulator):
             floating=not self.robot_config.asset.fix_base_link,
             enable_self_collisions=self.robot_config.asset.self_collisions,
         )
-        self.robot.articulation_key = ["robot"]
+        if len(self.robot.articulation_label) == 1:
+            self.robot.articulation_label[0] = "robot"
+        pressure_field_shape_ids = _configure_pressure_field_foot_shapes(
+            self.robot,
+            self.robot_config.contact_bodies or [],
+            self.config.sim,
+        )
+        if pressure_field_shape_ids:
+            print(f"[INFO] Enabled pressure-field contact on {len(pressure_field_shape_ids)} foot shapes")
         self.robot.approximate_meshes("convex_hull")
 
         self._object_assets = {}
@@ -239,7 +396,7 @@ class NewtonSimulator(Simulator):
         self._add_terrain(builder)
         for env_id in range(self.num_envs):
             builder.current_env_group = env_id
-            builder.begin_world(key=f"world_{env_id}")
+            builder.begin_world(label=f"world_{env_id}")
             builder.add_builder(self.robot)
 
             if self.scene_lib.num_scenes() > 0:
@@ -366,21 +523,22 @@ class NewtonSimulator(Simulator):
         """Setup robot view and control parameters."""
         common_dof_names = copy.deepcopy(self._dof_names)
         newton_dof_names = {}
+        robot_joint_labels = [label.rsplit("/", 1)[-1] for label in self.robot.joint_label]
 
         while len(common_dof_names) > 0:
             common_dof_name = common_dof_names[0]
-            if common_dof_name in self.robot.joint_key:
+            if common_dof_name in robot_joint_labels:
                 newton_dof_names[common_dof_name] = common_dof_name
                 common_dof_names.pop(0)
             else:
                 multi_dof_name = None
-                for newton_dof_name in self.robot.joint_key:
+                for newton_dof_name in robot_joint_labels:
                     if common_dof_name in newton_dof_name:
                         multi_dof_name = newton_dof_name
                         break
                 assert (
                     multi_dof_name is not None
-                ), f"No joint key match found for {common_dof_name} in {self.robot.joint_key}"
+                ), f"No joint label match found for {common_dof_name} in {robot_joint_labels}"
 
                 newton_dof_names[multi_dof_name] = []
                 while (
@@ -394,7 +552,7 @@ class NewtonSimulator(Simulator):
         self.robot_view = ArticulationView(
             self.model,
             pattern="robot",
-            include_joints=self._newton_dof_names.keys(),
+            include_joints=list(self._newton_dof_names.keys()),
             include_links=self._body_names,
         )
 
@@ -861,6 +1019,11 @@ class NewtonSimulator(Simulator):
         ground_cfg = newton.ModelBuilder.ShapeConfig(
             mu=self.terrain.sim_config.static_friction,
             restitution=self.terrain.sim_config.restitution,
+            hydroelastic_type=(
+                newton.HydroelasticType.RIGID
+                if getattr(self.config.sim, "pressure_field_feet", False)
+                else newton.HydroelasticType.NONE
+            ),
         )
 
         print("Adding terrain")
@@ -868,7 +1031,7 @@ class NewtonSimulator(Simulator):
             sum(self.terrain.config.terrain_proportions[:-1]) == 0
             and self.terrain.config.terrain_proportions[-1] == 1.0
         ):
-            if self.config.viewer_backend == "viser":
+            if self.config.viewer_backend == "viser" and not getattr(self.config.sim, "pressure_field_feet", False):
                 # ViewerViser does not reliably display Newton's special plane primitive.
                 # Use a large explicit mesh instead for flat-ground scenes.
                 plane_vertices, plane_indices = create_plane_mesh(400.0, 400.0)
@@ -879,6 +1042,7 @@ class NewtonSimulator(Simulator):
                     body=-1, mesh=ground_mesh, cfg=ground_cfg, key="ground_plane"
                 )
             else:
+                # Pressure-field feet need a rigid hydroelastic plane, not a visual mesh surrogate.
                 builder.add_ground_plane(cfg=ground_cfg)
         else:
             points, indices = convert_to_indexed_mesh(
@@ -902,10 +1066,11 @@ class NewtonSimulator(Simulator):
 
         # Create a contact sensor for each specified contact body
         for body_name in self.robot_config.contact_bodies:
+            body_patterns = [body_name, f"*/{body_name}"]
             # Create sensor that detects contacts between this body and anything
             # The sensor will aggregate contacts across all environments
             sensor = SensorContact(
-                self.model, sensing_obj_bodies=body_name, verbose=False
+                self.model, sensing_obj_bodies=body_patterns, verbose=False
             )
             self._contact_sensors[body_name] = sensor
 
@@ -914,6 +1079,316 @@ class NewtonSimulator(Simulator):
             )
 
         print(f"[INFO] Contact sensors setup complete for {len(self._contact_sensors)} bodies")
+
+    def _setup_contact_analysis_metadata(self) -> None:
+        """Precompute static foot metadata for GRF/CoP/pressure analysis."""
+        left_bodies = list(
+            self.robot_config.common_naming_to_robot_body_names.get(
+                "all_left_foot_bodies", []
+            )
+        )
+        right_bodies = list(
+            self.robot_config.common_naming_to_robot_body_names.get(
+                "all_right_foot_bodies", []
+            )
+        )
+        if not left_bodies and not right_bodies:
+            self._contact_analysis = None
+            return
+
+        num_bodies_per_robot = len(self._body_names)
+        shape_body = wp.to_torch(self.model.shape_body).detach().cpu().numpy()
+        shape_world = wp.to_torch(self.model.shape_world).detach().cpu().numpy()
+        shape_transform = wp.to_torch(self.model.shape_transform).detach().cpu().numpy()
+        shape_aabb_lower = (
+            wp.to_torch(self.model.shape_collision_aabb_lower).detach().cpu().numpy()
+        )
+        shape_aabb_upper = (
+            wp.to_torch(self.model.shape_collision_aabb_upper).detach().cpu().numpy()
+        )
+        default_body_transforms = self.default_body_transforms[0].detach().cpu().numpy()
+
+        side_specs = [
+            ("left", left_bodies),
+            ("right", right_bodies),
+        ]
+        sides = []
+        body_side_index = np.full((num_bodies_per_robot,), -1, dtype=np.int32)
+
+        for side_index, (side_name, body_names) in enumerate(side_specs):
+            local_body_indices = [
+                self._body_names.index(body_name)
+                for body_name in body_names
+                if body_name in self._body_names
+            ]
+            if not local_body_indices:
+                continue
+
+            anchor_body_name = next(
+                (
+                    body_name
+                    for body_name in body_names
+                    if "ankle" in body_name.lower() and body_name in self._body_names
+                ),
+                body_names[0],
+            )
+            anchor_body_idx = self._body_names.index(anchor_body_name)
+            body_side_index[local_body_indices] = side_index
+
+            shape_ids = np.where(
+                (shape_body >= 0)
+                & (shape_body < num_bodies_per_robot)
+                & np.isin(shape_body, np.asarray(local_body_indices, dtype=np.int32))
+            )[0]
+            if shape_ids.size == 0:
+                continue
+
+            anchor_transform = default_body_transforms[anchor_body_idx]
+            anchor_pos = anchor_transform[:3]
+            anchor_rotation = _quat_xyzw_to_matrix_np(anchor_transform[3:7])
+
+            x_values = []
+            y_values = []
+            for shape_id in shape_ids.tolist():
+                local_body_idx = int(shape_body[shape_id])
+                body_transform = default_body_transforms[local_body_idx]
+                shape_corners = _make_aabb_corners_np(
+                    shape_aabb_lower[shape_id], shape_aabb_upper[shape_id]
+                )
+                corners_body = _transform_points_np(
+                    shape_transform[shape_id, :3],
+                    shape_transform[shape_id, 3:7],
+                    shape_corners,
+                )
+                corners_world = _transform_points_np(
+                    body_transform[:3],
+                    body_transform[3:7],
+                    corners_body,
+                )
+                corners_anchor = (corners_world - anchor_pos[None, :]) @ anchor_rotation
+                x_values.append(corners_anchor[:, 0])
+                y_values.append(corners_anchor[:, 1])
+
+            bounds = np.array(
+                [
+                    float(np.min(np.concatenate(x_values))),
+                    float(np.max(np.concatenate(x_values))),
+                    float(np.min(np.concatenate(y_values))),
+                    float(np.max(np.concatenate(y_values))),
+                ],
+                dtype=np.float32,
+            )
+            sides.append(
+                {
+                    "name": side_name,
+                    "body_names": list(body_names),
+                    "body_indices": np.asarray(local_body_indices, dtype=np.int32),
+                    "anchor_body_name": anchor_body_name,
+                    "anchor_body_idx": int(anchor_body_idx),
+                    "support_bounds_xy": bounds,
+                }
+            )
+
+        if not sides:
+            self._contact_analysis = None
+            return
+
+        self._contact_analysis = {
+            "num_bodies_per_robot": int(num_bodies_per_robot),
+            "shape_body": shape_body.astype(np.int32),
+            "shape_world": shape_world.astype(np.int32),
+            "body_side_index": body_side_index,
+            "sides": sides,
+        }
+
+    def get_contact_analysis_metadata(self) -> Optional[Dict[str, object]]:
+        """Return static foot-analysis metadata for downstream plotting/export."""
+        if self._contact_analysis is None:
+            return None
+
+        return {
+            "side_names": [side["name"] for side in self._contact_analysis["sides"]],
+            "anchor_body_names": [
+                side["anchor_body_name"] for side in self._contact_analysis["sides"]
+            ],
+            "support_bounds_xy": [
+                side["support_bounds_xy"].copy()
+                for side in self._contact_analysis["sides"]
+            ],
+        }
+
+    def get_contact_analysis_frame(
+        self,
+        current_state: Optional[RobotState] = None,
+        *,
+        num_bins_x: int = 24,
+        num_bins_y: int = 12,
+    ) -> Optional[Dict[str, np.ndarray]]:
+        """Aggregate the current foot-ground contact state into analysis-friendly outputs."""
+        if self._contact_analysis is None or self.contacts.force is None:
+            return None
+
+        if current_state is None:
+            current_state = self.get_robot_state()
+        elif current_state.state_conversion != StateConversion.COMMON:
+            current_state = current_state.clone().convert_to_common(self.data_conversion)
+
+        if current_state.rigid_body_pos is None or current_state.rigid_body_rot is None:
+            return None
+
+        side_infos = self._contact_analysis["sides"]
+        num_sides = len(side_infos)
+        num_envs = current_state.rigid_body_pos.shape[0]
+
+        grf_world = np.zeros((num_envs, num_sides, 3), dtype=np.float32)
+        cop_world_weighted = np.zeros((num_envs, num_sides, 3), dtype=np.float32)
+        cop_world = np.full((num_envs, num_sides, 3), np.nan, dtype=np.float32)
+        cop_local = np.full((num_envs, num_sides, 2), np.nan, dtype=np.float32)
+        cop_normalized = np.full((num_envs, num_sides, 2), np.nan, dtype=np.float32)
+        pressure_maps = np.zeros(
+            (num_envs, num_sides, num_bins_y, num_bins_x), dtype=np.float32
+        )
+        contact_counts = np.zeros((num_envs, num_sides), dtype=np.int32)
+        stance_force_z = np.zeros((num_envs, num_sides), dtype=np.float32)
+
+        rigid_contact_count = int(self.contacts.rigid_contact_count.numpy()[0])
+        if rigid_contact_count <= 0:
+            return {
+                "side_names": np.array(
+                    [side["name"] for side in side_infos], dtype=np.str_
+                ),
+                "grf_world": grf_world,
+                "cop_world": cop_world,
+                "cop_local": cop_local,
+                "cop_normalized": cop_normalized,
+                "cop_valid": np.zeros((num_envs, num_sides), dtype=bool),
+                "pressure_maps": pressure_maps,
+                "contact_counts": contact_counts,
+                "support_bounds_xy": np.stack(
+                    [side["support_bounds_xy"] for side in side_infos], axis=0
+                ),
+            }
+
+        shape0 = self.contacts.rigid_contact_shape0.numpy()[:rigid_contact_count]
+        shape1 = self.contacts.rigid_contact_shape1.numpy()[:rigid_contact_count]
+        point0 = self.contacts.rigid_contact_point0.numpy()[:rigid_contact_count]
+        point1 = self.contacts.rigid_contact_point1.numpy()[:rigid_contact_count]
+        force = self.contacts.force.numpy()[:rigid_contact_count, :3]
+
+        shape_body = self._contact_analysis["shape_body"]
+        shape_world = self._contact_analysis["shape_world"]
+        body_side_index = self._contact_analysis["body_side_index"]
+        num_bodies_per_robot = self._contact_analysis["num_bodies_per_robot"]
+
+        rigid_body_pos = current_state.rigid_body_pos.detach().cpu().numpy()
+        rigid_body_rot = current_state.rigid_body_rot.detach().cpu().numpy()
+
+        for contact_idx in range(rigid_contact_count):
+            shape_idx_0 = int(shape0[contact_idx])
+            shape_idx_1 = int(shape1[contact_idx])
+            body_idx_0 = int(shape_body[shape_idx_0])
+            body_idx_1 = int(shape_body[shape_idx_1])
+
+            local_body_idx_0 = body_idx_0 % num_bodies_per_robot if body_idx_0 >= 0 else -1
+            local_body_idx_1 = body_idx_1 % num_bodies_per_robot if body_idx_1 >= 0 else -1
+            side_idx_0 = (
+                int(body_side_index[local_body_idx_0]) if local_body_idx_0 >= 0 else -1
+            )
+            side_idx_1 = (
+                int(body_side_index[local_body_idx_1]) if local_body_idx_1 >= 0 else -1
+            )
+
+            env_idx = -1
+            side_idx = -1
+            contact_force = None
+            ground_point = None
+
+            if side_idx_0 >= 0 and body_idx_1 < 0:
+                env_idx = int(shape_world[shape_idx_0])
+                side_idx = side_idx_0
+                contact_force = force[contact_idx]
+                ground_point = point1[contact_idx]
+            elif side_idx_1 >= 0 and body_idx_0 < 0:
+                env_idx = int(shape_world[shape_idx_1])
+                side_idx = side_idx_1
+                contact_force = -force[contact_idx]
+                ground_point = point0[contact_idx]
+            else:
+                continue
+
+            if env_idx < 0 or env_idx >= num_envs or side_idx < 0 or side_idx >= num_sides:
+                continue
+
+            contact_counts[env_idx, side_idx] += 1
+            grf_world[env_idx, side_idx] += contact_force.astype(np.float32)
+
+            fz = float(max(contact_force[2], 0.0))
+            if fz <= 0.0:
+                continue
+
+            stance_force_z[env_idx, side_idx] += fz
+            cop_world_weighted[env_idx, side_idx] += ground_point.astype(np.float32) * fz
+
+            side_info = side_infos[side_idx]
+            anchor_body_idx = side_info["anchor_body_idx"]
+            anchor_pos = rigid_body_pos[env_idx, anchor_body_idx]
+            anchor_rot = rigid_body_rot[env_idx, anchor_body_idx]
+            x_axis, y_axis = _planar_axes_from_quat_xyzw(anchor_rot)
+            delta = ground_point.astype(np.float32) - anchor_pos.astype(np.float32)
+            local_x = float(np.dot(delta, x_axis))
+            local_y = float(np.dot(delta, y_axis))
+
+            x_min, x_max, y_min, y_max = side_info["support_bounds_xy"]
+            bin_width = max((x_max - x_min) / float(num_bins_x), 1.0e-6)
+            bin_height = max((y_max - y_min) / float(num_bins_y), 1.0e-6)
+            bin_area = bin_width * bin_height
+
+            bin_x = int(np.clip(np.floor((local_x - x_min) / bin_width), 0, num_bins_x - 1))
+            bin_y = int(np.clip(np.floor((local_y - y_min) / bin_height), 0, num_bins_y - 1))
+            pressure_maps[env_idx, side_idx, bin_y, bin_x] += np.float32(fz / bin_area)
+
+        cop_valid = stance_force_z > 1.0e-6
+        for env_idx in range(num_envs):
+            for side_idx, side_info in enumerate(side_infos):
+                if not cop_valid[env_idx, side_idx]:
+                    continue
+
+                weighted_force = stance_force_z[env_idx, side_idx]
+                cop_world[env_idx, side_idx] = (
+                    cop_world_weighted[env_idx, side_idx] / weighted_force
+                ).astype(np.float32)
+
+                anchor_body_idx = side_info["anchor_body_idx"]
+                anchor_pos = rigid_body_pos[env_idx, anchor_body_idx]
+                anchor_rot = rigid_body_rot[env_idx, anchor_body_idx]
+                x_axis, y_axis = _planar_axes_from_quat_xyzw(anchor_rot)
+                delta = cop_world[env_idx, side_idx] - anchor_pos.astype(np.float32)
+                local_x = float(np.dot(delta, x_axis))
+                local_y = float(np.dot(delta, y_axis))
+                cop_local[env_idx, side_idx, 0] = local_x
+                cop_local[env_idx, side_idx, 1] = local_y
+
+                x_min, x_max, y_min, y_max = side_info["support_bounds_xy"]
+                cop_normalized[env_idx, side_idx, 0] = _normalize_to_unit_interval(
+                    local_x, x_min, x_max
+                )
+                cop_normalized[env_idx, side_idx, 1] = _normalize_to_unit_interval(
+                    local_y, y_min, y_max
+                )
+
+        return {
+            "side_names": np.array([side["name"] for side in side_infos], dtype=np.str_),
+            "grf_world": grf_world,
+            "cop_world": cop_world,
+            "cop_local": cop_local,
+            "cop_normalized": cop_normalized,
+            "cop_valid": cop_valid,
+            "pressure_maps": pressure_maps,
+            "contact_counts": contact_counts,
+            "support_bounds_xy": np.stack(
+                [side["support_bounds_xy"] for side in side_infos], axis=0
+            ).astype(np.float32),
+        }
 
     def _simulate(self) -> None:
         """Run physics simulation for one frame (decimation substeps)."""
@@ -934,17 +1409,11 @@ class NewtonSimulator(Simulator):
     def _update_contact_sensors(self) -> None:
         """Update contact sensors after physics step. Must be called outside CUDA graph."""
         if len(self._contact_sensors) > 0:
-            populate_contacts(self.contacts, self.solver)
+            self.solver.update_contacts(self.contacts, self.state_0)
             for body_name, sensor in self._contact_sensors.items():
-                sensor.eval(self.contacts)
-                # Store the net contact force for this body (across all environments)
-                # sensor.net_force has shape [num_worlds, num_bodies, 3] where num_bodies=1
-                if hasattr(sensor, "net_force") and sensor.net_force is not None:
-                    net_force = wp.to_torch(sensor.net_force).clone()
-                    # Squeeze the body dimension if present (shape [N, 1, 3] -> [N, 3])
-                    if net_force.dim() == 3 and net_force.shape[1] == 1:
-                        net_force = net_force.squeeze(1)
-                    self._contact_forces[body_name] = net_force
+                sensor.update(self.state_0, self.contacts)
+                if sensor.total_force is not None:
+                    self._contact_forces[body_name] = wp.to_torch(sensor.total_force).clone()
 
     def _physics_step(self) -> None:
         """Performs a physics simulation step."""

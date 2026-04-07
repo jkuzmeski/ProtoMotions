@@ -26,6 +26,8 @@ reproduce the motion while maintaining physical plausibility.
 * ``mlp_complex_terrain.py`` - MLP policy for complex terrains (stairs, slopes, etc.)
 * ``mlp_domain_rand.py`` - Reduced coordinate observations with domain randomization for sim2real
 * ``transformer.py``, ``transformer_complex_terrain.py`` - Transformer variants with more future observation frames
+* ``smpl_lower_body_box_feet.py``, ``smpl_lower_body_ellipsoid_feet_point.py``, and
+  ``smpl_lower_body_ellipsoid_feet_pressure.py`` - lower-body Newton contact-model comparison on flat ground
 
 **Example command**:
 
@@ -178,6 +180,7 @@ See Also
 --------
 
 * :doc:`configuration` - Configuration system
+* :doc:`contact_model_experiment` - SMPL lower-body contact-model experiment pipeline
 * :doc:`../tutorials/code_tutorials` - Step-by-step tutorials
 * :doc:`../getting_started/quickstart` - Quick start guide
 
