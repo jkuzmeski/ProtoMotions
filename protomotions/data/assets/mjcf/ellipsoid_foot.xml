@@ -1,0 +1,59 @@
+<mujoco model="ellipsoid_foot_detailed">
+  <compiler coordinate="local"/>
+  <default>
+    <joint damping="0.0" armature="0.01" stiffness="0.0" limited="true"/>
+    <geom conaffinity="1" condim="3" contype="7" margin="0.001" rgba="0.8 0.6 .4 1"/>
+  </default>
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1=".4 .5 .6" rgb2="0 0 0" width="100" height="100"/>
+    <texture builtin="flat" height="1278" mark="cross" markrgb="1 1 1" name="texgeom" random="0.01" rgb1="0.8 0.6 0.4" rgb2="0.8 0.6 0.4" type="cube" width="127"/>
+    <texture builtin="checker" height="100" name="texplane" rgb1="0 0 0" rgb2="0.8 0.8 0.8" type="2d" width="100"/>
+    <material name="MatPlane" reflectance="0.5" shininess="1" specular="1" texrepeat="60 60" texture="texplane"/>
+    <material name="geom" texture="texgeom" texuniform="true"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 1.5" dir="0 0 -1" diffuse="0.8 0.8 0.8" specular="0.3 0.3 0.3"/>
+
+    <!-- Shank (L_Knee) -->
+    <body name="L_Knee" pos="0 0 0.5">
+      <joint name="root_z" type="slide" axis="0 0 1" damping="10" stiffness="0"/>
+      <!-- Shank geometry -->
+      <geom type="capsule" contype="1" conaffinity="1" density="1234.567901" fromto="0.0000 0.0000 -0.0797 0.0000 0.0000 -0.3185" size="0.0541"/>
+      
+      <!-- Ankle (L_Ankle) -->
+      <body name="L_Ankle" pos="0.0000 0.0000 -0.3982">
+        <joint name="L_Ankle_x" type="hinge" pos="0 0 0" axis="1 0 0" stiffness="150" damping="15" armature="0.02" range="-10.0000 10.0000"/>
+        <joint name="L_Ankle_y" type="hinge" pos="0 0 0" axis="0 1 0" stiffness="150" damping="15" armature="0.02" range="-45.0000 20.0000"/>
+        <joint name="L_Ankle_z" type="hinge" pos="0 0 0" axis="0 0 1" stiffness="150" damping="15" armature="0.02" range="-10.0000 10.0000"/>
+        
+        <!-- Heel ellipsoid: a=35.4, b=54.0, c=22.6 mm, Euler (0.329, 0.201, 0.101) rad -->
+        <geom type="ellipsoid" pos="-0.0301 -0.0037 -0.0450" size="0.0540 0.0354 0.0226" quat="0.9795 0.1640 0.0996 0.0505" density="1000"/>
+        
+        <!-- Ball ellipsoid: a=63.2, b=33.8, c=24.0 mm, Euler (-0.235, 0.191, 0.528) rad -->
+        <!-- In MuJoCo: size=(x=anterior, y=lateral, z=vertical), so 63.2mm goes to y-axis for medial-lateral elongation -->
+        <geom type="ellipsoid" pos="0.0890 -0.0020 -0.0456" size="0.0338 0.0632 0.0240" quat="0.9572 -0.0878 0.1218 0.2470" density="1000"/>
+        
+        <!-- Toe (L_Toe) -->
+        <body name="L_Toe" pos="0.1400 0.0000 -0.0550">
+          <joint name="L_Toe_x" type="hinge" pos="0 0 0" axis="1 0 0" stiffness="75" damping="8" armature="0.02" range="-10.0000 10.0000"/>
+          <joint name="L_Toe_y" type="hinge" pos="0 0 0" axis="0 1 0" stiffness="75" damping="8" armature="0.02" range="-20.0000 20.0000"/>
+          <joint name="L_Toe_z" type="hinge" pos="0 0 0" axis="0 0 1" stiffness="75" damping="8" armature="0.02" range="-5.0000 5.0000"/>
+          
+          <!-- Toe ellipsoid: a=18.2, b=18.6, c=13.2 mm, Euler (0.339, 1.23, 0.454) rad -->
+          <!-- Position adjusted so toe contacts ground at same level as heel/ball -->
+          <geom type="ellipsoid" pos="0.0102 -0.0108 0.0094" size="0.0182 0.0186 0.0132" quat="0.7600 0.2624 0.5268 0.2759" density="1000"/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+  
+  <actuator>
+    <motor name="L_Ankle_x" joint="L_Ankle_x" gear="500"/>
+    <motor name="L_Ankle_y" joint="L_Ankle_y" gear="500"/>
+    <motor name="L_Ankle_z" joint="L_Ankle_z" gear="500"/>
+    <motor name="L_Toe_x" joint="L_Toe_x" gear="500"/>
+    <motor name="L_Toe_y" joint="L_Toe_y" gear="500"/>
+    <motor name="L_Toe_z" joint="L_Toe_z" gear="500"/>
+  </actuator>
+</mujoco>

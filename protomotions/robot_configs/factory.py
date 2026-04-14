@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026 The ProtoMotions Developers
+# SPDX-FileCopyrightText: Copyright (c) 2025 The ProtoMotions Developers
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,7 +20,7 @@ def robot_config(robot_name: str, **updates) -> RobotConfig:
     """Factory function to create robot configuration based on robot type.
 
     Args:
-        robot_name: Name of the robot type (smpl, smplx, amp, g1, h1_2, soma23, rigv1)
+        robot_name: Name of the robot type (smpl, smplx, amp, g1, h1_2, rigv1)
         **updates: Optional field updates to apply to the robot config
 
     Returns:
@@ -29,7 +29,19 @@ def robot_config(robot_name: str, **updates) -> RobotConfig:
     Raises:
         ValueError: If robot_name is not recognized
     """
-    if robot_name == "smpl":
+    if robot_name == "smpl_lower_body_ellipsoid_feet":
+        from protomotions.robot_configs.smpl_lower_body_ellipsoid_feet import (
+            SmplLowerBodyEllipsoidFeetRobotConfig,
+        )
+
+        config = SmplLowerBodyEllipsoidFeetRobotConfig()
+    elif robot_name.startswith("smpl_lower_body"):
+        from protomotions.robot_configs.smpl_lower_body import (
+            SmplLowerBodyConfigFactory,
+        )
+
+        config = SmplLowerBodyConfigFactory.from_robot_name(robot_name)
+    elif robot_name == "smpl":
         from protomotions.robot_configs.smpl import SmplRobotConfig
 
         config = SmplRobotConfig()
@@ -53,10 +65,6 @@ def robot_config(robot_name: str, **updates) -> RobotConfig:
         from protomotions.robot_configs.rigv1 import Rigv1RobotConfig
 
         config = Rigv1RobotConfig()
-    elif robot_name == "soma23":
-        from protomotions.robot_configs.soma23 import Soma23RobotConfig
-
-        config = Soma23RobotConfig()
     else:
         raise ValueError(f"Invalid robot name: {robot_name}")
 

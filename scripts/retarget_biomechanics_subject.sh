@@ -1,0 +1,257 @@
+#!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 The ProtoMotions Developers
+# SPDX-License-Identifier: Apache-2.0
+#
+# Convenience script to run the biomechanics lower-body retargeting pipeline
+# in staged steps, mirroring scripts/retarget_amass_to_robot.sh.
+#
+# NOTE:
+# This wrapper currently drives the local Torch-based lower-body retargeter at
+# pyroki/batch_retarget_to_smpl_lower_body.py. Despite the path, that script is
+# not a true PyRoki/JAX implementation.
+#
+# IMPORTANT:
+# - The first interpreter is used for ProtoMotions/HumanRetargeting pipeline steps.
+# - The second interpreter is used for the retarget/contact extraction step.
+# - For the current local lower-body retargeter under pyroki/, using the same
+#   interpreter for both arguments is valid as long as it has torch installed.
+#
+# Usage:
+#   ./scripts/retarget_biomechanics_subject.sh \
+#       <proto_python> <retarget_python> <subject_profile> [output_dir] [--force]
+#
+# Example:
+#   ./scripts/retarget_biomechanics_subject.sh \
+#       ./.venv/bin/python \
+#       ./.venv/bin/python \
+#       HumanRetargeting/biomechanics_retarget/profiles/S_GENERIC.yaml \
+#       HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC \
+#       --force
+
+set -euo pipefail
+
+usage() {
+    echo "Usage: $0 <proto_python> <retarget_python> <subject_profile> [output_dir] [--force]"
+    echo ""
+    echo "Arguments:"
+    echo "  proto_python     Python interpreter with ProtoMotions/HumanRetargeting deps"
+    echo "  retarget_python  Python interpreter used for the lower-body retarget step"
+    echo "  subject_profile  YAML subject profile"
+    echo "  output_dir       Optional output directory"
+    echo "  --force          Re-run stages even when outputs already exist"
+}
+
+if [ $# -lt 3 ]; then
+    if [ $# -eq 1 ] && { [ "$1" = "--help" ] || [ "$1" = "-h" ]; }; then
+        usage
+        exit 0
+    fi
+    usage
+    exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+PROTO_PYTHON="$1"
+RETARGET_PYTHON="$2"
+SUBJECT_PROFILE="$3"
+shift 3
+
+OUTPUT_DIR_OVERRIDE=""
+FORCE_FLAG=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --force)
+            FORCE_FLAG=1
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            if [ -z "$OUTPUT_DIR_OVERRIDE" ]; then
+                OUTPUT_DIR_OVERRIDE="$1"
+            else
+                echo "Error: unexpected argument '$1'"
+                usage
+                exit 1
+            fi
+            ;;
+    esac
+    shift
+done
+
+if [ ! -f "$PROTO_PYTHON" ]; then
+    echo "Error: ProtoMotions Python not found: $PROTO_PYTHON"
+    exit 1
+fi
+
+if [ ! -f "$RETARGET_PYTHON" ]; then
+    echo "Error: retarget Python not found: $RETARGET_PYTHON"
+    exit 1
+fi
+
+if [ ! -f "$SUBJECT_PROFILE" ]; then
+    echo "Error: subject profile not found: $SUBJECT_PROFILE"
+    exit 1
+fi
+
+mapfile -t PROFILE_INFO < <(
+    "$PROTO_PYTHON" - "$REPO_ROOT" "$SUBJECT_PROFILE" "$OUTPUT_DIR_OVERRIDE" <<'PY'
+import sys
+from pathlib import Path
+
+repo_root = Path(sys.argv[1]).resolve()
+profile_path = Path(sys.argv[2]).resolve()
+output_override = sys.argv[3].strip()
+
+sys.path.insert(0, str(repo_root))
+
+from HumanRetargeting.biomechanics_retarget.subject_assets import SubjectAssetBuilder
+from HumanRetargeting.biomechanics_retarget.subject_profiles import load_subject_profile
+
+profile = load_subject_profile(profile_path)
+builder = SubjectAssetBuilder(
+    profile=profile,
+    rescale_dir=repo_root / "HumanRetargeting" / "rescale",
+    assets_root=repo_root / "protomotions" / "data" / "assets",
+)
+assets = builder.build(force=False)
+
+if output_override:
+    output_dir = Path(output_override).resolve()
+else:
+    output_dir = (
+        repo_root
+        / "HumanRetargeting"
+        / "biomechanics_retarget"
+        / "processed_data"
+        / profile.subject_id
+    )
+
+for value in (
+    profile.subject_id,
+    str(profile.input_dir),
+    str(output_dir),
+    str(profile.output_fps),
+    str(assets.urdf_path),
+    str(assets.mjcf_path),
+):
+    print(value)
+PY
+)
+
+if [ "${#PROFILE_INFO[@]}" -ne 6 ]; then
+    echo "Error: failed to resolve subject profile metadata"
+    exit 1
+fi
+
+SUBJECT_ID="${PROFILE_INFO[0]}"
+INPUT_DIR="${PROFILE_INFO[1]}"
+OUTPUT_DIR="${PROFILE_INFO[2]}"
+OUTPUT_FPS="${PROFILE_INFO[3]}"
+RETARGET_URDF="${PROFILE_INFO[4]}"
+MODEL_XML="${PROFILE_INFO[5]}"
+
+KEYPOINTS_DIR="${OUTPUT_DIR}/keypoints"
+RETARGETED_DIR="${OUTPUT_DIR}/retargeted_motions"
+CONTACTS_DIR="${OUTPUT_DIR}/contacts"
+MOTION_DIR="${OUTPUT_DIR}/motion_files"
+PACKAGED_DIR="${OUTPUT_DIR}/packaged_data"
+
+mkdir -p "$OUTPUT_DIR"
+
+FORCE_ARGS=()
+if [ "$FORCE_FLAG" -eq 1 ]; then
+    FORCE_ARGS+=(--force)
+fi
+
+RETARGET_ARGS=()
+if [ "$FORCE_FLAG" -eq 0 ]; then
+    RETARGET_ARGS+=(--skip-existing)
+fi
+
+echo "=============================================="
+echo "Biomechanics Subject Retargeting"
+echo "=============================================="
+echo "Subject ID:          $SUBJECT_ID"
+echo "ProtoMotions Python: $PROTO_PYTHON"
+echo "Retarget Python:     $RETARGET_PYTHON"
+echo "Subject profile:     $SUBJECT_PROFILE"
+echo "Input dir:           $INPUT_DIR"
+echo "Output dir:          $OUTPUT_DIR"
+echo "Output FPS:          $OUTPUT_FPS"
+echo "Retarget URDF:       $RETARGET_URDF"
+echo "Model XML:           $MODEL_XML"
+echo "=============================================="
+
+echo ""
+echo "[Step 1/6] Transforming treadmill data to overground..."
+"$PROTO_PYTHON" "$REPO_ROOT/HumanRetargeting/biomechanics_retarget/pipeline.py" \
+    "$INPUT_DIR" \
+    "$OUTPUT_DIR" \
+    --subject-profile "$SUBJECT_PROFILE" \
+    --step overground \
+    "${FORCE_ARGS[@]}"
+
+echo ""
+echo "[Step 2/6] Extracting keypoints..."
+"$PROTO_PYTHON" "$REPO_ROOT/HumanRetargeting/biomechanics_retarget/pipeline.py" \
+    "$INPUT_DIR" \
+    "$OUTPUT_DIR" \
+    --subject-profile "$SUBJECT_PROFILE" \
+    --step keypoints \
+    "${FORCE_ARGS[@]}"
+
+echo ""
+echo "[Step 3/6] Retargeting lower-body motions..."
+"$RETARGET_PYTHON" "$REPO_ROOT/pyroki/batch_retarget_to_smpl_lower_body.py" \
+    --keypoints-folder-path "$KEYPOINTS_DIR" \
+    --output-dir "$RETARGETED_DIR" \
+    --urdf-path "$RETARGET_URDF" \
+    --retarget-fps "$OUTPUT_FPS" \
+    --source-type treadmill \
+    --no-visualize \
+    "${RETARGET_ARGS[@]}"
+
+echo ""
+echo "[Step 4/6] Extracting contact labels..."
+"$RETARGET_PYTHON" "$REPO_ROOT/pyroki/batch_retarget_to_smpl_lower_body.py" \
+    --keypoints-folder-path "$KEYPOINTS_DIR" \
+    --contacts-dir "$CONTACTS_DIR" \
+    --urdf-path "$RETARGET_URDF" \
+    --retarget-fps "$OUTPUT_FPS" \
+    --source-type treadmill \
+    --save-contacts-only \
+    "${RETARGET_ARGS[@]}"
+
+echo ""
+echo "[Step 5/6] Converting retargeted files to .motion..."
+"$PROTO_PYTHON" "$REPO_ROOT/HumanRetargeting/biomechanics_retarget/pipeline.py" \
+    "$INPUT_DIR" \
+    "$OUTPUT_DIR" \
+    --subject-profile "$SUBJECT_PROFILE" \
+    --step convert \
+    "${FORCE_ARGS[@]}"
+
+echo ""
+echo "[Step 6/6] Packaging MotionLib..."
+"$PROTO_PYTHON" "$REPO_ROOT/HumanRetargeting/biomechanics_retarget/pipeline.py" \
+    "$INPUT_DIR" \
+    "$OUTPUT_DIR" \
+    --subject-profile "$SUBJECT_PROFILE" \
+    --step package \
+    "${FORCE_ARGS[@]}"
+
+echo ""
+echo "=============================================="
+echo "Retargeting complete!"
+echo "=============================================="
+echo "Keypoints dir:       $KEYPOINTS_DIR"
+echo "Retargeted dir:      $RETARGETED_DIR"
+echo "Contacts dir:        $CONTACTS_DIR"
+echo "Motion dir:          $MOTION_DIR"
+echo "Packaged dir:        $PACKAGED_DIR"
+echo ""

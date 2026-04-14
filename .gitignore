@@ -18,3 +18,15 @@ data/amass/*.pkl
 !.claude/commands/
 .cursor/
 renders/
+.venv/
+.venv-*/
+HumanRetargeting/biomechanics_retarget/processed_data/**/profile.yaml
+HumanRetargeting/biomechanics_retarget/processed_data/**/qc/
+HumanRetargeting/biomechanics_retarget/processed_data/**/yaml_data/motions_*.yaml
+HumanRetargeting/biomechanics_retarget/processed_data/**/contacts/*.npz
+HumanRetargeting/biomechanics_retarget/processed_data/**/keypoints/*.npy
+HumanRetargeting/biomechanics_retarget/processed_data/**/motion_files/*.motion
+HumanRetargeting/biomechanics_retarget/processed_data/**/overground_data/*.npy
+HumanRetargeting/biomechanics_retarget/processed_data/**/overground_data/metadata/*
+HumanRetargeting/biomechanics_retarget/processed_data/**/packaged_data/*.pt
+HumanRetargeting/biomechanics_retarget/processed_data/**/retargeted_motions/*.npz

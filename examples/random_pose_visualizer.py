@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026 The ProtoMotions Developers
+# SPDX-FileCopyrightText: Copyright (c) 2025 The ProtoMotions Developers
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,12 +14,12 @@
 # limitations under the License.
 #
 """
-Random Pose Visualizer for Humanoid Robots
+Default Pose Visualizer for Humanoid Robots
 
-This tool visualizes random humanoid poses by:
-1. Loading a specified robot (e.g., g1, rigv1, smpl)
-2. Generating random joint configurations within joint limits
-3. Displaying the poses with visualization markers on key body parts
+This tool visualizes a robot in its default standing pose by:
+1. Loading a specified robot from the robot config factory
+2. Resetting it onto a flat terrain at the simulator's default pose
+3. Holding that pose with the robot's default controller
 """
 
 from typing import Dict, List
@@ -29,21 +29,20 @@ import math
 
 # Parse arguments first (argparse is safe, doesn't import torch)
 parser = argparse.ArgumentParser(
-    description="Random Pose Visualizer for Humanoid Robots"
+    description="Default Pose Visualizer for Humanoid Robots"
 )
 parser.add_argument(
     "--simulator",
     type=str,
     choices=["isaacgym", "isaaclab", "newton"],
-    default="isaacgym",
+    default="newton",
     help="Simulator to use (isaacgym, isaaclab, newton)",
 )
 parser.add_argument(
     "--robot",
     type=str,
-    choices=["g1", "rigv1", "smpl"],
-    default="g1",
-    help="Robot to load (g1, rigv1, or smpl)",
+    default="smpl_lower_body_ellipsoid_feet",
+    help="Robot to load from protomotions.robot_configs.factory.robot_config",
 )
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments")
 parser.add_argument("--headless", action="store_true", help="Run in headless mode")
@@ -72,7 +71,11 @@ from protomotions.simulator.base_simulator.config import (  # noqa: E402
 )
 from protomotions.simulator.factory import simulator_config  # noqa: E402
 from protomotions.robot_configs.factory import robot_config  # noqa: E402
-from protomotions.utils.rotations import quat_from_euler_xyz  # noqa: E402
+from protomotions.components.terrains.config import TerrainConfig  # noqa: E402
+from protomotions.components.terrains.terrain import Terrain  # noqa: E402
+from protomotions.simulator.base_simulator.utils import (  # noqa: E402
+    convert_friction_for_simulator,
+)
 
 
 @dataclass
@@ -101,21 +104,26 @@ ROBOT_SPECS = {
     "smpl": RobotSpec(
         viz_bodies=["Pelvis", "L_Knee", "R_Knee", "L_Ankle", "R_Ankle"],
     ),
+    "smpl_lower_body": RobotSpec(
+        viz_bodies=["Pelvis", "L_Knee", "R_Knee", "L_Ankle", "R_Ankle", "L_Toe", "R_Toe"],
+    ),
+    "smpl_lower_body_ellipsoid_feet": RobotSpec(
+        viz_bodies=["Pelvis", "L_Knee", "R_Knee", "L_Ankle", "R_Ankle", "L_Toe", "R_Toe"],
+    ),
 }
 
 
-class RandomPoseVisualizer:
+class DefaultPoseVisualizer:
     def __init__(
         self,
-        robot_name: str = "g1",
+        robot_name: str = "smpl_lower_body_ellipsoid_feet",
         num_envs: int = 1,
-        simulator_type: str = "isaacgym",
+        simulator_type: str = "newton",
         headless: bool = False,
         cpu_only: bool = False,
         extra_simulator_params: dict = None,
     ):
         self.robot_name = robot_name
-        self.robot_spec = ROBOT_SPECS[robot_name]
         self.num_envs = num_envs
         self.simulator_type = simulator_type
         self.headless = headless
@@ -123,6 +131,7 @@ class RandomPoseVisualizer:
 
         # Load robot configuration using factory function
         self.robot_cfg = robot_config(robot_name)
+        self.robot_spec = self._resolve_robot_spec(robot_name)
 
         # Create simulator configuration using factory function
         self.simulator_cfg = simulator_config(
@@ -130,26 +139,35 @@ class RandomPoseVisualizer:
             self.robot_cfg,
             headless=headless,
             num_envs=num_envs,
-            experiment_name="random_pose_viz",
+            experiment_name="default_pose_viz",
         )
 
-        # Override robot asset settings for pose visualization
-        self.robot_cfg.asset.disable_gravity = True
-        self.robot_cfg.asset.fix_base_link = False  # Allow free movement
-        self.robot_cfg.asset.self_collisions = False  # Disable self-collisions
-
-        # Use torque control (zero torque) to hold poses without movement
-        from protomotions.robot_configs.base import ControlType
-
-        self.robot_cfg.control.control_type = ControlType.TORQUE
+        # Keep the robot dynamic and let the default PD controller hold the nominal pose.
+        self.robot_cfg.asset.disable_gravity = False
+        self.robot_cfg.asset.fix_base_link = False
+        self.robot_cfg.asset.self_collisions = False
 
         # Create visualization markers
         self.viz_markers = self._create_visualization_markers()
 
-        # No terrain needed for pose visualization
-        terrain = None
+        terrain_grid_size = max(1, math.ceil(num_envs ** (1 / 3)))
+        terrain_config = TerrainConfig(
+            map_length=8.0,
+            map_width=8.0,
+            border_size=4.0,
+            num_levels=terrain_grid_size,
+            num_terrains=terrain_grid_size,
+        )
+        terrain_config, self.simulator_cfg = convert_friction_for_simulator(
+            terrain_config, self.simulator_cfg
+        )
+        terrain = Terrain(
+            config=terrain_config,
+            num_envs=self.simulator_cfg.num_envs,
+            device=self.device,
+        )
 
-        # Create empty scene_lib (no scenes, no terrain needed)
+        # Create empty scene_lib (no extra scene objects)
         from protomotions.components.scene_lib import SceneLib
 
         scene_lib = SceneLib.empty(
@@ -177,9 +195,33 @@ class RandomPoseVisualizer:
         print(f"Number of actions: {self.robot_cfg.number_of_actions}")
         print(f"Number of DOFs: {self.robot_cfg.kinematic_info.num_dofs}")
         print(f"Visualizing bodies: {self.robot_spec.viz_bodies}")
-        print("Press 'R' to generate a new random pose")
+        print("Press 'R' to reapply the default standing pose")
 
         self.simulator.user_requested_reset = True
+
+    def _resolve_robot_spec(self, robot_name: str) -> RobotSpec:
+        if robot_name in ROBOT_SPECS:
+            return ROBOT_SPECS[robot_name]
+
+        preferred_bodies = [
+            "Pelvis",
+            "torso_link",
+            "L_Knee",
+            "R_Knee",
+            "L_Ankle",
+            "R_Ankle",
+            "L_Toe",
+            "R_Toe",
+            "left_knee_link",
+            "right_knee_link",
+            "left_ankle_roll_link",
+            "right_ankle_roll_link",
+        ]
+        body_names = self.robot_cfg.kinematic_info.body_names
+        viz_bodies = [body for body in preferred_bodies if body in body_names]
+        if not viz_bodies:
+            viz_bodies = body_names[: min(6, len(body_names))]
+        return RobotSpec(viz_bodies=viz_bodies)
 
     def _create_visualization_markers(self) -> Dict[str, VisualizationMarkerConfig]:
         """Create visualization markers for specified body locations"""
@@ -196,53 +238,6 @@ class RandomPoseVisualizer:
         }
 
         return markers
-
-    def _gen_random_pose(self):
-        """Generate a random pose within joint limits"""
-
-        print("Generating new random pose")
-
-        dof_limits_lower = self.robot_cfg.kinematic_info.dof_limits_lower.to(
-            self.device
-        )
-        dof_limits_upper = self.robot_cfg.kinematic_info.dof_limits_upper.to(
-            self.device
-        )
-        print("dof_limits_lower=", dof_limits_lower)
-        print("dof_limits_upper =", dof_limits_upper)
-        # Generate random DOF positions within limits
-        random_dof_pos = torch.rand(
-            self.num_envs,
-            len(dof_limits_lower),
-            device=self.device,
-            requires_grad=False,
-        )
-
-        # Scale to joint limits
-        dof_ranges = dof_limits_upper - dof_limits_lower
-        random_dof_pos = (dof_limits_lower + random_dof_pos * dof_ranges).detach()
-
-        return random_dof_pos
-
-    def _gen_random_root_rotation(self):
-        """Generate random root rotation quaternion"""
-        # Generate random euler angles (roll, pitch, yaw)
-        random_roll = (
-            (torch.rand(self.num_envs, device=self.device) - 0.5) * 2 * torch.pi
-        )  # [-π, π]
-        random_pitch = (
-            (torch.rand(self.num_envs, device=self.device) - 0.5) * 2 * torch.pi
-        )  # [-π, π]
-        random_yaw = (
-            (torch.rand(self.num_envs, device=self.device) - 0.5) * 2 * torch.pi
-        )  # [-π, π]
-
-        # Convert to quaternion (xyzw format since w_last=True)
-        random_quat = quat_from_euler_xyz(
-            random_roll, random_pitch, random_yaw, w_last=True
-        )
-
-        return random_quat
 
     def _get_updated_marker_positions(self):
         """Update marker positions to follow the specified bodies"""
@@ -299,66 +294,21 @@ class RandomPoseVisualizer:
             dim=-1,
         ).reshape(-1, 3)
 
-        # Scale by spacing and take only first N positions
-        root_positions = coords[: self.num_envs] * spacing  # shape: (self.num_envs, 3)
-        print("@@@@@@@@@@@@@@@@@@")
+        # Scale by spacing and offset each robot to its nominal standing height.
+        root_positions = coords[: self.num_envs] * spacing
+        terrain_xy = root_positions[:, :2]
+        terrain_heights = self.simulator.terrain.get_ground_heights(terrain_xy).view(-1)
+        root_positions[:, 2] = terrain_heights + self.robot_cfg.default_root_height
         while True:
-            # Check for reset request (R key press triggers this in simulator)
             if self.simulator.user_requested_reset:
-                current_state = self.simulator.get_robot_state()
-
-                random_dof_pos = self._gen_random_pose()
-                random_root_rot = self._gen_random_root_rotation()
-
-                # since all sim are in reduced coordinate
-                # we only need to set the root state and dof pos (vel)
-
-                current_state.dof_pos = random_dof_pos.detach()
-                current_state.dof_vel = torch.zeros_like(random_dof_pos).detach()
-                current_state.rigid_body_pos[:, 0, :] = root_positions
-                # NOTE: we use xyzw quaternion ordering for the common state shared by all simulators
-                # current_state.rigid_body_rot[:, 0, :] = torch.tensor([0, 0, 0, 1.0], device=self.device).repeat(self.num_envs, 1)
-                current_state.rigid_body_rot[:, 0, :] = random_root_rot.detach()
-                current_state.rigid_body_vel[:, 0, :] = torch.zeros(
-                    self.num_envs, 3, device=self.device
-                )
-                current_state.rigid_body_ang_vel[:, 0, :] = torch.zeros(
-                    self.num_envs, 3, device=self.device
-                )
-
+                default_state = self.simulator.get_default_robot_reset_state()
+                default_state.root_pos[:] = root_positions
                 env_ids = torch.arange(self.num_envs, device=self.device)
                 self.simulator.reset_envs(
-                    current_state, new_object_states=None, env_ids=env_ids
+                    default_state, new_object_states=None, env_ids=env_ids
                 )
+                self.simulator.user_requested_reset = False
 
-                # # we could set the full maximal coordinate state, but it's not necessary
-
-                # random_dof_pos_w_root = torch.cat([
-                #     torch.zeros(self.num_envs, 3, device=self.device),
-                #     torch.tensor([1.0, 0, 0, 0], device=self.device).repeat(self.num_envs, 1),  # mjcf uses wxyz quaternion ordering
-                #     random_dof_pos
-                # ], dim=1).detach()
-
-                # # pose lib fk function uses MJCF convention.
-                # fk_state = fk_batch_mjcf_with_velocities(
-                #     self.kinematic_info,
-                #     random_dof_pos_w_root,
-                #     fps=None,
-                #     compute_velocities=False,
-                # )
-
-                # # Detach all tensors to avoid gradient issues
-                # fk_state.dof_pos = random_dof_pos.detach()
-                # fk_state.dof_vel = torch.zeros_like(random_dof_pos).detach()
-                # fk_state.rigid_body_pos = fk_state.rigid_body_pos.detach()
-                # fk_state.rigid_body_rot = fk_state.rigid_body_rot.detach()
-                # fk_state.rigid_body_vel = torch.zeros_like(fk_state.rigid_body_pos).detach()
-                # fk_state.rigid_body_ang_vel = torch.zeros_like(fk_state.rigid_body_pos).detach()
-
-                # env_ids = torch.arange(self.num_envs, device=self.device)
-                # self.simulator.reset_envs(fk_state, env_ids=env_ids)
-
-            # zero torque control, so should stay at the reset random pose without moving (gravity off)
             _common_actions = torch.zeros(
                 self.num_envs, self.robot_cfg.number_of_actions, device=self.device
             )
@@ -366,21 +316,6 @@ class RandomPoseVisualizer:
             marker_states = self._get_updated_marker_positions()
 
             self.simulator.step(_common_actions, markers_callback=lambda: marker_states)
-
-            # self.simulator.user_requested_reset = False
-
-            # self.simulator._common_actions = torch.zeros(self.num_envs, self.robot_spec.num_dofs, device=self.device)
-            # self.simulator._apply_motor_forces()
-
-            # # if self.simulator.control_type == ControlType.BUILT_IN_PD:
-            # #     self.simulator._common_actions = torch.zeros(self.num_envs, self.robot_spec.num_dofs, device=self.device)
-            # #     self.simulator._apply_pd_control()
-            # # else:
-
-            # self.simulator._simulate()
-            # self.simulator._refresh_sim_tensors()
-
-            # self.simulator.render()
 
             step_count += 1
 
@@ -399,7 +334,7 @@ def main():
         simulation_app = app_launcher.app
         extra_simulator_params["simulation_app"] = simulation_app
 
-    visualizer = RandomPoseVisualizer(
+    visualizer = DefaultPoseVisualizer(
         robot_name=args.robot,
         num_envs=args.num_envs,
         simulator_type=args.simulator,
