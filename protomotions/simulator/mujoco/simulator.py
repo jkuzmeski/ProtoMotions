@@ -669,21 +669,13 @@ class MujocoSimulator(Simulator):
         new_object_states: Optional[ObjectState] = None,
         env_ids: Optional[torch.Tensor] = None,
     ) -> None:
-        """Set simulator state (qpos/qvel) and recompute FK.
-
-        For MuJoCo (single env), we force XY spawn at origin so the robot
-        stays near the ground plane center and camera tracking works well.
-        """
+        """Set simulator state (qpos/qvel) and recompute FK."""
         root_pos = new_states.root_pos[0].cpu().numpy().copy()
         root_rot = new_states.root_rot[0].cpu().numpy()
         root_vel = new_states.root_vel[0].cpu().numpy()
         root_ang_vel = new_states.root_ang_vel[0].cpu().numpy()
         dof_pos = new_states.dof_pos[0].cpu().numpy()
         dof_vel = new_states.dof_vel[0].cpu().numpy()
-
-        # Force XY to origin for single env (keep Z height from motion)
-        root_pos[0] = 0.0
-        root_pos[1] = 0.0
 
         if self._has_free_joint:
             self.data.qpos[0:3] = root_pos
@@ -1093,5 +1085,9 @@ class MujocoSimulator(Simulator):
             if not self.viewer.is_running():
                 self._viewer_initialized = False
                 return
+            # Re-assert camera tracking each frame so keyboard/mouse
+            # interactions that switch the camera mode don't lose the robot.
+            self.viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+            self.viewer.cam.trackbodyid = 1
 
         super().render()

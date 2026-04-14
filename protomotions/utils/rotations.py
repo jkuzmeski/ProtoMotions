@@ -369,7 +369,11 @@ def quat_diff_rad(a: Tensor, b: Tensor, w_last: bool) -> Tensor:
     b_conj = quat_conjugate(b, w_last)
     mul = quat_mul(a, b_conj, w_last)
     # 2 * torch.acos(torch.abs(mul[:, -1]))
-    return 2.0 * torch.asin(torch.clamp(torch.norm(mul[:, 1:], p=2, dim=-1), max=1.0))
+    if w_last:
+        vec_part = mul[:, :3]
+    else:
+        vec_part = mul[:, 1:]
+    return 2.0 * torch.asin(torch.clamp(torch.norm(vec_part, p=2, dim=-1), max=1.0))
 
 
 @torch.jit.script
