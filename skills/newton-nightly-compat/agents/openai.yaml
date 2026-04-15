@@ -1,0 +1,4 @@
+interface:
+  display_name: "Newton Nightly Compat"
+  short_description: "Catch Newton drift after nightly rebases"
+  default_prompt: "Use $newton-nightly-compat to rebase ProtoMotions against the latest Newton changes, run the nightly smoke checks, and patch compatibility drift until training clears the smoke threshold."

@@ -37,7 +37,7 @@ from protomotions.simulator.base_simulator.simulator_state import (
 from protomotions.simulator.newton.config import NewtonSimulatorConfig
 import warp as wp
 import newton
-from newton import ActuatorMode
+from newton import JointTargetMode
 from newton.selection import ArticulationView
 from newton import Contacts
 from newton.sensors import SensorContact
@@ -138,6 +138,68 @@ class NewtonSimulator(Simulator):
         self.contacts = None  # Initialized after solver/sensors are set up
         self._camera_initialized = False
 
+    def _get_builder_joint_keys(self) -> list[str]:
+        """Return builder joint names in the old ProtoMotions matching format.
+
+        Older Newton builds exposed ``joint_key`` directly. The local fork stores
+        full joint labels in ``joint_label``; the basename after the final slash
+        preserves the compound key format ProtoMotions expects.
+        """
+        if hasattr(self.robot, "joint_key"):
+            return list(self.robot.joint_key)
+        if hasattr(self.robot, "joint_label"):
+            return [label.rsplit("/", 1)[-1] for label in self.robot.joint_label]
+        raise AttributeError("Newton ModelBuilder has neither 'joint_key' nor 'joint_label'")
+
+    def _get_robot_articulation_pattern(self) -> str:
+        """Resolve the articulation selector pattern for the finalized model.
+
+        Newton's local API drifted from builder-side ``articulation_key`` to
+        ``articulation_label``. Some builds also preserve hierarchical labels
+        after replication, so hard-coding ``"robot"`` is brittle. Prefer the
+        exact canonical label when present and fall back to simple wildcard
+        forms that still select one robot articulation per world.
+        """
+        labels = list(getattr(self.model, "articulation_label", []))
+        if not labels:
+            return "robot"
+
+        if "robot" in labels:
+            return "robot"
+
+        leaf_labels = [label.rsplit("/", 1)[-1] for label in labels]
+        if all(label == "robot" for label in leaf_labels):
+            return "*/robot"
+
+        if all(label.startswith("robot") for label in leaf_labels):
+            return "robot*"
+
+        unique_labels = set(labels)
+        if len(unique_labels) == 1:
+            return next(iter(unique_labels))
+
+        unique_leaf_labels = set(leaf_labels)
+        if len(unique_leaf_labels) == 1:
+            return f"*/{next(iter(unique_leaf_labels))}"
+
+        raise KeyError(
+            "Unable to resolve robot articulation pattern from labels "
+            f"{labels!r}; expected a stable per-world robot articulation"
+        )
+
+    def _get_model_body_pattern(self, body_name: str) -> str:
+        """Resolve a body selector pattern against finalized Newton body labels."""
+        body_labels = list(getattr(self.model, "body_label", []))
+        if body_name in body_labels:
+            return body_name
+
+        if any(label.rsplit("/", 1)[-1] == body_name for label in body_labels):
+            return f"*/{body_name}"
+
+        raise KeyError(
+            f"Unable to resolve body pattern for '{body_name}' from labels {body_labels!r}"
+        )
+
     def _create_simulation(self) -> None:
         """Create the Newton simulation environment."""
         self._create_envs()
@@ -209,15 +271,17 @@ class NewtonSimulator(Simulator):
         # 3. Set per-DOF joint properties ON THE BUILDER (before finalize)
         self._configure_builder_joint_properties()
 
-        self.robot.articulation_key = ["robot"]
+        if hasattr(self.robot, "articulation_label"):
+            self.robot.articulation_label = ["robot"]
+        if hasattr(self.robot, "articulation_key"):
+            self.robot.articulation_key = ["robot"]
         self.robot.approximate_meshes("convex_hull")
 
         # 5. Add projectile free bodies to the builder (before replicate)
         self._proj_config = ProjectileConfig()
         proj_sizes = self._proj_config.get_sizes()
         shape_cfg = newton.ModelBuilder.ShapeConfig(
-            density=self._proj_config.density,
-            thickness=1e-3,
+            density=self._proj_config.density
         )
         for i in range(self._proj_config.num_projectiles):
             s = proj_sizes[i]
@@ -277,19 +341,20 @@ class NewtonSimulator(Simulator):
         are the actuated joint DOFs.
         """
         # Build mapping from our DOF names to builder DOF indices.
-        # The builder's joint_key list contains compound names like
+        # The builder joint key list contains compound names like
         # "L_Hip_x_L_Hip_y_L_Hip_z" for multi-DOF joints.
         common_dof_names = list(self._dof_names)  # copy
+        builder_joint_keys = self._get_builder_joint_keys()
         is_floating = not self.robot_config.asset.fix_base_link
         dof_offset = 6 if is_floating else 0  # skip free-joint DOFs
 
-        # Walk through our DOF names, matching them to builder joint keys
+        # Walk through our DOF names, matching them to builder joint keys.
         builder_dof_idx = dof_offset
         while len(common_dof_names) > 0:
             common_dof_name = common_dof_names[0]
 
             # Check if it's a direct match
-            if common_dof_name in self.robot.joint_key:
+            if common_dof_name in builder_joint_keys:
                 # Single-DOF joint
                 info = self.robot_config.control.control_info[common_dof_name]
                 self._set_builder_dof_properties(builder_dof_idx, info)
@@ -298,13 +363,13 @@ class NewtonSimulator(Simulator):
             else:
                 # Multi-DOF joint: find the compound key containing this name
                 multi_dof_key = None
-                for key in self.robot.joint_key:
+                for key in builder_joint_keys:
                     if common_dof_name in key:
                         multi_dof_key = key
                         break
                 assert multi_dof_key is not None, (
                     f"No joint key match found for {common_dof_name} "
-                    f"in {self.robot.joint_key}"
+                    f"in {builder_joint_keys}"
                 )
 
                 # Consume all DOF names that belong to this compound joint
@@ -321,12 +386,12 @@ class NewtonSimulator(Simulator):
         if self.control_type == ControlType.BUILT_IN_PD:
             self.robot.joint_target_ke[dof_idx] = info.stiffness
             self.robot.joint_target_kd[dof_idx] = info.damping
-            self.robot.joint_act_mode[dof_idx] = int(ActuatorMode.POSITION)
+            self.robot.joint_target_mode[dof_idx] = int(JointTargetMode.POSITION)
         else:
             # PROPORTIONAL / TORQUE: we apply forces ourselves
             self.robot.joint_target_ke[dof_idx] = 0.0
             self.robot.joint_target_kd[dof_idx] = 0.0
-            self.robot.joint_act_mode[dof_idx] = int(ActuatorMode.NONE)
+            self.robot.joint_target_mode[dof_idx] = int(JointTargetMode.NONE)
 
         if info.armature is not None:
             self.robot.joint_armature[dof_idx] = info.armature
@@ -344,22 +409,23 @@ class NewtonSimulator(Simulator):
         builder before finalize — see _configure_builder_joint_properties().
         """
         common_dof_names = copy.deepcopy(self._dof_names)
+        builder_joint_keys = self._get_builder_joint_keys()
         newton_dof_names = {}
 
         while len(common_dof_names) > 0:
             common_dof_name = common_dof_names[0]
-            if common_dof_name in self.robot.joint_key:
+            if common_dof_name in builder_joint_keys:
                 newton_dof_names[common_dof_name] = common_dof_name
                 common_dof_names.pop(0)
             else:
                 multi_dof_name = None
-                for newton_dof_name in self.robot.joint_key:
+                for newton_dof_name in builder_joint_keys:
                     if common_dof_name in newton_dof_name:
                         multi_dof_name = newton_dof_name
                         break
                 assert (
                     multi_dof_name is not None
-                ), f"No joint key match found for {common_dof_name} in {self.robot.joint_key}"
+                ), f"No joint key match found for {common_dof_name} in {builder_joint_keys}"
 
                 newton_dof_names[multi_dof_name] = []
                 while (
@@ -372,8 +438,8 @@ class NewtonSimulator(Simulator):
 
         self.robot_view = ArticulationView(
             self.model,
-            pattern="robot",
-            include_joints=self._newton_dof_names.keys(),
+            pattern=self._get_robot_articulation_pattern(),
+            include_joints=list(self._newton_dof_names.keys()),
             include_links=self._body_names,
         )
 
@@ -477,30 +543,53 @@ class NewtonSimulator(Simulator):
             ccd_iterations=sim_params.ccd_iterations,
         )
 
-        # Set geom_margin on MuJoCo model directly (not synced by update_geom_properties_kernel)
-        geom_margin = wp.to_torch(self.solver.mjw_model.geom_margin)
-        geom_margin[:] = 0.01
-        self.solver.mjw_model.geom_margin = wp.from_torch(geom_margin, dtype=wp.float32)
+        # MuJoCo-backed shape contact parameters moved around across Newton builds.
+        # Older builds exposed model.mujoco.geom_gap as the persistent source of
+        # truth; the local fork no longer does. Set whichever surfaces exist.
+        if hasattr(self.solver.mjw_model, "geom_margin"):
+            geom_margin = wp.to_torch(self.solver.mjw_model.geom_margin)
+            geom_margin[:] = 0.01
+            self.solver.mjw_model.geom_margin = wp.from_torch(
+                geom_margin, dtype=wp.float32
+            )
 
-        # Set geom_gap on the Newton model (source of truth).
-        # update_geom_properties_kernel reads from model.mujoco.geom_gap and writes
-        # to mjw_model.geom_gap on every notify_model_changed(SHAPE_PROPERTIES).
-        # Setting only mjw_model.geom_gap would be overwritten by subsequent notifies.
-        newton_geom_gap = wp.to_torch(self.model.mujoco.geom_gap)
-        newton_geom_gap[:] = 0.01
-        self.model.mujoco.geom_gap.assign(
-            wp.from_torch(newton_geom_gap, dtype=wp.float32)
-        )
-        # Also set on MuJoCo model for immediate effect
-        mj_geom_gap = wp.to_torch(self.solver.mjw_model.geom_gap)
-        mj_geom_gap[:] = 0.01
-        self.solver.mjw_model.geom_gap = wp.from_torch(mj_geom_gap, dtype=wp.float32)
+        if hasattr(self.model, "mujoco") and hasattr(self.model.mujoco, "geom_gap"):
+            newton_geom_gap = wp.to_torch(self.model.mujoco.geom_gap)
+            newton_geom_gap[:] = 0.01
+            self.model.mujoco.geom_gap.assign(
+                wp.from_torch(newton_geom_gap, dtype=wp.float32)
+            )
+
+        if hasattr(self.solver.mjw_model, "geom_gap"):
+            mj_geom_gap = wp.to_torch(self.solver.mjw_model.geom_gap)
+            mj_geom_gap[:] = 0.01
+            self.solver.mjw_model.geom_gap = wp.from_torch(
+                mj_geom_gap, dtype=wp.float32
+            )
 
         self.viewer = None
         if not self.headless:
-            self.viewer = newton.viewer.ViewerGL()
+            viewer_backend = getattr(self.config, "viewer_backend", "gl")
+            if viewer_backend == "gl":
+                self.viewer = newton.viewer.ViewerGL()
+                self.viewer.vsync = True
+            elif viewer_backend == "viser":
+                viewer_port = getattr(self.config, "viewer_port", 8097)
+                self.viewer = newton.viewer.ViewerViser(port=viewer_port)
+                self.viewer.show_static = True
+            else:
+                raise ValueError(
+                    f"Unsupported Newton viewer_backend '{viewer_backend}'. "
+                    "Expected 'gl' or 'viser'."
+                )
             self.viewer.set_model(self.model)
-            self.viewer.vsync = True
+            if viewer_backend == "viser":
+                self._setup_viser_ground_visual()
+                viewer_max_worlds = getattr(self.config, "viewer_max_worlds", 16)
+                if viewer_max_worlds is not None:
+                    self.viewer.set_visible_worlds(
+                        range(min(viewer_max_worlds, self.model.world_count))
+                    )
 
         self.state_temp = self.model.state()
         self.state_0 = self.model.state()
@@ -510,6 +599,51 @@ class NewtonSimulator(Simulator):
         newton.eval_fk(
             self.model, self.model.joint_q, self.model.joint_qd, self.state_0
         )
+
+    def _setup_viser_ground_visual(self) -> None:
+        """Add a viewer-only ground reference for the Viser backend.
+
+        Some Newton/Viser combinations do not reliably display the built-in
+        plane primitive. A scene grid keeps ground orientation readable even
+        when the physics ground is not visible.
+        """
+        if getattr(self.config, "viewer_backend", "gl") != "viser":
+            return
+
+        server = getattr(self.viewer, "_server", None)
+        if server is None or not hasattr(server, "scene"):
+            return
+
+        add_grid = getattr(server.scene, "add_grid", None)
+        if add_grid is None:
+            return
+
+        grid_path = "/protomotions_ground"
+        try:
+            add_grid(
+                grid_path,
+                plane="xy",
+                infinite_grid=True,
+                cell_color=(170, 170, 170),
+                cell_thickness=1.0,
+                cell_size=0.5,
+                section_color=(120, 120, 120),
+                section_thickness=1.5,
+                section_size=2.0,
+                fade_distance=80.0,
+                shadow_opacity=0.2,
+                plane_color=(245, 245, 245),
+                plane_opacity=0.12,
+            )
+        except TypeError:
+            # Fallback for older viser signatures.
+            try:
+                add_grid(grid_path, width=2.0, height=2.0, cell_size=0.5)
+            except TypeError:
+                log.warning(
+                    "ViewerViser scene.add_grid signature is unsupported; "
+                    "skipping viewer-only ground grid."
+                )
 
     def _apply_domain_randomization_if_needed(self) -> None:
         """Apply friction and center of mass domain randomization.
@@ -694,10 +828,11 @@ class NewtonSimulator(Simulator):
 
         # Create a contact sensor for each specified contact body
         for body_name in self.robot_config.contact_bodies:
+            body_pattern = self._get_model_body_pattern(body_name)
             # Create sensor that detects contacts between this body and anything
             # The sensor will aggregate contacts across all environments
             sensor = SensorContact(
-                self.model, sensing_obj_bodies=body_name, verbose=False
+                self.model, sensing_obj_bodies=body_pattern, verbose=False
             )
             self._contact_sensors[body_name] = sensor
 
@@ -740,11 +875,21 @@ class NewtonSimulator(Simulator):
         if len(self._contact_sensors) > 0:
             self.solver.update_contacts(self.contacts, self.state_0)
             for body_name, sensor in self._contact_sensors.items():
-                sensor.eval(self.contacts)
+                if hasattr(sensor, "update"):
+                    sensor.update(self.state_0, self.contacts)
+                else:
+                    sensor.eval(self.contacts)
                 # Store the net contact force for this body (across all environments)
-                # sensor.net_force has shape [num_worlds, num_bodies, 3] where num_bodies=1
-                if hasattr(sensor, "net_force") and sensor.net_force is not None:
-                    net_force = wp.to_torch(sensor.net_force).clone()
+                # Newer Newton builds expose total_force, older ones expose
+                # net_force with a singleton body axis.
+                force_wp = None
+                if hasattr(sensor, "total_force") and sensor.total_force is not None:
+                    force_wp = sensor.total_force
+                elif hasattr(sensor, "net_force") and sensor.net_force is not None:
+                    force_wp = sensor.net_force
+
+                if force_wp is not None:
+                    net_force = wp.to_torch(force_wp).clone()
                     # Squeeze the body dimension if present (shape [N, 1, 3] -> [N, 3])
                     if net_force.dim() == 3 and net_force.shape[1] == 1:
                         net_force = net_force.squeeze(1)
@@ -1232,7 +1377,12 @@ class NewtonSimulator(Simulator):
             )
             height_offset = 0
 
-        cam_pos = np.array(self.viewer.camera.pos)
+        if hasattr(self.viewer, "camera") and hasattr(self.viewer.camera, "pos"):
+            cam_pos = np.array(self.viewer.camera.pos)
+        elif hasattr(self.viewer, "_camera_request") and self.viewer._camera_request:
+            cam_pos = np.array(self.viewer._camera_request[0], dtype=np.float64)
+        else:
+            return
         cam_delta = cam_pos - self._cam_prev_char_pos
 
         new_cam_target = char_root_pos + np.array([0, 0, height_offset])

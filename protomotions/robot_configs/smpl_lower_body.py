@@ -183,7 +183,7 @@ class SmplLowerBodyRobotConfig(RobotConfig):
                 iterations=200,
                 njmax=2000,
                 nconmax=1000,
-                ccd_iterations=1000,
+                ccd_iterations=4000,
             ),
         )
     )

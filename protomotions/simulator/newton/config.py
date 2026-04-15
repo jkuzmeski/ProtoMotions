@@ -14,6 +14,7 @@
 # limitations under the License.
 #
 from dataclasses import dataclass, field
+from typing import Optional
 from protomotions.simulator.base_simulator.config import SimParams, SimulatorConfig
 
 
@@ -70,3 +71,42 @@ class NewtonSimulatorConfig(SimulatorConfig):
     _target_: str = "protomotions.simulator.newton.simulator.NewtonSimulator"
     sim: NewtonSimParams = field(default_factory=NewtonSimParams)  # Override sim type
     w_last: bool = True  # Newton uses xyzw quaternions
+    viewer_backend: str = field(
+        default="gl",
+        metadata={"help": "Newton viewer backend to use when headless=False: 'gl' or 'viser'."},
+    )
+    viewer_port: int = field(
+        default=8097,
+        metadata={"help": "Port used by the Newton viser viewer server."},
+    )
+    viewer_max_worlds: Optional[int] = field(
+        default=16,
+        metadata={
+            "help": "Maximum number of Newton worlds to send to the viser viewer. "
+            "None renders all worlds; lower values reduce browser-side choppiness."
+        },
+    )
+    camera_follow_leash_xy: float = field(
+        default=0.35,
+        metadata={
+            "help": "XY dead-zone radius in meters before camera anchor starts moving."
+        },
+    )
+    camera_follow_vertical_tau: float = field(
+        default=0.8,
+        metadata={
+            "help": "Vertical (Z) anchor smoothing time constant in seconds."
+        },
+    )
+    camera_follow_max_speed: float = field(
+        default=6.0,
+        metadata={
+            "help": "Maximum camera translation speed in meters per second."
+        },
+    )
+    camera_follow_tau_target: float = field(
+        default=0.12,
+        metadata={
+            "help": "Camera look-at target smoothing time constant in seconds."
+        },
+    )
