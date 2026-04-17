@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+from .biomechanics_evaluator import BiomechanicsEvaluator
+from .config import BiomechanicsEvaluatorConfig
 from .mimic_evaluator import MimicEvaluator
 from .smoothness_calculator import SmoothnessCalculator
 from .metrics import MotionMetrics
@@ -23,6 +25,8 @@ from .aggregate_metrics import (
 )
 
 __all__ = [
+    "BiomechanicsEvaluator",
+    "BiomechanicsEvaluatorConfig",
     "MimicEvaluator",
     "SmoothnessCalculator",
     "MotionMetrics",

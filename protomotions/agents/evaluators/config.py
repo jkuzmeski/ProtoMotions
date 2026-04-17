@@ -85,3 +85,68 @@ class MimicEvaluatorConfig(EvaluatorConfig):
             "max": 1.0,
         }
     )
+
+
+@dataclass
+class BiomechanicsEvaluatorConfig(EvaluatorConfig):
+    """Configuration for speed-conditioned biomechanics evaluation."""
+
+    _target_: str = "protomotions.agents.evaluators.biomechanics_evaluator.BiomechanicsEvaluator"
+    target_speeds: Optional[list[float]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Target forward speeds to evaluate in m/s. "
+                "If omitted, the evaluator derives speeds from the motion metadata "
+                "or the speed/steering control config."
+            )
+        },
+    )
+    episodes_per_speed: int = field(
+        default=20,
+        metadata={"help": "Number of episodes to run per target speed.", "min": 1},
+    )
+    max_eval_steps: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Hard cap on steps per episode. None falls back to the environment's "
+                "max_episode_length."
+            )
+        },
+    )
+    left_strike_min_interval_sec: float = field(
+        default=0.20,
+        metadata={
+            "help": "Minimum time between accepted left-foot strikes to debounce contact chatter.",
+            "min": 0.0,
+        },
+    )
+    burn_in_speed_tolerance: float = field(
+        default=0.10,
+        metadata={
+            "help": "Relative tolerance for cycle-mean forward speed during burn-in gating.",
+            "min": 0.0,
+        },
+    )
+    burn_in_consecutive_cycles: int = field(
+        default=2,
+        metadata={
+            "help": "Number of consecutive in-range left-anchored cycles required to exit burn-in.",
+            "min": 1,
+        },
+    )
+    success_post_burn_in_cycles: int = field(
+        default=10,
+        metadata={
+            "help": "Number of left-anchored cycles required after burn-in before success is recorded.",
+            "min": 1,
+        },
+    )
+    waveform_num_points: int = field(
+        default=100,
+        metadata={
+            "help": "Number of normalized phase points used when exporting cycle waveforms.",
+            "min": 8,
+        },
+    )

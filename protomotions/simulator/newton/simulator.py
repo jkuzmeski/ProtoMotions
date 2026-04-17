@@ -17,6 +17,8 @@ import os
 import torch
 import numpy as np
 import sys
+from pathlib import Path
+from datetime import datetime
 from typing import Dict, Optional, Tuple
 
 from protomotions.simulator.base_simulator.simulator import Simulator
@@ -137,6 +139,14 @@ class NewtonSimulator(Simulator):
         self._contact_forces = {}  # Store contact forces per body
         self.contacts = None  # Initialized after solver/sensors are set up
         self._camera_initialized = False
+        self._needs_state_sync = False
+        self._last_reset_root_pos: Optional[torch.Tensor] = None
+        self._last_reset_root_rot: Optional[torch.Tensor] = None
+        self._last_reset_root_vel: Optional[torch.Tensor] = None
+        self._last_reset_root_ang_vel: Optional[torch.Tensor] = None
+        self._last_reset_dof_pos: Optional[torch.Tensor] = None
+        self._last_reset_dof_vel: Optional[torch.Tensor] = None
+        self._last_reset_sim_time: Optional[torch.Tensor] = None
 
     def _get_builder_joint_keys(self) -> list[str]:
         """Return builder joint names in the old ProtoMotions matching format.
@@ -895,6 +905,357 @@ class NewtonSimulator(Simulator):
                         net_force = net_force.squeeze(1)
                     self._contact_forces[body_name] = net_force
 
+    def _sync_state_reads_if_needed(self) -> None:
+        """Synchronize Warp work once before reading simulator state tensors."""
+        if not self._needs_state_sync:
+            return
+
+        if wp.get_device().is_cuda:
+            wp.synchronize()
+        self._needs_state_sync = False
+
+    def _get_nonfinite_env_ids(self, *tensors: torch.Tensor) -> torch.Tensor:
+        """Return env IDs where any provided tensor contains non-finite values."""
+        bad_envs = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        for tensor in tensors:
+            finite_mask = torch.isfinite(tensor)
+            if tensor.dim() >= 2:
+                finite_mask = finite_mask.all(dim=tuple(range(1, tensor.dim())))
+            bad_envs |= ~finite_mask
+        return torch.nonzero(bad_envs, as_tuple=False).flatten()
+
+    def _summarize_nonfinite_tensor(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        first_bad_env: int,
+    ) -> str:
+        """Return a compact summary of non-finite values for a state tensor."""
+        if tensor.dim() == 0:
+            is_finite = bool(torch.isfinite(tensor).item())
+            return f"{name}: finite={is_finite}"
+
+        if tensor.shape[0] != self.num_envs:
+            return f"{name}: unexpected leading shape {tuple(tensor.shape)}"
+
+        finite_mask = torch.isfinite(tensor)
+        if tensor.dim() >= 2:
+            env_is_finite = finite_mask.all(dim=tuple(range(1, tensor.dim())))
+            env_slice = tensor[first_bad_env]
+            env_finite = torch.isfinite(env_slice)
+        else:
+            env_is_finite = finite_mask
+            env_slice = tensor[first_bad_env : first_bad_env + 1]
+            env_finite = torch.isfinite(env_slice)
+
+        bad_env_count = int((~env_is_finite).sum().item())
+        env_bad_count = int((~env_finite).sum().item())
+        env_total_count = int(env_finite.numel())
+
+        if env_finite.any():
+            max_abs = float(env_slice[env_finite].abs().max().item())
+            max_abs_str = f"{max_abs:.3e}"
+        else:
+            max_abs_str = "nan"
+
+        return (
+            f"{name}: bad_envs={bad_env_count}/{self.num_envs}, "
+            f"env[{first_bad_env}] nonfinite={env_bad_count}/{env_total_count}, "
+            f"env[{first_bad_env}] max|finite|={max_abs_str}"
+        )
+
+    def _assert_finite_reset_inputs(
+        self,
+        new_states: ResetState,
+        env_ids: torch.Tensor,
+    ) -> None:
+        """Fail fast when reset inputs contain non-finite values."""
+        fields = {
+            "reset.root_pos": new_states.root_pos,
+            "reset.root_rot": new_states.root_rot,
+            "reset.root_vel": new_states.root_vel,
+            "reset.root_ang_vel": new_states.root_ang_vel,
+            "reset.dof_pos": new_states.dof_pos,
+            "reset.dof_vel": new_states.dof_vel,
+        }
+
+        for name, tensor in fields.items():
+            if tensor is None:
+                continue
+
+            finite_mask = torch.isfinite(tensor)
+            if tensor.dim() >= 2:
+                row_finite = finite_mask.all(dim=tuple(range(1, tensor.dim())))
+            else:
+                row_finite = finite_mask
+
+            if row_finite.all():
+                continue
+
+            bad_local_ids = torch.nonzero(~row_finite, as_tuple=False).flatten()
+            bad_env_ids = env_ids[bad_local_ids]
+            bad_element_count = int((~finite_mask[bad_local_ids]).sum().item())
+            msg = (
+                f"Non-finite reset input detected in {name}. "
+                f"bad_envs={bad_env_ids.numel()}/{env_ids.numel()} "
+                f"(first 10 env ids: {bad_env_ids[:10].detach().cpu().tolist()}) "
+                f"bad_elements={bad_element_count}"
+            )
+            log.error(msg)
+            raise AssertionError(msg)
+
+    def _record_last_reset_state(
+        self,
+        new_states: ResetState,
+        env_ids: torch.Tensor,
+    ) -> None:
+        """Store last applied reset state for post-mortem diagnostics."""
+        if self._last_reset_root_pos is None:
+            self._last_reset_root_pos = torch.zeros(
+                self.num_envs, 3, device=self.device, dtype=new_states.root_pos.dtype
+            )
+            self._last_reset_root_rot = torch.zeros(
+                self.num_envs, 4, device=self.device, dtype=new_states.root_rot.dtype
+            )
+            self._last_reset_root_vel = torch.zeros(
+                self.num_envs, 3, device=self.device, dtype=new_states.root_vel.dtype
+            )
+            self._last_reset_root_ang_vel = torch.zeros(
+                self.num_envs,
+                3,
+                device=self.device,
+                dtype=new_states.root_ang_vel.dtype,
+            )
+            self._last_reset_dof_pos = torch.zeros(
+                self.num_envs,
+                new_states.dof_pos.shape[-1],
+                device=self.device,
+                dtype=new_states.dof_pos.dtype,
+            )
+            self._last_reset_dof_vel = torch.zeros(
+                self.num_envs,
+                new_states.dof_vel.shape[-1],
+                device=self.device,
+                dtype=new_states.dof_vel.dtype,
+            )
+            self._last_reset_sim_time = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.float32
+            )
+
+        self._last_reset_root_pos[env_ids] = new_states.root_pos.detach()
+        self._last_reset_root_rot[env_ids] = new_states.root_rot.detach()
+        self._last_reset_root_vel[env_ids] = new_states.root_vel.detach()
+        self._last_reset_root_ang_vel[env_ids] = new_states.root_ang_vel.detach()
+        self._last_reset_dof_pos[env_ids] = new_states.dof_pos.detach()
+        self._last_reset_dof_vel[env_ids] = new_states.dof_vel.detach()
+        self._last_reset_sim_time[env_ids] = float(self.sim_time)
+
+    def _write_nonfinite_debug_dump(
+        self,
+        source: str,
+        bad_env_ids: torch.Tensor,
+        first_bad_env: int,
+        tensors: Dict[str, torch.Tensor],
+    ) -> Optional[Path]:
+        """Write a debug dump for non-finite Newton states and return its path."""
+        if wp.get_device().is_cuda:
+            wp.synchronize()
+
+        root_transforms = wp.to_torch(
+            self.robot_view.get_root_transforms(self.state_0)
+        ).squeeze(1)
+        root_velocities = wp.to_torch(
+            self.robot_view.get_root_velocities(self.state_0)
+        ).squeeze(1)
+        dof_pos = (
+            wp.to_torch(self.robot_view.get_dof_positions(self.state_0))
+            .squeeze(1)
+            .view(self.num_envs, -1)
+        )
+        dof_vel = (
+            wp.to_torch(self.robot_view.get_dof_velocities(self.state_0))
+            .squeeze(1)
+            .view(self.num_envs, -1)
+        )
+
+        joint_q = wp.to_torch(self.state_0.joint_q)
+        joint_qd = wp.to_torch(self.state_0.joint_qd)
+        q_stride = joint_q.numel() // self.num_envs if self.num_envs > 0 else joint_q.numel()
+        qd_stride = (
+            joint_qd.numel() // self.num_envs if self.num_envs > 0 else joint_qd.numel()
+        )
+        q_start = first_bad_env * q_stride
+        q_end = min((first_bad_env + 1) * q_stride, joint_q.numel())
+        qd_start = first_bad_env * qd_stride
+        qd_end = min((first_bad_env + 1) * qd_stride, joint_qd.numel())
+
+        contact_snapshot = {}
+        for body_name, contact_force in self._contact_forces.items():
+            if contact_force.shape[0] > first_bad_env:
+                contact_snapshot[body_name] = contact_force[first_bad_env].detach().cpu().clone()
+
+        debug_payload = {
+            "timestamp_utc": datetime.utcnow().isoformat(),
+            "source": source,
+            "sim_time": float(self.sim_time),
+            "frame_dt": float(self.frame_dt),
+            "sim_dt": float(self.sim_dt),
+            "decimation": int(self.decimation),
+            "num_envs": int(self.num_envs),
+            "bad_env_ids": bad_env_ids.detach().cpu().clone(),
+            "first_bad_env": int(first_bad_env),
+            "steps_since_reset_first_bad_env": int(
+                self._steps_since_reset[first_bad_env].item()
+            ),
+            "actions_first_bad_env": {
+                "current": self._common_actions[first_bad_env].detach().cpu().clone(),
+                "previous": self._previous_actions[first_bad_env].detach().cpu().clone(),
+                "prev_prev": self._prev_prev_actions[first_bad_env].detach().cpu().clone(),
+            },
+            "state_first_bad_env": {
+                "root_transforms": root_transforms[first_bad_env].detach().cpu().clone(),
+                "root_velocities": root_velocities[first_bad_env].detach().cpu().clone(),
+                "dof_pos": dof_pos[first_bad_env].detach().cpu().clone(),
+                "dof_vel": dof_vel[first_bad_env].detach().cpu().clone(),
+                "joint_q_flat": joint_q[q_start:q_end].detach().cpu().clone(),
+                "joint_qd_flat": joint_qd[qd_start:qd_end].detach().cpu().clone(),
+            },
+            "nonfinite_masks_first_bad_env": {
+                name: ~torch.isfinite(tensor[first_bad_env]).detach().cpu()
+                for name, tensor in tensors.items()
+            },
+            "tensors_first_bad_env": {
+                name: tensor[first_bad_env].detach().cpu().clone()
+                for name, tensor in tensors.items()
+            },
+            "contact_forces_first_bad_env": contact_snapshot,
+        }
+
+        if self._last_reset_root_pos is not None:
+            last_reset_root_pos = self._last_reset_root_pos[first_bad_env].detach().clone()
+            reset_ground_height = None
+            reset_root_clearance = None
+            if self.terrain is not None and hasattr(self.terrain, "get_ground_heights"):
+                try:
+                    reset_ground_height = float(
+                        self.terrain.get_ground_heights(
+                            last_reset_root_pos.unsqueeze(0)
+                        )
+                        .reshape(-1)[0]
+                        .item()
+                    )
+                    reset_root_clearance = float(
+                        last_reset_root_pos[2].item() - reset_ground_height
+                    )
+                except Exception:
+                    reset_ground_height = None
+                    reset_root_clearance = None
+
+            debug_payload["last_reset_first_bad_env"] = {
+                "sim_time": float(self._last_reset_sim_time[first_bad_env].item()),
+                "root_pos": last_reset_root_pos.cpu().clone(),
+                "root_rot": self._last_reset_root_rot[first_bad_env].detach()
+                .cpu()
+                .clone(),
+                "root_vel": self._last_reset_root_vel[first_bad_env].detach()
+                .cpu()
+                .clone(),
+                "root_ang_vel": self._last_reset_root_ang_vel[first_bad_env]
+                .detach()
+                .cpu()
+                .clone(),
+                "dof_pos": self._last_reset_dof_pos[first_bad_env].detach()
+                .cpu()
+                .clone(),
+                "dof_vel": self._last_reset_dof_vel[first_bad_env].detach()
+                .cpu()
+                .clone(),
+                "ground_height": reset_ground_height,
+                "root_clearance": reset_root_clearance,
+            }
+
+        dump_dir = Path("output/nonfinite_dumps")
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+        dump_path = dump_dir / (
+            f"newton_nonfinite_{timestamp}_env{first_bad_env}_src_{source}.pt"
+        )
+        torch.save(debug_payload, dump_path)
+        return dump_path
+
+    def _raise_on_nonfinite_envs(
+        self,
+        source: str,
+        bad_env_ids: torch.Tensor,
+        tensors: Dict[str, torch.Tensor],
+    ) -> None:
+        """Fail hard with rich diagnostics when non-finite state is detected."""
+        if bad_env_ids.numel() == 0:
+            return
+
+        first_bad_env = int(bad_env_ids[0].item())
+
+        dump_path: Optional[Path] = None
+        dump_error = None
+        try:
+            dump_path = self._write_nonfinite_debug_dump(
+                source=source,
+                bad_env_ids=bad_env_ids,
+                first_bad_env=first_bad_env,
+                tensors=tensors,
+            )
+        except Exception as exc:  # pragma: no cover - best effort diagnostics
+            dump_error = str(exc)
+
+        summary_lines = [
+            "Non-finite Newton simulator state detected.",
+            f"source={source}",
+            f"sim_time={self.sim_time:.6f}s frame_dt={self.frame_dt:.6f}s",
+            (
+                f"bad_envs={bad_env_ids.numel()}/{self.num_envs}, "
+                f"first_bad_env={first_bad_env}, "
+                f"bad_env_ids(first10)={bad_env_ids[:10].tolist()}"
+            ),
+            f"steps_since_reset[first_bad_env]={int(self._steps_since_reset[first_bad_env].item())}",
+        ]
+        for name, tensor in tensors.items():
+            summary_lines.append(
+                self._summarize_nonfinite_tensor(
+                    name=name,
+                    tensor=tensor,
+                    first_bad_env=first_bad_env,
+                )
+            )
+        if dump_path is not None:
+            summary_lines.append(f"diagnostic_dump={dump_path}")
+        if dump_error is not None:
+            summary_lines.append(f"diagnostic_dump_error={dump_error}")
+
+        msg = " | ".join(summary_lines)
+        log.error(msg)
+        raise AssertionError(msg)
+
+    def _read_bodies_state_tensors(
+        self,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Read raw body state tensors from Newton without finite checks."""
+        body_transforms = (
+            wp.to_torch(self.robot_view.get_link_transforms(self.state_0))
+            .squeeze(1)
+            .view(self.num_envs, self.robot_config.kinematic_info.num_bodies, -1)
+        )
+        body_pos = body_transforms[:, :, :3]
+        body_rot = body_transforms[:, :, 3:]
+
+        body_vel_transforms = (
+            wp.to_torch(self.robot_view.get_link_velocities(self.state_0))
+            .squeeze(1)
+            .view(self.num_envs, self.robot_config.kinematic_info.num_bodies, -1)
+        )
+        body_vel = body_vel_transforms[:, :, :3]
+        body_ang_vel = body_vel_transforms[:, :, 3:]
+        return body_pos, body_rot, body_vel, body_ang_vel
+
     def _physics_step(self) -> None:
         """Performs a physics simulation step."""
         # Update control targets before simulation
@@ -934,6 +1295,7 @@ class NewtonSimulator(Simulator):
 
         self._update_contact_sensors()
         self.sim_time += self.frame_dt
+        self._needs_state_sync = True
 
     def _set_simulator_env_state(
         self,
@@ -948,29 +1310,43 @@ class NewtonSimulator(Simulator):
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device)
         env_mask[env_ids] = True
+        self._assert_finite_reset_inputs(new_states, env_ids)
 
         # Newton expects the state setter to be provided with the states for all envs.
         # The mask is used to determine which envs to apply the update to.
-        robot_state = self._get_simulator_bodies_state()
-        robot_dof_state = self._get_simulator_dof_state()
-        robot_state.merge_fields_from(robot_dof_state)
-
-        robot_state.root_pos[env_ids] = new_states.root_pos
-        robot_state.root_rot[env_ids] = new_states.root_rot
-        robot_state.root_vel[env_ids] = new_states.root_vel
-        robot_state.root_ang_vel[env_ids] = new_states.root_ang_vel
-        robot_state.dof_pos[env_ids] = new_states.dof_pos
-        robot_state.dof_vel[env_ids] = new_states.dof_vel
-
-        root_state = torch.cat([robot_state.root_pos, robot_state.root_rot], dim=1)
-        root_vel_state = torch.cat(
-            [robot_state.root_vel, robot_state.root_ang_vel], dim=1
+        root_state = wp.to_torch(self.robot_view.get_root_transforms(self.state_0)).squeeze(
+            1
         )
+        root_vel_state = wp.to_torch(
+            self.robot_view.get_root_velocities(self.state_0)
+        ).squeeze(1)
+        dof_pos = (
+            wp.to_torch(self.robot_view.get_dof_positions(self.state_0))
+            .squeeze(1)
+            .view(self.num_envs, -1)
+        )
+        dof_vel = (
+            wp.to_torch(self.robot_view.get_dof_velocities(self.state_0))
+            .squeeze(1)
+            .view(self.num_envs, -1)
+        )
+
+        root_state = root_state.clone()
+        root_vel_state = root_vel_state.clone()
+        dof_pos = dof_pos.clone()
+        dof_vel = dof_vel.clone()
+
+        root_state[env_ids, :3] = new_states.root_pos
+        root_state[env_ids, 3:] = new_states.root_rot
+        root_vel_state[env_ids, :3] = new_states.root_vel
+        root_vel_state[env_ids, 3:] = new_states.root_ang_vel
+        dof_pos[env_ids] = new_states.dof_pos
+        dof_vel[env_ids] = new_states.dof_vel
 
         root_state_3d = root_state.unsqueeze(1)
         root_vel_state_3d = root_vel_state.unsqueeze(1)
-        dof_pos_3d = robot_state.dof_pos.unsqueeze(1)
-        dof_vel_3d = robot_state.dof_vel.unsqueeze(1)
+        dof_pos_3d = dof_pos.unsqueeze(1)
+        dof_vel_3d = dof_vel.unsqueeze(1)
 
         # Set state_0 using ArticulationView
         self.robot_view.set_root_transforms(self.state_0, root_state_3d, mask=env_mask)
@@ -1000,12 +1376,16 @@ class NewtonSimulator(Simulator):
         newton.eval_fk(
             self.model, self.state_1.joint_q, self.state_1.joint_qd, self.state_1
         )
+        self._record_last_reset_state(new_states, env_ids)
+        self._needs_state_sync = True
 
     # ===== Group 4: State Getters =====
     def _get_simulator_bodies_contact_buf(
         self, env_ids: Optional[torch.Tensor] = None
     ) -> RobotState:
         """Returns contact forces for robot bodies."""
+        self._sync_state_reads_if_needed()
+
         # Initialize with zeros for all bodies
         rigid_body_contact_forces = torch.zeros(
             self.num_envs, len(self._body_names), 3, device=self.device
@@ -1060,21 +1440,24 @@ class NewtonSimulator(Simulator):
         self, env_ids: Optional[torch.Tensor] = None
     ) -> RobotState:
         """Returns the state of robot bodies."""
-        body_transforms = (
-            wp.to_torch(self.robot_view.get_link_transforms(self.state_0))
-            .squeeze(1)
-            .view(self.num_envs, self.robot_config.kinematic_info.num_bodies, -1)
-        )
-        body_pos = body_transforms[:, :, :3]
-        body_rot = body_transforms[:, :, 3:]
+        self._sync_state_reads_if_needed()
 
-        body_vel_transforms = (
-            wp.to_torch(self.robot_view.get_link_velocities(self.state_0))
-            .squeeze(1)
-            .view(self.num_envs, self.robot_config.kinematic_info.num_bodies, -1)
+        body_pos, body_rot, body_vel, body_ang_vel = self._read_bodies_state_tensors()
+
+        bad_env_ids = self._get_nonfinite_env_ids(
+            body_pos, body_rot, body_vel, body_ang_vel
         )
-        body_vel = body_vel_transforms[:, :, :3]
-        body_ang_vel = body_vel_transforms[:, :, 3:]
+        if bad_env_ids.numel() > 0:
+            self._raise_on_nonfinite_envs(
+                source="bodies_state",
+                bad_env_ids=bad_env_ids,
+                tensors={
+                    "rigid_body_pos": body_pos,
+                    "rigid_body_rot": body_rot,
+                    "rigid_body_vel": body_vel,
+                    "rigid_body_ang_vel": body_ang_vel,
+                },
+            )
 
         if env_ids is not None:
             body_pos = body_pos[env_ids]
@@ -1094,12 +1477,25 @@ class NewtonSimulator(Simulator):
         self, env_ids: Optional[torch.Tensor] = None
     ) -> RootOnlyState:
         """Returns the root state of the robot."""
+        self._sync_state_reads_if_needed()
+
         root_transforms = wp.to_torch(
             self.robot_view.get_root_transforms(self.state_0)
         ).squeeze(1)
         root_velocities = wp.to_torch(
             self.robot_view.get_root_velocities(self.state_0)
         ).squeeze(1)
+
+        bad_env_ids = self._get_nonfinite_env_ids(root_transforms, root_velocities)
+        if bad_env_ids.numel() > 0:
+            self._raise_on_nonfinite_envs(
+                source="root_state",
+                bad_env_ids=bad_env_ids,
+                tensors={
+                    "root_transforms": root_transforms,
+                    "root_velocities": root_velocities,
+                },
+            )
 
         if env_ids is not None:
             root_transforms = root_transforms[env_ids]
@@ -1127,6 +1523,8 @@ class NewtonSimulator(Simulator):
 
     def _get_simulator_dof_forces(self, env_ids=None):
         """Returns the DOF forces."""
+        self._sync_state_reads_if_needed()
+
         dof_forces = wp.to_torch(self.robot_view.get_dof_forces(self.control)).squeeze(
             1
         )
@@ -1140,6 +1538,8 @@ class NewtonSimulator(Simulator):
         self, env_ids: Optional[torch.Tensor] = None
     ) -> RobotState:
         """Returns the state of robot DOFs."""
+        self._sync_state_reads_if_needed()
+
         dof_pos = (
             wp.to_torch(self.robot_view.get_dof_positions(self.state_0))
             .squeeze(1)
@@ -1151,6 +1551,17 @@ class NewtonSimulator(Simulator):
             .squeeze(1)
             .view(self.num_envs, -1)
         )
+
+        bad_env_ids = self._get_nonfinite_env_ids(dof_pos, dof_vel)
+        if bad_env_ids.numel() > 0:
+            self._raise_on_nonfinite_envs(
+                source="dof_state",
+                bad_env_ids=bad_env_ids,
+                tensors={
+                    "dof_pos": dof_pos,
+                    "dof_vel": dof_vel,
+                },
+            )
 
         if env_ids is not None:
             dof_pos = dof_pos[env_ids]
@@ -1245,6 +1656,8 @@ class NewtonSimulator(Simulator):
         env_ids: torch.Tensor,
     ) -> None:
         """Apply velocity impulse to robot root by adding to current velocities."""
+        self._sync_state_reads_if_needed()
+
         current_vel_3d = wp.to_torch(self.robot_view.get_root_velocities(self.state_0))
         current_vel = current_vel_3d.squeeze(1)
         new_vel = current_vel.clone()
@@ -1263,6 +1676,8 @@ class NewtonSimulator(Simulator):
 
         Newton uses xyzw quaternions natively — no conversion needed.
         """
+        self._sync_state_reads_if_needed()
+
         joint_q = wp.to_torch(self.state_0.joint_q)
         n_proj = self._proj_config.num_projectiles
         q_stride = self._proj_q_stride

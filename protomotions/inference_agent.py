@@ -132,19 +132,43 @@ from protomotions.utils.simulator_imports import import_simulator_before_torch  
 AppLauncher = import_simulator_before_torch(args.simulator)
 
 # Now safe to import everything else including torch
+import importlib.util  # noqa: E402
 import logging  # noqa: E402
 from pathlib import Path  # noqa: E402
+import sys  # noqa: E402
 import torch  # noqa: E402
 from protomotions.utils.hydra_replacement import get_class  # noqa: E402
 from protomotions.utils.fabric_config import FabricConfig  # noqa: E402
 from lightning.fabric import Fabric  # noqa: E402
 from dataclasses import asdict  # noqa: E402
-from protomotions.utils.config_utils import clean_dict_for_storage  # noqa: E402
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s: %(message)s")
 
 log = logging.getLogger(__name__)
+
+
+def _load_joint_plot_generator():
+    """Load the joint-plot helper from the repo's sibling scripts directory.
+
+    inference_agent.py is commonly launched as `python protomotions/inference_agent.py`,
+    which puts `/.../protomotions` on sys.path but not the repo root. That means
+    `import scripts.plot_eval_joint_angles` fails even though the file exists.
+    Load it by absolute path instead.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    module_path = repo_root / "scripts" / "plot_eval_joint_angles.py"
+    spec = importlib.util.spec_from_file_location(
+        "protomotions_plot_eval_joint_angles",
+        module_path,
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load plot helper from {module_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module.generate_joint_angle_plots
 
 
 # def tmp_enable_domain_randomization(robot_cfg, simulator_cfg, env_cfg):
@@ -367,6 +391,29 @@ def main():
         if args.full_eval:
             agent.evaluator.eval_count = 0
             evaluation_log, evaluated_score = agent.evaluator.evaluate()
+
+            predicted_motion_lib = (
+                checkpoint_path.parent
+                / "results"
+                / f"predicted_motion_lib_epoch_{agent.current_epoch}.pt"
+            )
+            if predicted_motion_lib.exists():
+                try:
+                    generate_joint_angle_plots = _load_joint_plot_generator()
+                    plot_output_dir = generate_joint_angle_plots(
+                        predicted_motion_lib=predicted_motion_lib,
+                    )
+                    log.info(f"Auto-generated joint plots at {plot_output_dir}")
+                except Exception as exc:
+                    log.warning(
+                        "Full eval saved a predicted MotionLib but automatic joint "
+                        f"plot generation failed: {exc}"
+                    )
+            else:
+                log.info(
+                    "No predicted MotionLib was produced by this evaluator; "
+                    "skipping automatic joint-angle plot generation."
+                )
             
             # Print evaluation metrics
             print("\n" + "=" * 60)
