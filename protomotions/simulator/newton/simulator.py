@@ -14,6 +14,7 @@
 # limitations under the License.
 #
 import os
+import traceback
 import torch
 import numpy as np
 import sys
@@ -225,7 +226,20 @@ class NewtonSimulator(Simulator):
         self.graph = None
         self.use_cuda_graph = False
 
-        if wp.get_device().is_cuda and wp.is_mempool_enabled(wp.get_device()):
+        fail_fast_warnings = bool(
+            getattr(self.config.sim, "raise_on_mujoco_warning", False)
+        )
+        can_use_cuda_graph = (
+            wp.get_device().is_cuda and wp.is_mempool_enabled(wp.get_device())
+        )
+
+        if can_use_cuda_graph and fail_fast_warnings:
+            print(
+                "[INFO] CUDA graph disabled: fail-fast MuJoCo warning escalation "
+                "requires uncaptured Newton solver steps"
+            )
+
+        if can_use_cuda_graph and not fail_fast_warnings:
             print(f"[INFO] Using CUDA graph ({self.control_type.name})")
             self.use_cuda_graph = True
             zeros = torch.zeros(
@@ -545,37 +559,17 @@ class NewtonSimulator(Simulator):
             integrator=sim_params.integrator,
             njmax=sim_params.njmax,
             nconmax=sim_params.nconmax,
+            nccdmax=sim_params.nccdmax,
+            naccdmax=sim_params.naccdmax,
             iterations=sim_params.iterations,
             ls_iterations=sim_params.ls_iterations,
             ls_parallel=sim_params.ls_parallel,
             impratio=sim_params.impratio,
             cone=sim_params.cone,
             ccd_iterations=sim_params.ccd_iterations,
+            max_epa_workspace_iterations=sim_params.max_epa_workspace_iterations,
+            raise_on_mujoco_warning=sim_params.raise_on_mujoco_warning,
         )
-
-        # MuJoCo-backed shape contact parameters moved around across Newton builds.
-        # Older builds exposed model.mujoco.geom_gap as the persistent source of
-        # truth; the local fork no longer does. Set whichever surfaces exist.
-        if hasattr(self.solver.mjw_model, "geom_margin"):
-            geom_margin = wp.to_torch(self.solver.mjw_model.geom_margin)
-            geom_margin[:] = 0.01
-            self.solver.mjw_model.geom_margin = wp.from_torch(
-                geom_margin, dtype=wp.float32
-            )
-
-        if hasattr(self.model, "mujoco") and hasattr(self.model.mujoco, "geom_gap"):
-            newton_geom_gap = wp.to_torch(self.model.mujoco.geom_gap)
-            newton_geom_gap[:] = 0.01
-            self.model.mujoco.geom_gap.assign(
-                wp.from_torch(newton_geom_gap, dtype=wp.float32)
-            )
-
-        if hasattr(self.solver.mjw_model, "geom_gap"):
-            mj_geom_gap = wp.to_torch(self.solver.mjw_model.geom_gap)
-            mj_geom_gap[:] = 0.01
-            self.solver.mjw_model.geom_gap = wp.from_torch(
-                mj_geom_gap, dtype=wp.float32
-            )
 
         self.viewer = None
         if not self.headless:
@@ -864,7 +858,7 @@ class NewtonSimulator(Simulator):
 
     def _simulate(self) -> None:
         """Run physics simulation for one frame (decimation substeps)."""
-        for _ in range(self.decimation):
+        for substep_idx in range(self.decimation):
             self.state_0.clear_forces()
             if self.control_type == ControlType.PROPORTIONAL:
                 self._apply_pd_kernel(self.state_0)
@@ -872,13 +866,384 @@ class NewtonSimulator(Simulator):
                 self._apply_torques_kernel_method()
             if self.viewer:
                 self.viewer.apply_forces(self.state_0)
-            self.solver.step(
-                self.state_0, self.state_1, self.control, self.contacts, self.sim_dt
-            )
+            try:
+                self.solver.step(
+                    self.state_0, self.state_1, self.control, self.contacts, self.sim_dt
+                )
+            except Exception as exc:
+                self._raise_on_solver_failure(
+                    source="solver_step",
+                    substep_idx=substep_idx,
+                    exc=exc,
+                )
             self.state_0, self.state_1 = self.state_1, self.state_0
 
         if self.decimation % 2 != 0:
             self.state_0.assign(self.state_1)
+
+    @staticmethod
+    def _serialize_debug_value(value):
+        """Convert MuJoCo/Newton runtime values into debug-friendly Python types."""
+        if value is None:
+            return None
+        if hasattr(value, "numpy"):
+            try:
+                value = value.numpy()
+            except Exception:
+                pass
+        if isinstance(value, np.ndarray):
+            if value.size == 1:
+                return value.reshape(-1)[0].item()
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, tuple):
+            return [NewtonSimulator._serialize_debug_value(v) for v in value]
+        if isinstance(value, list):
+            return [NewtonSimulator._serialize_debug_value(v) for v in value]
+        return repr(value)
+
+    def _get_solver_runtime_options(self) -> Dict[str, object]:
+        """Read the effective MuJoCo runtime options from the active solver."""
+        option_names = (
+            "timestep",
+            "iterations",
+            "ls_iterations",
+            "ccd_iterations",
+            "sdf_iterations",
+            "sdf_initpoints",
+            "solver",
+            "integrator",
+            "cone",
+            "jacobian",
+            "impratio",
+            "tolerance",
+            "ls_tolerance",
+            "ccd_tolerance",
+            "run_collision_detection",
+        )
+        runtime_options: Dict[str, object] = {}
+        for model_name in ("mj_model", "mjw_model"):
+            solver_model = getattr(self.solver, model_name, None)
+            if solver_model is None or not hasattr(solver_model, "opt"):
+                continue
+            model_options = {}
+            for option_name in option_names:
+                option_value = getattr(solver_model.opt, option_name, None)
+                if option_value is None:
+                    continue
+                model_options[option_name] = self._serialize_debug_value(option_value)
+            if model_options:
+                runtime_options[model_name] = model_options
+        return runtime_options
+
+    def _compute_body_ground_clearances(
+        self,
+        body_pos: torch.Tensor,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Return terrain heights and clearances for each body if available."""
+        if self.terrain is None or not hasattr(self.terrain, "get_ground_heights"):
+            return None, None
+
+        try:
+            ground_heights = self.terrain.get_ground_heights(
+                body_pos.reshape(-1, body_pos.shape[-1])
+            ).view(self.num_envs, body_pos.shape[1])
+        except Exception:
+            return None, None
+
+        clearances = body_pos[:, :, 2] - ground_heights
+        return ground_heights, clearances
+
+    def _get_rigid_body_contact_forces_snapshot(self) -> torch.Tensor:
+        """Collect latest per-body contact forces into a dense tensor."""
+        rigid_body_contact_forces = torch.zeros(
+            self.num_envs, len(self._body_names), 3, device=self.device
+        )
+        for body_name, contact_force in self._contact_forces.items():
+            if body_name not in self._body_names:
+                continue
+            body_idx = self._body_names.index(body_name)
+            rigid_body_contact_forces[:, body_idx, :] = contact_force
+        return rigid_body_contact_forces
+
+    def _build_solver_failure_candidates(
+        self,
+        root_transforms: torch.Tensor,
+        root_velocities: torch.Tensor,
+        dof_vel: torch.Tensor,
+        body_pos: Optional[torch.Tensor] = None,
+        body_clearances: Optional[torch.Tensor] = None,
+        contact_forces: Optional[torch.Tensor] = None,
+        limit: int = 10,
+    ) -> list[Dict[str, object]]:
+        """Rank likely-problematic envs for solver failures."""
+        if self.num_envs == 0:
+            return []
+
+        root_z = root_transforms[:, 2]
+        lin_speed = torch.linalg.vector_norm(root_velocities[:, :3], dim=1)
+        ang_speed = torch.linalg.vector_norm(root_velocities[:, 3:], dim=1)
+        max_dof_vel = (
+            dof_vel.abs().max(dim=1).values
+            if dof_vel.numel() > 0
+            else torch.zeros(self.num_envs, device=root_transforms.device)
+        )
+
+        min_clearance = None
+        min_body_idx = None
+        clearance_term = torch.zeros_like(root_z)
+        if body_clearances is not None and body_clearances.numel() > 0:
+            min_clearance, min_body_idx = body_clearances.min(dim=1)
+            clearance_term = (-min_clearance).clamp_min(0.0)
+
+        max_contact_force = None
+        max_contact_idx = None
+        if contact_forces is not None and contact_forces.numel() > 0:
+            contact_magnitudes = torch.linalg.vector_norm(contact_forces, dim=-1)
+            max_contact_force, max_contact_idx = contact_magnitudes.max(dim=1)
+
+        # Favor penetrations first, then fast-moving envs with low body/root height.
+        score = (
+            10.0 * clearance_term
+            + 0.25 * (-root_z).clamp_min(0.0)
+            + 0.05 * lin_speed
+            + 0.02 * ang_speed
+            + 0.01 * max_dof_vel
+        )
+        top_k = min(limit, self.num_envs)
+        candidate_env_ids = torch.topk(score, k=top_k).indices.detach().cpu().tolist()
+
+        candidates: list[Dict[str, object]] = []
+        for env_id in candidate_env_ids:
+            candidate: Dict[str, object] = {
+                "env_id": int(env_id),
+                "score": float(score[env_id].item()),
+                "steps_since_reset": int(self._steps_since_reset[env_id].item()),
+                "root_z": float(root_z[env_id].item()),
+                "root_pos": root_transforms[env_id, :3].detach().cpu().tolist(),
+                "root_lin_speed": float(lin_speed[env_id].item()),
+                "root_ang_speed": float(ang_speed[env_id].item()),
+                "max_abs_dof_vel": float(max_dof_vel[env_id].item()),
+            }
+            if min_clearance is not None and min_body_idx is not None:
+                body_idx = int(min_body_idx[env_id].item())
+                candidate["min_body_clearance"] = float(min_clearance[env_id].item())
+                candidate["min_body_name"] = self._body_names[body_idx]
+                if body_pos is not None:
+                    candidate["min_body_pos"] = (
+                        body_pos[env_id, body_idx].detach().cpu().tolist()
+                    )
+            if max_contact_force is not None and max_contact_idx is not None:
+                contact_body_idx = int(max_contact_idx[env_id].item())
+                candidate["max_contact_force"] = float(max_contact_force[env_id].item())
+                candidate["max_contact_force_body"] = self._body_names[contact_body_idx]
+            if self._last_reset_root_pos is not None:
+                candidate["time_since_reset"] = float(
+                    self.sim_time - float(self._last_reset_sim_time[env_id].item())
+                )
+                candidate["last_reset_root_pos"] = (
+                    self._last_reset_root_pos[env_id].detach().cpu().tolist()
+                )
+            candidates.append(candidate)
+        return candidates
+
+    def _write_solver_failure_debug_dump(
+        self,
+        source: str,
+        substep_idx: int,
+        exc: Exception,
+    ) -> Path:
+        """Write a fail-fast debug dump for solver-step failures and warnings."""
+        if wp.get_device().is_cuda:
+            wp.synchronize()
+
+        root_transforms = wp.to_torch(
+            self.robot_view.get_root_transforms(self.state_0)
+        ).squeeze(1)
+        root_velocities = wp.to_torch(
+            self.robot_view.get_root_velocities(self.state_0)
+        ).squeeze(1)
+        body_pos, body_rot, body_vel, body_ang_vel = self._read_bodies_state_tensors()
+        body_ground_heights, body_clearances = self._compute_body_ground_clearances(
+            body_pos
+        )
+        dof_pos = (
+            wp.to_torch(self.robot_view.get_dof_positions(self.state_0))
+            .squeeze(1)
+            .view(self.num_envs, -1)
+        )
+        dof_vel = (
+            wp.to_torch(self.robot_view.get_dof_velocities(self.state_0))
+            .squeeze(1)
+            .view(self.num_envs, -1)
+        )
+        rigid_body_contact_forces = self._get_rigid_body_contact_forces_snapshot()
+        solver_failure_candidates = self._build_solver_failure_candidates(
+            root_transforms=root_transforms,
+            root_velocities=root_velocities,
+            dof_vel=dof_vel,
+            body_pos=body_pos,
+            body_clearances=body_clearances,
+            contact_forces=rigid_body_contact_forces,
+            limit=10,
+        )
+
+        solver_capacity = {
+            "max_contact_count": int(self.solver.get_max_contact_count()),
+            "use_cuda_graph": bool(self.use_cuda_graph),
+        }
+        for data_name, attr_names in (
+            ("mjw_data", ("nacon", "naconmax", "naccd", "naccdmax")),
+            ("mj_data", ("ncon", "nconmax", "nefc", "njmax")),
+        ):
+            solver_data = getattr(self.solver, data_name, None)
+            if solver_data is None:
+                continue
+            data_snapshot = {}
+            for attr_name in attr_names:
+                if hasattr(solver_data, attr_name):
+                    data_snapshot[attr_name] = self._serialize_debug_value(
+                        getattr(solver_data, attr_name)
+                    )
+            if data_snapshot:
+                solver_capacity[data_name] = data_snapshot
+
+        debug_payload = {
+            "timestamp_utc": datetime.utcnow().isoformat(),
+            "source": source,
+            "substep_idx": int(substep_idx),
+            "sim_time": float(self.sim_time),
+            "frame_dt": float(self.frame_dt),
+            "sim_dt": float(self.sim_dt),
+            "decimation": int(self.decimation),
+            "num_envs": int(self.num_envs),
+            "exception_type": type(exc).__name__,
+            "exception_message": str(exc),
+            "traceback": traceback.format_exc(),
+            "solver_config": {
+                "solver": self.config.sim.solver,
+                "integrator": self.config.sim.integrator,
+                "iterations": int(self.config.sim.iterations),
+                "ls_iterations": int(self.config.sim.ls_iterations),
+                "ls_parallel": bool(self.config.sim.ls_parallel),
+                "impratio": float(self.config.sim.impratio),
+                "njmax": int(self.config.sim.njmax),
+                "nconmax": int(self.config.sim.nconmax),
+                "nccdmax": None if self.config.sim.nccdmax is None else int(self.config.sim.nccdmax),
+                "naccdmax": None if self.config.sim.naccdmax is None else int(self.config.sim.naccdmax),
+                "max_epa_workspace_iterations": None if self.config.sim.max_epa_workspace_iterations is None else int(self.config.sim.max_epa_workspace_iterations),
+                "cone": self.config.sim.cone,
+                "ccd_iterations": int(self.config.sim.ccd_iterations),
+                "raise_on_mujoco_warning": bool(self.config.sim.raise_on_mujoco_warning),
+            },
+            "solver_runtime_options": self._get_solver_runtime_options(),
+            "solver_capacity": solver_capacity,
+            "actions": {
+                "current": self._common_actions.detach().cpu().clone(),
+                "previous": self._previous_actions.detach().cpu().clone(),
+                "prev_prev": self._prev_prev_actions.detach().cpu().clone(),
+            },
+            "solver_failure_candidates": solver_failure_candidates,
+            "state_before_step": {
+                "root_transforms": root_transforms.detach().cpu().clone(),
+                "root_velocities": root_velocities.detach().cpu().clone(),
+                "rigid_body_pos": body_pos.detach().cpu().clone(),
+                "rigid_body_rot": body_rot.detach().cpu().clone(),
+                "rigid_body_vel": body_vel.detach().cpu().clone(),
+                "rigid_body_ang_vel": body_ang_vel.detach().cpu().clone(),
+                "rigid_body_contact_forces": rigid_body_contact_forces.detach().cpu().clone(),
+                "body_ground_heights": None if body_ground_heights is None else body_ground_heights.detach().cpu().clone(),
+                "body_ground_clearances": None if body_clearances is None else body_clearances.detach().cpu().clone(),
+                "body_names": list(self._body_names),
+                "dof_pos": dof_pos.detach().cpu().clone(),
+                "dof_vel": dof_vel.detach().cpu().clone(),
+                "joint_q": wp.to_torch(self.state_0.joint_q).detach().cpu().clone(),
+                "joint_qd": wp.to_torch(self.state_0.joint_qd).detach().cpu().clone(),
+            },
+        }
+
+        dump_dir = Path("output/sim_failure_dumps")
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+        dump_path = dump_dir / (
+            f"newton_solver_failure_{timestamp}_substep{substep_idx}_src_{source}.pt"
+        )
+        torch.save(debug_payload, dump_path)
+        return dump_path
+
+    def _raise_on_solver_failure(
+        self,
+        source: str,
+        substep_idx: int,
+        exc: Exception,
+    ) -> None:
+        """Crash immediately with a solver failure summary and state dump."""
+        dump_path: Optional[Path] = None
+        dump_error = None
+        try:
+            dump_path = self._write_solver_failure_debug_dump(
+                source=source,
+                substep_idx=substep_idx,
+                exc=exc,
+            )
+        except Exception as dump_exc:  # pragma: no cover - best effort diagnostics
+            dump_error = str(dump_exc)
+
+        candidate_summaries = []
+        try:
+            root_transforms = wp.to_torch(
+                self.robot_view.get_root_transforms(self.state_0)
+            ).squeeze(1)
+            root_velocities = wp.to_torch(
+                self.robot_view.get_root_velocities(self.state_0)
+            ).squeeze(1)
+            body_pos, _, _, _ = self._read_bodies_state_tensors()
+            _, body_clearances = self._compute_body_ground_clearances(body_pos)
+            dof_vel = (
+                wp.to_torch(self.robot_view.get_dof_velocities(self.state_0))
+                .squeeze(1)
+                .view(self.num_envs, -1)
+            )
+            contact_forces = self._get_rigid_body_contact_forces_snapshot()
+            candidate_summaries = self._build_solver_failure_candidates(
+                root_transforms=root_transforms,
+                root_velocities=root_velocities,
+                dof_vel=dof_vel,
+                body_pos=body_pos,
+                body_clearances=body_clearances,
+                contact_forces=contact_forces,
+                limit=3,
+            )
+        except Exception:
+            candidate_summaries = []
+
+        summary_lines = [
+            "Newton solver step failed.",
+            f"source={source}",
+            f"sim_time={self.sim_time:.6f}s frame_dt={self.frame_dt:.6f}s sim_dt={self.sim_dt:.6f}s",
+            f"substep={substep_idx + 1}/{self.decimation}",
+            f"use_cuda_graph={self.use_cuda_graph}",
+            (
+                f"solver_budget(nconmax={int(self.config.sim.nconmax)}, "
+                f"nccdmax={self.config.sim.nccdmax if self.config.sim.nccdmax is not None else 'auto'}, "
+                f"njmax={int(self.config.sim.njmax)}, "
+                f"ccd_iterations={int(self.config.sim.ccd_iterations)})"
+            ),
+            f"exception={type(exc).__name__}: {exc}",
+        ]
+        if candidate_summaries:
+            summary_lines.append(f"candidate_envs={candidate_summaries}")
+        if dump_path is not None:
+            summary_lines.append(f"diagnostic_dump={dump_path}")
+        if dump_error is not None:
+            summary_lines.append(f"diagnostic_dump_error={dump_error}")
+
+        msg = " | ".join(summary_lines)
+        log.error(msg)
+        raise RuntimeError(msg) from exc
 
     def _update_contact_sensors(self) -> None:
         """Update contact sensors after physics step. Must be called outside CUDA graph."""
@@ -913,6 +1278,15 @@ class NewtonSimulator(Simulator):
         if wp.get_device().is_cuda:
             wp.synchronize()
         self._needs_state_sync = False
+
+    def _reset_solver_worlds_from_state(self, env_ids: torch.Tensor) -> None:
+        """Clear per-world MuJoCo runtime state after direct Newton state teleports."""
+        if env_ids is None or env_ids.numel() == 0:
+            return
+        reset_worlds = getattr(self.solver, "reset_worlds", None)
+        if reset_worlds is None:
+            return
+        reset_worlds(self.state_0, env_ids)
 
     def _get_nonfinite_env_ids(self, *tensors: torch.Tensor) -> torch.Tensor:
         """Return env IDs where any provided tensor contains non-finite values."""
@@ -1377,6 +1751,7 @@ class NewtonSimulator(Simulator):
             self.model, self.state_1.joint_q, self.state_1.joint_qd, self.state_1
         )
         self._record_last_reset_state(new_states, env_ids)
+        self._reset_solver_worlds_from_state(env_ids)
         self._needs_state_sync = True
 
     # ===== Group 4: State Getters =====
@@ -1741,6 +2116,8 @@ class NewtonSimulator(Simulator):
         newton.eval_fk(
             self.model, self.state_1.joint_q, self.state_1.joint_qd, self.state_1
         )
+        self._reset_solver_worlds_from_state(env_ids)
+        self._needs_state_sync = True
 
     # ===== Group 6: Rendering & Visualization =====
     def _init_camera(self) -> None:

@@ -54,6 +54,14 @@ class NewtonSimParams(SimParams):
         default=300,
         metadata={"help": "Max contacts."}
     )
+    nccdmax: Optional[int] = field(
+        default=None,
+        metadata={"help": "Max CCD contact candidates per world. Defaults to nconmax when unset."}
+    )
+    naccdmax: Optional[int] = field(
+        default=None,
+        metadata={"help": "Global CCD contact candidate budget. Defaults to nccdmax * num_worlds when unset."}
+    )
     cone: str = field(
         default="pyramidal",
         metadata={"help": "Friction cone: 'pyramidal' or 'elliptic'."}
@@ -61,6 +69,18 @@ class NewtonSimParams(SimParams):
     ccd_iterations: int = field(
         default=200,
         metadata={"help": "CCD (continuous collision detection) iterations."}
+    )
+    max_epa_workspace_iterations: Optional[int] = field(
+        default=128,
+        metadata={
+            "help": "Cap for MuJoCo-Warp EPA scratch/workspace iterations. Keep this separate from ccd_iterations to avoid runaway GPU allocations in large batched runs."
+        },
+    )
+    raise_on_mujoco_warning: bool = field(
+        default=False,
+        metadata={
+            "help": "Raise immediately when MuJoCo emits a runtime warning during a Newton solver step. Enable this for bridge/debug investigations; it disables CUDA graph replay so warnings can fail fast at the offending step."
+        },
     )
 
 
