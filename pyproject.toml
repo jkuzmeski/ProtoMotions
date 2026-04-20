@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=69.5.1", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "protomotions"
+version = "3.1"
+description = "Physics-based Character Animation with Reinforcement Learning"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [
+    { name = "Chen Tessler" },
+    { name = "Yifeng Jiang" },
+]
+requires-python = ">=3.10,<3.14"
+dependencies = []
+
+[project.optional-dependencies]
+newton = [
+    "newton[examples]",
+    "torch==2.7.0",
+    "torchvision==0.22.0",
+    "tensordict==0.9.0",
+    "lightning",
+    "numpy>=1.21.1",
+    "termcolor>=1.1.0",
+    "scikit-image",
+    "rtree==1.2.0",
+    "trimesh",
+    "rich",
+    "typer>=0.6.1",
+    "transformers>=4.20.1",
+    "matplotlib",
+    "easydict",
+    "wandb==0.23.0",
+    "sentry-sdk==2.0.0",
+    "hydra-core==1.3.2",
+    "moviepy",
+    "dm_control>=1.0",
+    "pandas",
+    "openmesh==1.2.1",
+    "tensorboardX",
+]
+
+[tool.setuptools.packages.find]
+include = ["protomotions*"]
+namespaces = true
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com/"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+newton = { path = "../newton", editable = true }
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+warp-lang = { index = "nvidia" }

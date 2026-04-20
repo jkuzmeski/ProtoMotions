@@ -13,13 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from setuptools import setup
+from setuptools import find_namespace_packages, setup
 
 setup(
-    name="protomotions",
-    version="3.1",
-    packages=["protomotions"],
-    description="Physics-based Character Animation with Reinforcement Learning",
-    author="Chen Tessler, Yifeng Jiang",
-    python_requires=">=3.8",
+    packages=find_namespace_packages(include=["protomotions*"]),
+    include_package_data=True,
 )

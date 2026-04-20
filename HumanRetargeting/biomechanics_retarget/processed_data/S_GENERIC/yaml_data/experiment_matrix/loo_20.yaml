@@ -1,0 +1,112 @@
+manifest_version: 1
+subject_id: S_GENERIC
+subset_name: loo_20
+source_manifest: /home/jkuzm/biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/yaml_data/motions_S_GENERIC.yaml
+fps: 30
+selected_files:
+- S02_15ms_Long.motion
+- S02_25ms_Long.motion
+- S02_30ms_Long.motion
+- S02_35ms_Long.motion
+- S02_40ms_Long.motion
+- S02_45ms_Long.motion
+- S02_50ms_Long.motion
+motions:
+- subject_id: S_GENERIC
+  trial_name: S02_15ms_Long
+  speed_mps: 1.5
+  source_file: /home/jkuzm/biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/treadmill_data/S_GENERIC/S02_15ms_Long.txt
+  fps: 30
+  duration_seconds: 18.166666666666668
+  file: /home/jkuzm/biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/motion_files/S02_15ms_Long.motion
+  weight: 1.0
+  sub_motions:
+  - idx: 0
+    timings:
+      start: 0.0
+      end: 18.166666666666668
+    weight: 1.0
+- subject_id: S_GENERIC
+  trial_name: S02_25ms_Long
+  speed_mps: 2.5
+  source_file: /home/jkuzm/biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/treadmill_data/S_GENERIC/S02_25ms_Long.txt
+  fps: 30
+  duration_seconds: 18.966666666666665
+  file: /home/jkuzm/biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/motion_files/S02_25ms_Long.motion
+  weight: 1.0
+  sub_motions:
+  - idx: 0
+    timings:
+      start: 0.0
+      end: 18.966666666666665
+    weight: 1.0
+- subject_id: S_GENERIC
+  trial_name: S02_30ms_Long
+  speed_mps: 3.0
+  source_file: /home/jkuzm/biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/treadmill_data/S_GENERIC/S02_30ms_Long.txt
+  fps: 30
+  duration_seconds: 19.3
+  file: /home/jkuzm/biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/motion_files/S02_30ms_Long.motion
+  weight: 1.0
+  sub_motions:
+  - idx: 0
+    timings:
+      start: 0.0
+      end: 19.3
+    weight: 1.0
+- subject_id: S_GENERIC
+  trial_name: S02_35ms_Long
+  speed_mps: 3.5
+  source_file: /home/jkuzm/biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/treadmill_data/S_GENERIC/S02_35ms_Long.txt
+  fps: 30
+  duration_seconds: 18.5
+  file: /home/jkuzm/biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/motion_files/S02_35ms_Long.motion
+  weight: 1.0
+  sub_motions:
+  - idx: 0
+    timings:
+      start: 0.0
+      end: 18.5
+    weight: 1.0
+- subject_id: S_GENERIC
+  trial_name: S02_40ms_Long
+  speed_mps: 4.0
+  source_file: /home/jkuzm/biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/treadmill_data/S_GENERIC/S02_40ms_Long.txt
+  fps: 30
+  duration_seconds: 19.3
+  file: /home/jkuzm/biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/motion_files/S02_40ms_Long.motion
+  weight: 1.0
+  sub_motions:
+  - idx: 0
+    timings:
+      start: 0.0
+      end: 19.3
+    weight: 1.0
+- subject_id: S_GENERIC
+  trial_name: S02_45ms_Long
+  speed_mps: 4.5
+  source_file: /home/jkuzm/biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/treadmill_data/S_GENERIC/S02_45ms_Long.txt
+  fps: 30
+  duration_seconds: 19.166666666666668
+  file: /home/jkuzm/biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/motion_files/S02_45ms_Long.motion
+  weight: 1.0
+  sub_motions:
+  - idx: 0
+    timings:
+      start: 0.0
+      end: 19.166666666666668
+    weight: 1.0
+- subject_id: S_GENERIC
+  trial_name: S02_50ms_Long
+  speed_mps: 5.0
+  source_file: /home/jkuzm/biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/treadmill_data/S_GENERIC/S02_50ms_Long.txt
+  fps: 30
+  duration_seconds: 18.833333333333332
+  file: /home/jkuzm/biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/motion_files/S02_50ms_Long.motion
+  weight: 1.0
+  sub_motions:
+  - idx: 0
+    timings:
+      start: 0.0
+      end: 18.833333333333332
+    weight: 1.0

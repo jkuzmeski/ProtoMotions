@@ -1,0 +1,21 @@
+manifest_version: 1
+subject_id: S_GENERIC
+subset_name: speed_2
+fps: 30
+selected_files:
+- S02_20ms_Long.motion
+motions:
+- subject_id: S_GENERIC
+  trial_name: S02_20ms_Long
+  speed_mps: 2.0
+  source_file: /home/jkuzm/biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/treadmill_data/S_GENERIC/S02_20ms_Long.txt
+  fps: 30
+  duration_seconds: 18.533333333333335
+  file: /home/jkuzm/biomotions/ProtoMotions/HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC/motion_files/S02_20ms_Long.motion
+  weight: 1.0
+  sub_motions:
+  - idx: 0
+    timings:
+      start: 0.0
+      end: 18.533333333333335
+    weight: 1.0
