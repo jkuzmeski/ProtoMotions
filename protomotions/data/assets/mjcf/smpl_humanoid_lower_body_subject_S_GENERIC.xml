@@ -30,13 +30,12 @@
             <joint name="L_Ankle_x" type="hinge" pos="0.000000 0.000000 0.000000" axis="1 0 0" stiffness="150" damping="15" armature="0.02" range="-10.0000 10.0000" />
             <joint name="L_Ankle_y" type="hinge" pos="0.000000 0.000000 0.000000" axis="0 1 0" stiffness="150" damping="15" armature="0.02" range="-45.0000 20.0000" />
             <joint name="L_Ankle_z" type="hinge" pos="0.000000 0.000000 0.000000" axis="0 0 1" stiffness="150" damping="15" armature="0.02" range="-10.0000 10.0000" />
-            <geom type="ellipsoid" pos="-0.030100 -0.003700 -0.045000" size="0.054000 0.035400 0.022600" quat="0.9795 0.1640 0.0996 0.0505" density="1954.530354" />
-            <geom type="ellipsoid" pos="0.089000 -0.002000 -0.045600" size="0.033800 0.063200 0.024000" quat="0.9572 -0.0878 0.1218 0.2470" density="1954.530354" />
+            <geom type="box" pos="0.022500 0.000000 -0.020000" size="0.086500 0.040000 0.047800" quat="1.0000 0.0000 0.0000 0.0000" density="584.562194" />
             <body name="L_Toe" pos="0.123300 0.000000 -0.055000">
               <joint name="L_Toe_x" type="hinge" pos="0.000000 0.000000 0.000000" axis="1 0 0" stiffness="75" damping="8" armature="0.02" range="-10.0000 10.0000" />
               <joint name="L_Toe_y" type="hinge" pos="0.000000 0.000000 0.000000" axis="0 1 0" stiffness="75" damping="8" armature="0.02" range="-20.0000 20.0000" />
               <joint name="L_Toe_z" type="hinge" pos="0.000000 0.000000 0.000000" axis="0 0 1" stiffness="75" damping="8" armature="0.02" range="-5.0000 5.0000" />
-              <geom type="ellipsoid" pos="0.010200 -0.010800 0.009400" size="0.018200 0.018600 0.013200" quat="0.7600 0.2624 0.5268 0.2759" density="9913.899509" />
+              <geom type="box" pos="0.024800 0.000000 0.007000" size="0.049600 0.040000 0.020000" quat="1.0000 0.0000 0.0000 0.0000" density="584.562194" />
             </body>
           </body>
         </body>
@@ -55,13 +54,12 @@
             <joint name="R_Ankle_x" type="hinge" pos="0.000000 0.000000 0.000000" axis="1 0 0" stiffness="150" damping="15" armature="0.02" range="-25.0000 25.0000" />
             <joint name="R_Ankle_y" type="hinge" pos="0.000000 0.000000 0.000000" axis="0 1 0" stiffness="150" damping="15" armature="0.02" range="-45.0000 20.0000" />
             <joint name="R_Ankle_z" type="hinge" pos="0.000000 0.000000 0.000000" axis="0 0 1" stiffness="150" damping="15" armature="0.02" range="-10.0000 10.0000" />
-            <geom type="ellipsoid" pos="-0.030100 0.003700 -0.045000" size="0.054000 0.035400 0.022600" quat="0.9795 -0.1640 0.0996 -0.0505" density="1954.530354" />
-            <geom type="ellipsoid" pos="0.089000 0.002000 -0.045600" size="0.033800 0.063200 0.024000" quat="0.9572 0.0878 0.1218 -0.2470" density="1954.530354" />
+            <geom type="box" pos="0.022500 0.000000 -0.020000" size="0.086500 0.040000 0.047800" quat="1.0000 0.0000 0.0000 0.0000" density="584.562194" />
             <body name="R_Toe" pos="0.123300 0.000000 -0.055000">
               <joint name="R_Toe_x" type="hinge" pos="0.000000 0.000000 0.000000" axis="1 0 0" stiffness="75" damping="8" armature="0.02" range="-10.0000 10.0000" />
               <joint name="R_Toe_y" type="hinge" pos="0.000000 0.000000 0.000000" axis="0 1 0" stiffness="75" damping="8" armature="0.02" range="-20.0000 20.0000" />
               <joint name="R_Toe_z" type="hinge" pos="0.000000 0.000000 0.000000" axis="0 0 1" stiffness="75" damping="8" armature="0.02" range="-5.0000 5.0000" />
-              <geom type="ellipsoid" pos="0.010200 0.010800 0.009400" size="0.018200 0.018600 0.013200" quat="0.7600 -0.2624 0.5268 -0.2759" density="9913.899509" />
+              <geom type="box" pos="0.024800 0.000000 0.007000" size="0.049600 0.040000 0.020000" quat="1.0000 0.0000 0.0000 0.0000" density="584.562194" />
             </body>
           </body>
         </body>

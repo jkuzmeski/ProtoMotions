@@ -20,6 +20,7 @@ data/amass/*.pkl
 renders/
 .venv/
 .venv-*/
+.venvs/
 HumanRetargeting/biomechanics_retarget/processed_data/**/profile.yaml
 HumanRetargeting/biomechanics_retarget/processed_data/**/qc/
 HumanRetargeting/biomechanics_retarget/processed_data/**/yaml_data/motions_*.yaml

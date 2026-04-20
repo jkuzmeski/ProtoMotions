@@ -121,31 +121,24 @@ For full installation details, see the `Newton Installation Guide <https://newto
 
 **Requirements**: Python 3.10+, NVIDIA GPU (compute capability >= 5.0), driver 545+
 
-1. Clone Newton and create a virtual environment:
+1. If you keep ``ProtoMotions`` and your Newton fork as sibling directories, run the local setup script from the ProtoMotions repo:
 
    .. code-block:: bash
 
-      git clone git@github.com:newton-physics/newton.git
-      cd newton
-      git checkout 8a2abf2  # checkout last tested commit
-      uv venv
+      cd /path/to/ProtoMotions
+      bash scripts/setup_newton_uv.sh
+
+   This creates ``/path/to/ProtoMotions/.venv`` with an editable install of the sibling ``../newton`` checkout.
+
+2. Manual equivalent (if you prefer to run the commands yourself):
+
+   .. code-block:: bash
+
+      cd /path/to/ProtoMotions
+      uv sync --python 3.12 --extra newton
       source .venv/bin/activate
 
-2. Install Newton dependencies:
-
-   .. code-block:: bash
-
-      uv pip install mujoco --pre -f https://py.mujoco.org/
-      uv pip install warp-lang --pre -U -f https://pypi.nvidia.com/warp-lang/
-      uv pip install git+https://github.com/google-deepmind/mujoco_warp.git@main
-      uv pip install -e .[examples]
-
-3. Install ProtoMotions and dependencies:
-
-   .. code-block:: bash
-
-      uv pip install -e /path/to/protomotions
-      uv pip install -r /path/to/protomotions/requirements_newton.txt
+   ``uv`` resolves ``newton`` from the local sibling checkout at ``../newton`` through ``tool.uv.sources`` in ``pyproject.toml``.
 
 MuJoCo (CPU-only)
 ~~~~~~~~~~~~~~~~~
@@ -228,4 +221,3 @@ Next Steps
 ----------
 
 After installation, proceed to the :doc:`quickstart` guide to train your first agent or run pre-trained models.
-
