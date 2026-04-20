@@ -157,12 +157,38 @@ def detect_stance_phases(
     vertical_velocity_threshold: float = 0.1,
     horizontal_acceleration_threshold: float = 0.5,
 ) -> np.ndarray:
-    height_condition = foot_positions[:, 2] < height_threshold
-    vert_vel_cond = np.abs(foot_velocities[:, 2]) < vertical_velocity_threshold
-    horiz_accel = np.linalg.norm(foot_accelerations[:, :2], axis=1)
-    horiz_accel_cond = horiz_accel < horizontal_acceleration_threshold
-    stance_mask = height_condition & vert_vel_cond & horiz_accel_cond
-    stance_mask = binary_closing(stance_mask, structure=np.ones(5))
+    """Detect stance using adaptive per-joint thresholds.
+
+    Uses the same adaptive algorithm as the keypoint extractor so that the
+    overground transform and the retarget step agree on contact timing.
+    The explicit threshold parameters are kept for backward-compatible call
+    sites but are used only as fallback caps.
+    """
+    del foot_accelerations  # not used by adaptive detector
+
+    clearance = foot_positions[:, 2] - np.percentile(foot_positions[:, 2], 1.0)
+    horizontal_speed = np.linalg.norm(foot_velocities[:, :2], axis=1)
+    vertical_speed = np.abs(foot_velocities[:, 2])
+
+    adaptive_height = max(
+        0.012,
+        min(float(height_threshold), float(np.percentile(clearance, 20.0) + 0.008)),
+    )
+    adaptive_hspeed = max(
+        0.2,
+        min(1.0, float(np.percentile(horizontal_speed, 15.0) + 0.15)),
+    )
+    adaptive_vspeed = max(
+        0.08,
+        min(0.5, float(np.percentile(vertical_speed, 20.0) + 0.05)),
+    )
+
+    stance_mask = (
+        (clearance <= adaptive_height)
+        & (horizontal_speed <= adaptive_hspeed)
+        & (vertical_speed <= adaptive_vspeed)
+    )
+    stance_mask = binary_closing(stance_mask, structure=np.ones(7))
     stance_mask = binary_opening(stance_mask, structure=np.ones(3))
     return stance_mask
 

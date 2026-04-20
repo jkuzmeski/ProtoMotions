@@ -354,15 +354,13 @@ def convert_npz_to_motion(
     motion.dof_vel = dof_vel.squeeze(1)
     
     # --- FIX HEIGHT ---
-    # User requested to move motion based on minimum value and zero off of that.
-    # This implies a global shift (fix_height) rather than per-frame adjustment.
-    
-    # We skip fix_height_per_frame to preserve flight phases and vertical dynamics.
-    # motion.fix_height_per_frame(height_offset=0.02, min_clamp=-10.0)
-    
-    # Apply global fix
-    # Use the provided height_offset directly.
-    motion.fix_height(height_offset=height_offset)
+    # The overground stage already grounds the data (subtracts the 1st-percentile
+    # ankle/toe height). Applying fix_height again here shifts the whole motion
+    # down by however much the IK solver's feet sit above 0, which can push feet
+    # below the ground plane in some frames.  Only apply a global shift when the
+    # caller explicitly requests a non-zero offset.
+    if abs(height_offset) > 1e-6:
+        motion.fix_height(height_offset=height_offset)
 
     # Handle contact labels
     motion_length = motion.rigid_body_pos.shape[0]

@@ -63,6 +63,74 @@ PYROKI_KEYPOINT_NAMES = [
     "right_foot",
 ]
 
+# Indices into TREADMILL_JOINT_NAMES for convenience.
+_IDX_PELVIS = 0
+_IDX_L_HIP = 1
+_IDX_L_KNEE = 2
+_IDX_L_ANKLE = 3
+_IDX_L_TOE = 4
+_IDX_R_HIP = 5
+_IDX_R_KNEE = 6
+_IDX_R_ANKLE = 7
+_IDX_R_TOE = 8
+
+
+def extract_anthropometry_from_keypoints(
+    keypoint_files: list[Path],
+) -> dict[str, float]:
+    """Extract segment lengths from finished keypoint .npy files.
+
+    Averages across all provided trials to get robust estimates of
+    pelvis width, thigh / shank / foot lengths per side.  The returned
+    dictionary uses the same keys expected by ``SubjectProfile`` so it
+    can be fed directly into a profile YAML.
+    """
+    thighs_l, thighs_r = [], []
+    shanks_l, shanks_r = [], []
+    feet_l, feet_r = [], []
+    pelvis_widths = []
+
+    for kf in keypoint_files:
+        data = np.load(kf, allow_pickle=True)
+        if data.ndim == 0:
+            data = data.item()
+        positions = np.asarray(data["positions"], dtype=np.float32)
+
+        thighs_l.append(float(np.linalg.norm(positions[:, _IDX_L_KNEE] - positions[:, _IDX_L_HIP], axis=1).mean()))
+        thighs_r.append(float(np.linalg.norm(positions[:, _IDX_R_KNEE] - positions[:, _IDX_R_HIP], axis=1).mean()))
+        shanks_l.append(float(np.linalg.norm(positions[:, _IDX_L_ANKLE] - positions[:, _IDX_L_KNEE], axis=1).mean()))
+        shanks_r.append(float(np.linalg.norm(positions[:, _IDX_R_ANKLE] - positions[:, _IDX_R_KNEE], axis=1).mean()))
+        feet_l.append(float(np.linalg.norm(positions[:, _IDX_L_TOE] - positions[:, _IDX_L_ANKLE], axis=1).mean()))
+        feet_r.append(float(np.linalg.norm(positions[:, _IDX_R_TOE] - positions[:, _IDX_R_ANKLE], axis=1).mean()))
+        pelvis_widths.append(float(np.linalg.norm(positions[:, _IDX_L_HIP] - positions[:, _IDX_R_HIP], axis=1).mean()))
+
+    thigh = float(np.mean(thighs_l + thighs_r))
+    shank = float(np.mean(shanks_l + shanks_r))
+    # foot_length_m is the forward (X) reach used by the asset scaler.
+    # Approximate from the 3D ankle-to-toe distance using the base model's
+    # toe Z-drop ratio: z_drop/foot_3d ≈ 0.055/0.135 ≈ 0.407.
+    foot_3d = float(np.mean(feet_l + feet_r))
+    foot_z_ratio = 0.055 / 0.135  # base model proportions
+    foot_length = float(np.sqrt(max(foot_3d**2 - (foot_z_ratio * foot_3d) ** 2, 0.0)))
+
+    foot_3d_l = float(np.mean(feet_l))
+    foot_3d_r = float(np.mean(feet_r))
+    foot_length_l = float(np.sqrt(max(foot_3d_l**2 - (foot_z_ratio * foot_3d_l) ** 2, 0.0)))
+    foot_length_r = float(np.sqrt(max(foot_3d_r**2 - (foot_z_ratio * foot_3d_r) ** 2, 0.0)))
+
+    return {
+        "pelvis_width_m": round(float(np.mean(pelvis_widths)), 4),
+        "thigh_length_m": round(thigh, 4),
+        "shank_length_m": round(shank, 4),
+        "foot_length_m": round(foot_length, 4),
+        "left_thigh_length_m": round(float(np.mean(thighs_l)), 4),
+        "right_thigh_length_m": round(float(np.mean(thighs_r)), 4),
+        "left_shank_length_m": round(float(np.mean(shanks_l)), 4),
+        "right_shank_length_m": round(float(np.mean(shanks_r)), 4),
+        "left_foot_length_m": round(foot_length_l, 4),
+        "right_foot_length_m": round(foot_length_r, 4),
+    }
+
 
 def calculate_kinematics(
     positions: np.ndarray, fps: int

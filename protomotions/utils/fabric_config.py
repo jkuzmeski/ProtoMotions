@@ -40,7 +40,7 @@ class FabricConfig:
         metadata={"help": "Number of nodes for distributed training.", "min": 1}
     )
     strategy: Union[Dict, fabric.strategies.Strategy] = field(
-        default_factory=fabric.strategies.DDPStrategy,
+        default_factory=lambda: fabric.strategies.SingleDeviceStrategy(device="cuda:0"),
         metadata={"help": "Distributed training strategy (DDP, FSDP, etc)."}
     )
     precision: Union[str, int] = field(

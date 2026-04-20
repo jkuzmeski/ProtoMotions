@@ -211,6 +211,14 @@ class BaseEnv:
         # reused by both state_history and _build_global_context
         self._current_noisy_obs = None
 
+        # Raw state extras are only needed by evaluators, not the training hot path.
+        self._export_raw_extras = False
+
+        # Cached env index tensor to avoid repeated torch.arange allocations
+        self._all_env_ids = torch.arange(
+            self.num_envs, device=self.device, dtype=torch.long
+        )
+
         self.skip_height_correction = (
             self.config.skip_correct_terrain_height_on_flat and self.terrain.is_flat()
         )
@@ -283,6 +291,9 @@ class BaseEnv:
 
         # Component infrastructure for MdpComponent
         self._component_manager = ComponentManager(self.device)
+        self._env_step_requires_dof_forces = self._components_require_current_field(
+            "dof_forces"
+        )
         self._observation_buffer: Dict[str, Tensor] = {}
         self._density_weights = compute_body_density_weights(
             self.robot_config.kinematic_info
@@ -317,6 +328,27 @@ class BaseEnv:
                 f"checkpoint/config.\n"
                 f"{'=' * 70}"
             )
+
+    def _components_require_current_field(self, field_name: str) -> bool:
+        """Return True when any configured MDP component binds current.<field_name>."""
+        required_path = f"current.{field_name}"
+        component_groups = (
+            self.config.observation_components,
+            self.config.reward_components,
+            self.config.termination_components,
+        )
+
+        for components in component_groups:
+            for component in components.values():
+                dynamic_vars = getattr(component, "dynamic_vars", None)
+                if not dynamic_vars:
+                    continue
+
+                for field_path in dynamic_vars.values():
+                    if getattr(field_path, "path", None) == required_path:
+                        return True
+
+        return False
 
     ###############################################################
     # Getters
@@ -693,12 +725,22 @@ class BaseEnv:
         """
         self.progress_buf += 1
 
+        # Raw extras are evaluation-only, so use a lighter state query during training.
+        if self._export_raw_extras:
+            rbs: RobotState = self.simulator.get_robot_state()
+        else:
+            rbs: RobotState = self.simulator.get_env_step_state(
+                include_dof_forces=self._env_step_requires_dof_forces
+            )
+
+        ground_heights = None
+        body_contacts = None
+
         if self.state_history is not None:
-            current_state = self.simulator.get_robot_state()
             ground_heights = self.terrain.get_ground_heights(
-                current_state.rigid_body_pos[:, 0]
+                rbs.rigid_body_pos[:, 0]
             ).squeeze(-1)
-            body_contacts = current_state.rigid_body_contacts[
+            body_contacts = rbs.rigid_body_contacts[
                 :, self.contact_body_ids
             ].bool()
 
@@ -712,7 +754,7 @@ class BaseEnv:
                 # Single source of truth: uniform noise via apply_observation_noise
                 noisy = apply_observation_noise(
                     obs_noise_cfg=obs_noise_cfg,
-                    robot_state=current_state,
+                    robot_state=rbs,
                     anchor_idx=self.robot_config.anchor_body_index,
                     ground_heights=ground_heights,
                 )
@@ -728,12 +770,12 @@ class BaseEnv:
                 noisy_kwargs["noisy_ground_heights"] = noisy.ground_heights
 
             self.state_history.rotate_and_update(
-                rigid_body_pos=current_state.rigid_body_pos,
-                rigid_body_rot=current_state.rigid_body_rot,
-                rigid_body_vel=current_state.rigid_body_vel,
-                rigid_body_ang_vel=current_state.rigid_body_ang_vel,
-                dof_pos=current_state.dof_pos,
-                dof_vel=current_state.dof_vel,
+                rigid_body_pos=rbs.rigid_body_pos,
+                rigid_body_rot=rbs.rigid_body_rot,
+                rigid_body_vel=rbs.rigid_body_vel,
+                rigid_body_ang_vel=rbs.rigid_body_ang_vel,
+                dof_pos=rbs.dof_pos,
+                dof_vel=rbs.dof_vel,
                 actions=self._current_raw_action,
                 ground_heights=ground_heights,
                 body_contacts=body_contacts,
@@ -755,12 +797,16 @@ class BaseEnv:
             # When realign_motion_with_humanoid_on_each_step is True, we re-align before computing observations and rewards.
             # This ensures the robot only matches the local-pose with global orientation.
             self.align_motion_with_humanoid(
-                torch.arange(self.num_envs, device=self.device, dtype=torch.long),
-                self.simulator.get_root_state().root_pos,
+                self._all_env_ids,
+                rbs.root_pos,
             )
 
         # Build context once and reuse for observations, rewards, and terminations
-        self._current_context = self._build_global_context()
+        self._current_context = self._build_global_context(
+            current_state=rbs,
+            ground_heights=ground_heights,
+            body_contacts=body_contacts,
+        )
 
         self.compute_observations(context=self._current_context)
         self.compute_reward(context=self._current_context)
@@ -770,9 +816,11 @@ class BaseEnv:
 
         self.extras["terminate"] = self.terminate_buf
 
-        rbs: RobotState = self.simulator.get_robot_state()
-        for k, _ in rbs.get_shape_mapping(flattened=True).items():
-            self.extras[f"raw/{k}"] = rbs.flatten_bodies(k)
+        if self._export_raw_extras:
+            for k, _ in rbs.get_shape_mapping(flattened=True).items():
+                flattened = rbs.flatten_bodies(k)
+                if flattened is not None:
+                    self.extras[f"raw/{k}"] = flattened
 
         # Update previous contact forces for next step's impact penalty
         self.prev_contact_force_magnitudes[:] = torch.norm(
@@ -791,7 +839,7 @@ class BaseEnv:
             context: Pre-built EnvContext from self.context property.
         """
         if env_ids is None:
-            env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+            env_ids = self._all_env_ids
 
         if context is None:
             raise ValueError("context is required - use self.context to build it")
@@ -854,7 +902,12 @@ class BaseEnv:
             self._current_context = self._build_global_context()
         return self._current_context
 
-    def _build_global_context(self) -> EnvContext:
+    def _build_global_context(
+        self,
+        current_state: RobotState = None,
+        ground_heights: Tensor = None,
+        body_contacts: Tensor = None,
+    ) -> EnvContext:
         """Build a fresh global context for observations, rewards, and terminations.
 
         Creates typed EnvContext with view wrappers around existing data structures.
@@ -867,19 +920,27 @@ class BaseEnv:
         When no observation noise is configured:
         - Both point to the same tensors (memory efficient)
 
+        Args:
+            current_state: Pre-fetched RobotState to reuse. If None, queries the simulator.
+            ground_heights: Pre-fetched terrain heights to reuse. If None, queries terrain.
+            body_contacts: Pre-fetched body contact flags to reuse. If None, derives them.
+
         Returns:
             Typed EnvContext for observation/reward/termination functions.
         """
-        current_state = self.simulator.get_robot_state()
+        if current_state is None:
+            current_state = self.simulator.get_robot_state()
         anchor_idx = self.robot_config.anchor_body_index
 
-        ground_heights = self.terrain.get_ground_heights(
-            current_state.rigid_body_pos[:, 0]
-        ).squeeze(-1)
+        if ground_heights is None:
+            ground_heights = self.terrain.get_ground_heights(
+                current_state.rigid_body_pos[:, 0]
+            ).squeeze(-1)
 
-        body_contacts = current_state.rigid_body_contacts[
-            :, self.contact_body_ids
-        ].bool()
+        if body_contacts is None:
+            body_contacts = current_state.rigid_body_contacts[
+                :, self.contact_body_ids
+            ].bool()
 
         # Contact force magnitudes for impact penalty rewards
         current_contact_force_magnitudes = torch.norm(

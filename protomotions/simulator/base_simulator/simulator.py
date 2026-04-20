@@ -632,10 +632,10 @@ class Simulator(RecordingMixin, ABC):
                                         Called after physics step but before rendering.
         """
         # Store the action history (two-step buffer for acceleration clamp)
-        self._prev_prev_actions = self._previous_actions.clone()
-        self._previous_actions = self._common_actions.clone()
+        self._prev_prev_actions.copy_(self._previous_actions)
+        self._previous_actions.copy_(self._common_actions)
         self.user_requested_reset = False
-        self._common_actions = common_actions.to(self.device)
+        self._common_actions.copy_(common_actions.to(self.device))
 
         # Apply PD target acceleration clamp (limits oscillatory jerk)
         if self.config.pd_target_max_accel is not None:
@@ -829,6 +829,19 @@ class Simulator(RecordingMixin, ABC):
         bodies_state.merge_fields_from(contact_state)
         bodies_state.merge_fields_from(dof_forces)
         return bodies_state
+
+    def get_env_step_state(
+        self,
+        env_ids: Optional[torch.Tensor] = None,
+        *,
+        include_dof_forces: bool = True,
+    ) -> RobotState:
+        """Retrieve robot state for the environment step hot path.
+
+        Simulators can override this to skip state fields that are only needed for
+        evaluation or logging. The default keeps full behavior.
+        """
+        return self.get_robot_state(env_ids)
 
     def get_bodies_state(self, env_ids: Optional[torch.Tensor] = None) -> RobotState:
         """

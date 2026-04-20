@@ -130,16 +130,20 @@ class BaseEvaluator:
             return {}, None
 
         self.agent.eval()
-        self._metrics = self.initialize_eval()
-        if self._metrics is None:
-            return {}, None
+        prev_export_raw_extras = getattr(self.env, "_export_raw_extras", False)
+        self.env._export_raw_extras = True
+        try:
+            self._metrics = self.initialize_eval()
+            if self._metrics is None:
+                return {}, None
 
-        self.run_evaluation()
-        evaluation_log, evaluated_score = self.process_eval_results()
-        self.cleanup_after_evaluation()
-        self.eval_count += 1
-
-        return evaluation_log, evaluated_score
+            self.run_evaluation()
+            evaluation_log, evaluated_score = self.process_eval_results()
+            self.eval_count += 1
+            return evaluation_log, evaluated_score
+        finally:
+            self.env._export_raw_extras = prev_export_raw_extras
+            self.cleanup_after_evaluation()
 
     @property
     def num_envs(self) -> int:
