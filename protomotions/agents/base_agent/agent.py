@@ -311,8 +311,11 @@ class BaseAgent:
 
         # Save environment checkpoint for unique task IDs
         task_id = self.env.get_task_id()
-        per_rank_task_id = [None for _ in range(self.fabric.world_size)]
-        dist.all_gather_object(per_rank_task_id, task_id)
+        if dist.is_initialized():
+            per_rank_task_id = [None for _ in range(self.fabric.world_size)]
+            dist.all_gather_object(per_rank_task_id, task_id)
+        else:
+            per_rank_task_id = [task_id]
 
         # Only ranks with unique task IDs save the env checkpoint
         rank_to_task_id = {}
@@ -329,13 +332,15 @@ class BaseAgent:
             log.info(
                 f"Saved env checkpoint: {env_checkpoint}, rank {self.fabric.global_rank}"
             )
-        self.fabric.barrier()
+        if dist.is_initialized():
+            self.fabric.barrier()
 
         # Check if new high score flag is consistent across devices
-        gathered_high_score = self.fabric.all_gather(new_high_score)
-        assert all(
-            [x == gathered_high_score[0] for x in gathered_high_score]
-        ), "New high score flag should be the same across all ranks."
+        if dist.is_initialized():
+            gathered_high_score = self.fabric.all_gather(new_high_score)
+            assert all(
+                [x == gathered_high_score[0] for x in gathered_high_score]
+            ), "New high score flag should be the same across all ranks."
 
         if new_high_score:
             self.fabric.save(save_dir / "score_based.ckpt", state_dict)

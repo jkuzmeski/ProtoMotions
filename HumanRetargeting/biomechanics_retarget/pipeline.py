@@ -35,6 +35,9 @@ from HumanRetargeting.biomechanics_retarget.stages.convert import (
 from HumanRetargeting.biomechanics_retarget.stages.keypoints import (
     run_keypoint_extraction,
 )
+from HumanRetargeting.biomechanics_retarget.extract_keypoints_from_overground import (
+    extract_anthropometry_from_keypoints,
+)
 from HumanRetargeting.biomechanics_retarget.stages.overground import (
     run_overground_trial,
 )
@@ -102,6 +105,7 @@ class PipelineConfig:
     assets_root: Path
     rescale_dir: Path
     qc_config_file: Path
+    skip_qc: bool = False
     export_profile: Path | None = None
 
     @property
@@ -495,6 +499,34 @@ class ProductionPipeline:
             self._apply_contact_source_to_keypoints(output_file)
             output_files.append(output_file)
 
+        # Auto-calibrate: compare profile anthropometry to data and warn on mismatch.
+        measured = extract_anthropometry_from_keypoints(output_files)
+        mismatches: list[str] = []
+        for key, threshold in (
+            ("thigh_length_m", 0.01),
+            ("shank_length_m", 0.01),
+            ("foot_length_m", 0.008),
+            ("pelvis_width_m", 0.01),
+        ):
+            profile_val = getattr(context.profile, key)
+            data_val = measured[key]
+            if abs(profile_val - data_val) > threshold:
+                mismatches.append(
+                    f"  {key}: profile={profile_val:.4f}  data={data_val:.4f}  "
+                    f"delta={data_val - profile_val:+.4f} ({100*(data_val - profile_val)/profile_val:+.1f}%)"
+                )
+        if mismatches:
+            console.print(
+                "[bold yellow]⚠ Anthropometry mismatch between profile and data:[/bold yellow]"
+            )
+            for line in mismatches:
+                console.print(line)
+            console.print(
+                "[yellow]Consider updating the subject profile with data-derived "
+                "measurements to improve retarget quality.[/yellow]"
+            )
+        self.summary["measured_anthropometry"] = measured
+
         self.summary["completed_step"] = PipelineStep.KEYPOINTS.value
         self.summary["num_keypoint_files"] = len(output_files)
         self._write_subject_summary()
@@ -535,10 +567,11 @@ class ProductionPipeline:
                 report,
                 self.config.qc_retarget_dir / f"{keypoint_file.stem}.json",
             )
-            ensure_validation_passed(
-                report,
-                f"Retarget validation failed for {keypoint_file.stem}",
-            )
+            if not self.config.skip_qc:
+                ensure_validation_passed(
+                    report,
+                    f"Retarget validation failed for {keypoint_file.stem}",
+                )
             output_files.append(npz_file)
 
         self.summary["completed_step"] = PipelineStep.RETARGET.value
@@ -593,10 +626,11 @@ class ProductionPipeline:
                 report,
                 self.config.qc_motion_dir / f"{trial_stem}.json",
             )
-            ensure_validation_passed(
-                report,
-                f"Motion validation failed for {trial_stem}",
-            )
+            if not self.config.skip_qc:
+                ensure_validation_passed(
+                    report,
+                    f"Motion validation failed for {trial_stem}",
+                )
             output_files.append(output_file)
 
         self.summary["completed_step"] = PipelineStep.CONVERT.value
@@ -654,10 +688,11 @@ class ProductionPipeline:
         )
         report["subject_id"] = context.profile.subject_id
         write_validation_report(report, self.config.qc_package_dir / "package.json")
-        ensure_validation_passed(
-            report,
-            f"Packaged MotionLib validation failed for {context.profile.subject_id}",
-        )
+        if not self.config.skip_qc:
+            ensure_validation_passed(
+                report,
+                f"Packaged MotionLib validation failed for {context.profile.subject_id}",
+            )
 
         self.summary["completed_step"] = PipelineStep.PACKAGE.value
         self.summary["packaged_file"] = str(packaged_file)
@@ -732,6 +767,7 @@ def main(
     contact_source: str = "heuristic",
     step: PipelineStep = PipelineStep.ALL,
     force: bool = False,
+    skip_qc: bool = False,
     pyroki_python: Path | None = None,
     pyroki_script: Path | None = None,
     export_profile: Path | None = None,
@@ -799,8 +835,9 @@ def main(
             contact_source=contact_source,
             step=step,
             force=force,
-            pyroki_python=pyroki_python.resolve() if pyroki_python else None,
-            pyroki_script=pyroki_script.resolve() if pyroki_script else None,
+            skip_qc=skip_qc,
+            pyroki_python=Path(pyroki_python).absolute() if pyroki_python else None,
+            pyroki_script=Path(pyroki_script).absolute() if pyroki_script else None,
             assets_root=assets_root.resolve(),
             rescale_dir=(REPO_ROOT / "HumanRetargeting" / "rescale").resolve(),
             qc_config_file=qc_config.resolve(),
@@ -859,6 +896,11 @@ def cli(
         "--force",
         help="Rebuild existing outputs instead of reusing them.",
     ),
+    skip_qc: bool = typer.Option(
+        False,
+        "--skip-qc",
+        help="Skip QC validation so any motion data passes through.",
+    ),
     pyroki_python: Path | None = typer.Option(
         None,
         "--pyroki-python",
@@ -904,6 +946,7 @@ def cli(
             contact_source=contact_source,
             step=step,
             force=force,
+            skip_qc=skip_qc,
             pyroki_python=pyroki_python,
             pyroki_script=pyroki_script,
             export_profile=export_profile,

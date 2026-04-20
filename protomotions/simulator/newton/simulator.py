@@ -18,6 +18,7 @@ import traceback
 import torch
 import numpy as np
 import sys
+import math
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Tuple
@@ -141,6 +142,23 @@ class NewtonSimulator(Simulator):
         self.contacts = None  # Initialized after solver/sensors are set up
         self._camera_initialized = False
         self._needs_state_sync = False
+        self._body_name_to_idx = {
+            body_name: idx for idx, body_name in enumerate(self._body_names)
+        }
+        self._all_env_ids = torch.arange(self.num_envs, device=self.device)
+        self._link_name_to_idx = {}
+        self._rigid_body_contact_forces = torch.zeros(
+            self.num_envs,
+            len(self._body_names),
+            3,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self._pd_targets_torch: Optional[torch.Tensor] = None
+        self._joint_target_pos_torch: Optional[torch.Tensor] = None
+        self._joint_target_pos_wp = None
+        self._dof_force_torch: Optional[torch.Tensor] = None
+        self._dof_force_wp = None
         self._last_reset_root_pos: Optional[torch.Tensor] = None
         self._last_reset_root_rot: Optional[torch.Tensor] = None
         self._last_reset_root_vel: Optional[torch.Tensor] = None
@@ -150,17 +168,14 @@ class NewtonSimulator(Simulator):
         self._last_reset_sim_time: Optional[torch.Tensor] = None
 
     def _get_builder_joint_keys(self) -> list[str]:
-        """Return builder joint names in the old ProtoMotions matching format.
+        """Return builder joint names in the ProtoMotions matching format.
 
-        Older Newton builds exposed ``joint_key`` directly. The local fork stores
-        full joint labels in ``joint_label``; the basename after the final slash
-        preserves the compound key format ProtoMotions expects.
+        Newton 1.0+ stores full joint labels in ``joint_label``; the basename
+        after the final slash preserves the compound key format ProtoMotions expects.
         """
-        if hasattr(self.robot, "joint_key"):
-            return list(self.robot.joint_key)
         if hasattr(self.robot, "joint_label"):
             return [label.rsplit("/", 1)[-1] for label in self.robot.joint_label]
-        raise AttributeError("Newton ModelBuilder has neither 'joint_key' nor 'joint_label'")
+        raise AttributeError("Newton ModelBuilder has no 'joint_label' attribute")
 
     def _get_robot_articulation_pattern(self) -> str:
         """Resolve the articulation selector pattern for the finalized model.
@@ -297,8 +312,6 @@ class NewtonSimulator(Simulator):
 
         if hasattr(self.robot, "articulation_label"):
             self.robot.articulation_label = ["robot"]
-        if hasattr(self.robot, "articulation_key"):
-            self.robot.articulation_key = ["robot"]
         self.robot.approximate_meshes("convex_hull")
 
         # 5. Add projectile free bodies to the builder (before replicate)
@@ -466,6 +479,9 @@ class NewtonSimulator(Simulator):
             include_joints=list(self._newton_dof_names.keys()),
             include_links=self._body_names,
         )
+        self._link_name_to_idx = {
+            name: idx for idx, name in enumerate(self.robot_view.link_names)
+        }
 
         self.default_body_transforms = (
             wp.to_torch(self.robot_view.get_link_transforms(self.model))
@@ -520,6 +536,29 @@ class NewtonSimulator(Simulator):
         self._pd_targets_wp = wp.zeros(
             self.num_envs * num_dofs, dtype=wp.float32, device=device_str
         )
+        self._pd_targets_torch = wp.to_torch(self._pd_targets_wp).view(
+            self.num_envs, num_dofs
+        )
+        self._joint_target_pos_torch = torch.zeros(
+            self.num_envs,
+            1,
+            num_dofs,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self._joint_target_pos_wp = wp.from_torch(
+            self._joint_target_pos_torch, dtype=wp.float32, requires_grad=False
+        )
+        self._dof_force_torch = torch.zeros(
+            self.num_envs,
+            1,
+            num_dofs,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self._dof_force_wp = wp.from_torch(
+            self._dof_force_torch, dtype=wp.float32, requires_grad=False
+        )
 
         kp_list = []
         kd_list = []
@@ -567,8 +606,6 @@ class NewtonSimulator(Simulator):
             impratio=sim_params.impratio,
             cone=sim_params.cone,
             ccd_iterations=sim_params.ccd_iterations,
-            max_epa_workspace_iterations=sim_params.max_epa_workspace_iterations,
-            raise_on_mujoco_warning=sim_params.raise_on_mujoco_warning,
         )
 
         self.viewer = None
@@ -595,7 +632,6 @@ class NewtonSimulator(Simulator):
                         range(min(viewer_max_worlds, self.model.world_count))
                     )
 
-        self.state_temp = self.model.state()
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
@@ -684,14 +720,9 @@ class NewtonSimulator(Simulator):
             num_buckets = static_friction.shape[0] if static_friction is not None else 0
 
             if num_buckets > 0:
-                # Build body name → local shape indices mapping via ArticulationView
-                link_name_to_idx = {
-                    name: i for i, name in enumerate(self.robot_view.link_names)
-                }
-
                 for idx, local_body_idx in enumerate(body_indices):
                     body_name = self._body_names[local_body_idx]
-                    link_idx = link_name_to_idx.get(body_name)
+                    link_idx = self._link_name_to_idx.get(body_name)
                     if link_idx is None:
                         continue
                     local_shape_indices = self.robot_view.link_shapes[link_idx]
@@ -737,14 +768,9 @@ class NewtonSimulator(Simulator):
             body_indices = self._domain_randomization["center_of_mass"]["body_indices"]
             com_offsets = self._domain_randomization["center_of_mass"]["com"]
 
-            # Build body name → link index mapping
-            link_name_to_idx = {
-                name: i for i, name in enumerate(self.robot_view.link_names)
-            }
-
             for idx, local_body_idx in enumerate(body_indices):
                 body_name = self._body_names[local_body_idx]
-                link_idx = link_name_to_idx.get(body_name)
+                link_idx = self._link_name_to_idx.get(body_name)
                 if link_idx is None:
                     continue
 
@@ -818,6 +844,21 @@ class NewtonSimulator(Simulator):
         """Setup visualization markers."""
         return
 
+    @staticmethod
+    def _get_contact_sensor_body_patterns(body_name: str) -> list:
+        """Build Newton body-label patterns for a configured contact body.
+
+        ProtoMotions contact bodies use short MJCF body names like
+        ``left_ankle_roll_link``. Newton 1.0+ stores ``model.body_label`` as
+        full paths and ``SensorContact`` matches via fnmatch. Return both
+        the short name and a glob pattern so either format matches.
+        """
+        from glob import has_magic
+
+        if "/" in body_name or has_magic(body_name):
+            return [body_name]
+        return [body_name, f"*/{body_name}"]
+
     def _setup_contact_sensors(self) -> None:
         """Setup contact sensors for each contact body."""
         if (
@@ -832,29 +873,50 @@ class NewtonSimulator(Simulator):
 
         # Create a contact sensor for each specified contact body
         for body_name in self.robot_config.contact_bodies:
-            body_pattern = self._get_model_body_pattern(body_name)
-            # Create sensor that detects contacts between this body and anything
-            # The sensor will aggregate contacts across all environments
+            sensor_body_patterns = self._get_contact_sensor_body_patterns(body_name)
             sensor = SensorContact(
-                self.model, sensing_obj_bodies=body_pattern, verbose=False
+                self.model, sensing_obj_bodies=sensor_body_patterns, verbose=False
             )
-            self._contact_sensors[body_name] = sensor
 
-            self._contact_forces[body_name] = torch.zeros(
-                self.num_envs, 3, device=self.device, dtype=torch.float32
-            )
+            # Validate that the sensor actually matched bodies
+            matched = len(getattr(sensor, "sensing_objs", []))
+            if matched == 0:
+                raise ValueError(
+                    f"Newton contact sensor for '{body_name}' matched no body labels "
+                    f"using {sensor_body_patterns}. Check that the configured body name "
+                    f"matches Newton's body_label format."
+                )
+
+            self._contact_sensors[body_name] = sensor
+            body_idx = self._body_name_to_idx.get(body_name)
+            if body_idx is None:
+                raise ValueError(
+                    f"Configured contact body '{body_name}' is not in robot body names"
+                )
+            self._contact_forces[body_name] = self._rigid_body_contact_forces[
+                :, body_idx, :
+            ]
 
         print(
             f"[INFO] Contact sensors setup complete for {len(self._contact_sensors)} bodies"
         )
 
     def _create_contacts(self) -> None:
-        """Create Contacts object with correct capacity and requested attributes."""
-        self.contacts = Contacts(
-            self.solver.get_max_contact_count(),
-            0,
-            requested_attributes=self.model.get_requested_contact_attributes(),
-        )
+        """Create Contacts object via model.contacts() (Newton 1.0+ API)."""
+        # Ensure the model allocates enough contacts for the solver (e.g. MuJoCo naconmax).
+        solver_max = int(self.solver.get_max_contact_count())
+        model_max = int(getattr(self.model, "rigid_contact_max", 0) or 0)
+        if solver_max > model_max:
+            self.model.rigid_contact_max = solver_max
+
+        if hasattr(self.model, "contacts") and callable(self.model.contacts):
+            self.contacts = self.model.contacts()
+        else:
+            self.contacts = Contacts(
+                self.solver.get_max_contact_count(),
+                0,
+                requested_attributes=self.model.get_requested_contact_attributes(),
+            )
 
     def _simulate(self) -> None:
         """Run physics simulation for one frame (decimation substeps)."""
@@ -959,15 +1021,7 @@ class NewtonSimulator(Simulator):
 
     def _get_rigid_body_contact_forces_snapshot(self) -> torch.Tensor:
         """Collect latest per-body contact forces into a dense tensor."""
-        rigid_body_contact_forces = torch.zeros(
-            self.num_envs, len(self._body_names), 3, device=self.device
-        )
-        for body_name, contact_force in self._contact_forces.items():
-            if body_name not in self._body_names:
-                continue
-            body_idx = self._body_names.index(body_name)
-            rigid_body_contact_forces[:, body_idx, :] = contact_force
-        return rigid_body_contact_forces
+        return self._rigid_body_contact_forces
 
     def _build_solver_failure_candidates(
         self,
@@ -1249,26 +1303,26 @@ class NewtonSimulator(Simulator):
         """Update contact sensors after physics step. Must be called outside CUDA graph."""
         if len(self._contact_sensors) > 0:
             self.solver.update_contacts(self.contacts, self.state_0)
+            self._rigid_body_contact_forces.zero_()
             for body_name, sensor in self._contact_sensors.items():
-                if hasattr(sensor, "update"):
-                    sensor.update(self.state_0, self.contacts)
-                else:
-                    sensor.eval(self.contacts)
-                # Store the net contact force for this body (across all environments)
-                # Newer Newton builds expose total_force, older ones expose
-                # net_force with a singleton body axis.
-                force_wp = None
-                if hasattr(sensor, "total_force") and sensor.total_force is not None:
-                    force_wp = sensor.total_force
-                elif hasattr(sensor, "net_force") and sensor.net_force is not None:
-                    force_wp = sensor.net_force
+                sensor.update(self.state_0, self.contacts)
 
-                if force_wp is not None:
-                    net_force = wp.to_torch(force_wp).clone()
-                    # Squeeze the body dimension if present (shape [N, 1, 3] -> [N, 3])
-                    if net_force.dim() == 3 and net_force.shape[1] == 1:
-                        net_force = net_force.squeeze(1)
-                    self._contact_forces[body_name] = net_force
+                contact_force = self._contact_forces[body_name]
+                if sensor.net_force is None:
+                    contact_force.zero_()
+                    continue
+
+                net_force = wp.to_torch(sensor.net_force)
+                # net_force shape varies by Newton version:
+                #   - (num_envs, 3)                      — old style
+                #   - (num_envs, 1, 3) or (N, M, 3)     — per-sensing-obj readings
+                # Reduce to (num_envs, 3) by summing over readings dim if needed.
+                if net_force.dim() == 3:
+                    contact_force.copy_(net_force.sum(dim=1))
+                elif net_force.numel() == 0:
+                    contact_force.zero_()
+                else:
+                    contact_force.copy_(net_force)
 
     def _sync_state_reads_if_needed(self) -> None:
         """Synchronize Warp work once before reading simulator state tensors."""
@@ -1284,9 +1338,11 @@ class NewtonSimulator(Simulator):
         if env_ids is None or env_ids.numel() == 0:
             return
         reset_worlds = getattr(self.solver, "reset_worlds", None)
-        if reset_worlds is None:
-            return
-        reset_worlds(self.state_0, env_ids)
+        if reset_worlds is not None:
+            reset_worlds(self.state_0, env_ids)
+        else:
+            # Newton 1.0+: no per-world reset; re-notify solver of state change
+            self.solver.notify_model_changed(SolverNotifyFlags.ALL)
 
     def _get_nonfinite_env_ids(self, *tensors: torch.Tensor) -> torch.Tensor:
         """Return env IDs where any provided tensor contains non-finite values."""
@@ -1563,51 +1619,70 @@ class NewtonSimulator(Simulator):
         bad_env_ids: torch.Tensor,
         tensors: Dict[str, torch.Tensor],
     ) -> None:
-        """Fail hard with rich diagnostics when non-finite state is detected."""
+        """Handle non-finite state: either fail-fast with dump, or clamp and continue.
+
+        When ``raise_on_nonfinite`` is enabled (config), writes a diagnostic dump
+        to ``output/nonfinite_dumps/`` and raises ``RuntimeError`` immediately.
+        Otherwise falls back to the previous behaviour (warn, clamp, mark for reset).
+        """
         if bad_env_ids.numel() == 0:
             return
 
         first_bad_env = int(bad_env_ids[0].item())
 
-        dump_path: Optional[Path] = None
-        dump_error = None
-        try:
-            dump_path = self._write_nonfinite_debug_dump(
-                source=source,
-                bad_env_ids=bad_env_ids,
-                first_bad_env=first_bad_env,
-                tensors=tensors,
-            )
-        except Exception as exc:  # pragma: no cover - best effort diagnostics
-            dump_error = str(exc)
-
-        summary_lines = [
-            "Non-finite Newton simulator state detected.",
-            f"source={source}",
-            f"sim_time={self.sim_time:.6f}s frame_dt={self.frame_dt:.6f}s",
-            (
-                f"bad_envs={bad_env_ids.numel()}/{self.num_envs}, "
-                f"first_bad_env={first_bad_env}, "
-                f"bad_env_ids(first10)={bad_env_ids[:10].tolist()}"
-            ),
-            f"steps_since_reset[first_bad_env]={int(self._steps_since_reset[first_bad_env].item())}",
-        ]
+        # Build per-tensor summaries for the log message
+        tensor_summaries = []
         for name, tensor in tensors.items():
-            summary_lines.append(
-                self._summarize_nonfinite_tensor(
-                    name=name,
-                    tensor=tensor,
-                    first_bad_env=first_bad_env,
-                )
+            tensor_summaries.append(
+                self._summarize_nonfinite_tensor(name, tensor, first_bad_env)
             )
-        if dump_path is not None:
-            summary_lines.append(f"diagnostic_dump={dump_path}")
-        if dump_error is not None:
-            summary_lines.append(f"diagnostic_dump_error={dump_error}")
+        summary_block = " | ".join(tensor_summaries)
 
-        msg = " | ".join(summary_lines)
-        log.error(msg)
-        raise AssertionError(msg)
+        fail_fast = getattr(getattr(self.config, "sim", None), "raise_on_nonfinite", False)
+
+        if fail_fast:
+            # Write debug dump before crashing
+            dump_path = None
+            try:
+                dump_path = self._write_nonfinite_debug_dump(
+                    source=source,
+                    bad_env_ids=bad_env_ids,
+                    first_bad_env=first_bad_env,
+                    tensors=tensors,
+                )
+            except Exception as dump_exc:
+                log.error(f"Failed to write non-finite debug dump: {dump_exc}")
+
+            msg = (
+                f"FAIL-FAST: Non-finite Newton state in {bad_env_ids.numel()}/{self.num_envs} envs "
+                f"(source={source}, first_bad={first_bad_env}, sim_time={self.sim_time:.6f}s). "
+                f"{summary_block}"
+            )
+            if dump_path is not None:
+                msg += f" | diagnostic_dump={dump_path}"
+            log.error(msg)
+            raise RuntimeError(msg)
+
+        # --- Soft path: warn, clamp, and mark for reset ---
+        log.warning(
+            f"Non-finite Newton state in {bad_env_ids.numel()}/{self.num_envs} envs "
+            f"(source={source}, first_bad={first_bad_env}). "
+            f"Clamping to zero; these envs will be reset. "
+            f"{summary_block}"
+        )
+
+        # Mark bad envs for forced termination
+        if not hasattr(self, "_nan_terminated_envs"):
+            self._nan_terminated_envs = torch.zeros(
+                self.num_envs, dtype=torch.bool, device=self.device
+            )
+        self._nan_terminated_envs[bad_env_ids] = True
+
+        # Replace non-finite values with zeros so downstream code doesn't crash
+        for tensor in tensors.values():
+            nan_mask = ~torch.isfinite(tensor)
+            if nan_mask.any():
+                tensor[nan_mask] = 0.0
 
     def _read_bodies_state_tensors(
         self,
@@ -1680,64 +1755,42 @@ class NewtonSimulator(Simulator):
         """Sets the state of specified environments using vectorized operations."""
         # assert new_object_states is None, "Newton does not yet support setting object states."
 
-        env_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         if env_ids is None:
-            env_ids = torch.arange(self.num_envs, device=self.device)
-        env_mask[env_ids] = True
+            env_ids = self._all_env_ids
         self._assert_finite_reset_inputs(new_states, env_ids)
 
-        # Newton expects the state setter to be provided with the states for all envs.
-        # The mask is used to determine which envs to apply the update to.
-        root_state = wp.to_torch(self.robot_view.get_root_transforms(self.state_0)).squeeze(
-            1
+        joint_q_0 = wp.to_torch(self.state_0.joint_q).view(
+            self.num_envs, self._proj_q_stride
         )
-        root_vel_state = wp.to_torch(
-            self.robot_view.get_root_velocities(self.state_0)
-        ).squeeze(1)
-        dof_pos = (
-            wp.to_torch(self.robot_view.get_dof_positions(self.state_0))
-            .squeeze(1)
-            .view(self.num_envs, -1)
+        joint_qd_0 = wp.to_torch(self.state_0.joint_qd).view(
+            self.num_envs, self._proj_qd_stride
         )
-        dof_vel = (
-            wp.to_torch(self.robot_view.get_dof_velocities(self.state_0))
-            .squeeze(1)
-            .view(self.num_envs, -1)
+        joint_q_1 = wp.to_torch(self.state_1.joint_q).view(
+            self.num_envs, self._proj_q_stride
+        )
+        joint_qd_1 = wp.to_torch(self.state_1.joint_qd).view(
+            self.num_envs, self._proj_qd_stride
         )
 
-        root_state = root_state.clone()
-        root_vel_state = root_vel_state.clone()
-        dof_pos = dof_pos.clone()
-        dof_vel = dof_vel.clone()
+        q_dof_start = 7 if not self.robot_config.asset.fix_base_link else 0
+        qd_dof_start = 6 if not self.robot_config.asset.fix_base_link else 0
+        q_dof_end = q_dof_start + self.robot_config.number_of_actions
+        qd_dof_end = qd_dof_start + self.robot_config.number_of_actions
 
-        root_state[env_ids, :3] = new_states.root_pos
-        root_state[env_ids, 3:] = new_states.root_rot
-        root_vel_state[env_ids, :3] = new_states.root_vel
-        root_vel_state[env_ids, 3:] = new_states.root_ang_vel
-        dof_pos[env_ids] = new_states.dof_pos
-        dof_vel[env_ids] = new_states.dof_vel
+        if not self.robot_config.asset.fix_base_link:
+            joint_q_0[env_ids, :3] = new_states.root_pos
+            joint_q_0[env_ids, 3:7] = new_states.root_rot
+            joint_qd_0[env_ids, :3] = new_states.root_vel
+            joint_qd_0[env_ids, 3:6] = new_states.root_ang_vel
+            joint_q_1[env_ids, :3] = new_states.root_pos
+            joint_q_1[env_ids, 3:7] = new_states.root_rot
+            joint_qd_1[env_ids, :3] = new_states.root_vel
+            joint_qd_1[env_ids, 3:6] = new_states.root_ang_vel
 
-        root_state_3d = root_state.unsqueeze(1)
-        root_vel_state_3d = root_vel_state.unsqueeze(1)
-        dof_pos_3d = dof_pos.unsqueeze(1)
-        dof_vel_3d = dof_vel.unsqueeze(1)
-
-        # Set state_0 using ArticulationView
-        self.robot_view.set_root_transforms(self.state_0, root_state_3d, mask=env_mask)
-        self.robot_view.set_root_velocities(
-            self.state_0, root_vel_state_3d, mask=env_mask
-        )
-        self.robot_view.set_dof_velocities(self.state_0, dof_vel_3d, mask=env_mask)
-
-        self.robot_view.set_dof_positions(self.state_0, dof_pos_3d, mask=env_mask)
-
-        # Also update state_1 to match state_0
-        self.robot_view.set_root_transforms(self.state_1, root_state_3d, mask=env_mask)
-        self.robot_view.set_root_velocities(
-            self.state_1, root_vel_state_3d, mask=env_mask
-        )
-        self.robot_view.set_dof_velocities(self.state_1, dof_vel_3d, mask=env_mask)
-        self.robot_view.set_dof_positions(self.state_1, dof_pos_3d, mask=env_mask)
+        joint_q_0[env_ids, q_dof_start:q_dof_end] = new_states.dof_pos
+        joint_qd_0[env_ids, qd_dof_start:qd_dof_end] = new_states.dof_vel
+        joint_q_1[env_ids, q_dof_start:q_dof_end] = new_states.dof_pos
+        joint_qd_1[env_ids, qd_dof_start:qd_dof_end] = new_states.dof_vel
 
         # Clear forces after reset
         self.state_0.clear_forces()
@@ -1761,18 +1814,7 @@ class NewtonSimulator(Simulator):
         """Returns contact forces for robot bodies."""
         self._sync_state_reads_if_needed()
 
-        # Initialize with zeros for all bodies
-        rigid_body_contact_forces = torch.zeros(
-            self.num_envs, len(self._body_names), 3, device=self.device
-        )
-
-        # Populate contact forces from sensors
-        if len(self._contact_sensors) > 0:
-            for body_name, contact_force in self._contact_forces.items():
-                # Find the index of this body in the body_names list
-                if body_name in self._body_names:
-                    body_idx = self._body_names.index(body_name)
-                    rigid_body_contact_forces[:, body_idx, :] = contact_force
+        rigid_body_contact_forces = self._get_rigid_body_contact_forces_snapshot()
 
         if env_ids is not None:
             rigid_body_contact_forces = rigid_body_contact_forces[env_ids]
@@ -1964,20 +2006,114 @@ class NewtonSimulator(Simulator):
         )[0, 0]
         return dof_limits_lower, dof_limits_upper
 
+    def _build_robot_state(
+        self,
+        env_ids: Optional[torch.Tensor] = None,
+        include_dof_forces: bool = True,
+    ) -> RobotState:
+        """Build robot state in a single pass for the hot path."""
+        self._sync_state_reads_if_needed()
+
+        body_pos, body_rot, body_vel, body_ang_vel = self._read_bodies_state_tensors()
+
+        bad_env_ids = self._get_nonfinite_env_ids(
+            body_pos, body_rot, body_vel, body_ang_vel
+        )
+        if bad_env_ids.numel() > 0:
+            self._raise_on_nonfinite_envs(
+                source="bodies_state",
+                bad_env_ids=bad_env_ids,
+                tensors={
+                    "rigid_body_pos": body_pos,
+                    "rigid_body_rot": body_rot,
+                    "rigid_body_vel": body_vel,
+                    "rigid_body_ang_vel": body_ang_vel,
+                },
+            )
+
+        dof_pos = (
+            wp.to_torch(self.robot_view.get_dof_positions(self.state_0))
+            .squeeze(1)
+            .view(self.num_envs, -1)
+        )
+        dof_vel = (
+            wp.to_torch(self.robot_view.get_dof_velocities(self.state_0))
+            .squeeze(1)
+            .view(self.num_envs, -1)
+        )
+
+        bad_dof_ids = self._get_nonfinite_env_ids(dof_pos, dof_vel)
+        if bad_dof_ids.numel() > 0:
+            self._raise_on_nonfinite_envs(
+                source="dof_state",
+                bad_env_ids=bad_dof_ids,
+                tensors={"dof_pos": dof_pos, "dof_vel": dof_vel},
+            )
+
+        contact_forces = self._get_rigid_body_contact_forces_snapshot()
+        binary_contacts = (torch.norm(contact_forces, dim=-1) > 0.01).float()
+
+        dof_forces = None
+        if include_dof_forces:
+            dof_forces = wp.to_torch(self.robot_view.get_dof_forces(self.control)).squeeze(
+                1
+            )
+
+        if env_ids is not None:
+            body_pos = body_pos[env_ids]
+            body_rot = body_rot[env_ids]
+            body_vel = body_vel[env_ids]
+            body_ang_vel = body_ang_vel[env_ids]
+            dof_pos = dof_pos[env_ids]
+            dof_vel = dof_vel[env_ids]
+            contact_forces = contact_forces[env_ids]
+            binary_contacts = binary_contacts[env_ids]
+            if dof_forces is not None:
+                dof_forces = dof_forces[env_ids]
+
+        state = RobotState(
+            rigid_body_pos=body_pos,
+            rigid_body_rot=body_rot,
+            rigid_body_vel=body_vel,
+            rigid_body_ang_vel=body_ang_vel,
+            dof_pos=dof_pos,
+            dof_vel=dof_vel,
+            dof_forces=dof_forces,
+            rigid_body_contact_forces=contact_forces,
+            rigid_body_contacts=binary_contacts,
+            state_conversion=StateConversion.SIMULATOR,
+        )
+        return state.convert_to_common(self.data_conversion)
+
+    def get_robot_state(self, env_ids: Optional[torch.Tensor] = None) -> RobotState:
+        """Optimized single-pass robot state query.
+
+        Performs one sync, one batch of wp.to_torch reads, and one convert_to_common
+        instead of the base class's 4 separate getter + 4 sync + 4 conversion passes.
+        """
+        return self._build_robot_state(env_ids, include_dof_forces=True)
+
+    def get_env_step_state(
+        self,
+        env_ids: Optional[torch.Tensor] = None,
+        *,
+        include_dof_forces: bool = True,
+    ) -> RobotState:
+        """Retrieve the reduced robot state needed on every environment step."""
+        return self._build_robot_state(env_ids, include_dof_forces=include_dof_forces)
+
     # ===== Group 5: Control & Computation Methods =====
     def _apply_simulator_pd_targets(self, pd_targets: torch.Tensor) -> None:
         """Applies PD position targets using Newton's internal PD controller."""
-        a_wp = wp.from_torch(
-            pd_targets.unsqueeze(1), dtype=wp.float32, requires_grad=False
+        self._joint_target_pos_torch.copy_(pd_targets.unsqueeze(1))
+        self.robot_view.set_attribute(
+            "joint_target_pos", self.control, self._joint_target_pos_wp
         )
-        self.robot_view.set_attribute("joint_target_pos", self.control, a_wp)
 
     def _apply_simulator_torques(self, torques: torch.Tensor) -> None:
         """Applies torques to the robot DOFs."""
-        a_wp = wp.from_torch(
-            torques.unsqueeze(1), dtype=wp.float32, requires_grad=False
-        )
-        self.robot_view.set_dof_forces(self.control, a_wp)
+        self._dof_force_torch.copy_(torques.unsqueeze(1))
+        self.robot_view.set_dof_forces(self.control, self._dof_force_wp)
 
     def _apply_pd_kernel(self, state: newton.State) -> None:
         """Apply explicit PD control using Warp kernel."""
@@ -2002,9 +2138,7 @@ class NewtonSimulator(Simulator):
 
     def _update_pd_targets(self, pd_targets: torch.Tensor) -> None:
         """Update PD targets in the persistent Warp array."""
-        wp.copy(
-            self._pd_targets_wp, wp.from_torch(pd_targets.view(-1), dtype=wp.float32)
-        )
+        self._pd_targets_torch.copy_(pd_targets)
 
     def _apply_torques_kernel_method(self) -> None:
         """Apply direct torques using Warp kernel."""
@@ -2022,7 +2156,7 @@ class NewtonSimulator(Simulator):
 
     def _update_torques(self, torques: torch.Tensor) -> None:
         """Update torques in the persistent Warp array."""
-        wp.copy(self._pd_targets_wp, wp.from_torch(torques.view(-1), dtype=wp.float32))
+        self._pd_targets_torch.copy_(torques)
 
     def _apply_root_velocity_impulse(
         self,
@@ -2033,17 +2167,19 @@ class NewtonSimulator(Simulator):
         """Apply velocity impulse to robot root by adding to current velocities."""
         self._sync_state_reads_if_needed()
 
-        current_vel_3d = wp.to_torch(self.robot_view.get_root_velocities(self.state_0))
-        current_vel = current_vel_3d.squeeze(1)
-        new_vel = current_vel.clone()
-        new_vel[env_ids, :3] += linear_velocity
-        new_vel[env_ids, 3:6] += angular_velocity
+        if self.robot_config.asset.fix_base_link:
+            return
 
-        env_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        env_mask[env_ids] = True
-        new_vel_3d = new_vel.unsqueeze(1)
-        self.robot_view.set_root_velocities(self.state_0, new_vel_3d, mask=env_mask)
-        self.robot_view.set_root_velocities(self.state_1, new_vel_3d, mask=env_mask)
+        joint_qd_0 = wp.to_torch(self.state_0.joint_qd).view(
+            self.num_envs, self._proj_qd_stride
+        )
+        joint_qd_1 = wp.to_torch(self.state_1.joint_qd).view(
+            self.num_envs, self._proj_qd_stride
+        )
+        joint_qd_0[env_ids, :3] += linear_velocity
+        joint_qd_0[env_ids, 3:6] += angular_velocity
+        joint_qd_1[env_ids, :3] += linear_velocity
+        joint_qd_1[env_ids, 3:6] += angular_velocity
 
     # ===== Group 5b: Projectile Methods =====
     def _get_projectile_positions_rotations(self) -> tuple:
@@ -2053,19 +2189,12 @@ class NewtonSimulator(Simulator):
         """
         self._sync_state_reads_if_needed()
 
-        joint_q = wp.to_torch(self.state_0.joint_q)
+        joint_q = wp.to_torch(self.state_0.joint_q).view(self.num_envs, self._proj_q_stride)
         n_proj = self._proj_config.num_projectiles
-        q_stride = self._proj_q_stride
-        jq_off = self._proj_jq_offset
-
-        pos = torch.zeros(self.num_envs, n_proj, 3, device=self.device)
-        rot = torch.zeros(self.num_envs, n_proj, 4, device=self.device)
-        for eid in range(self.num_envs):
-            for pid in range(n_proj):
-                qp = eid * q_stride + jq_off + pid * 7
-                pos[eid, pid] = joint_q[qp : qp + 3]
-                rot[eid, pid] = joint_q[qp + 3 : qp + 7]
-        return pos, rot
+        proj_q = joint_q[
+            :, self._proj_jq_offset : self._proj_jq_offset + n_proj * 7
+        ].view(self.num_envs, n_proj, 7)
+        return proj_q[..., :3], proj_q[..., 3:7]
 
     def _create_projectiles(self, config: ProjectileConfig) -> None:
         """Projectile bodies are already added to the builder during _create_envs."""
@@ -2085,25 +2214,22 @@ class NewtonSimulator(Simulator):
 
         Newton uses xyzw quaternions natively — no conversion needed.
         """
-        joint_q = wp.to_torch(self.state_0.joint_q)
-        joint_qd = wp.to_torch(self.state_0.joint_qd)
+        joint_q = wp.to_torch(self.state_0.joint_q).view(self.num_envs, self._proj_q_stride)
+        joint_qd = wp.to_torch(self.state_0.joint_qd).view(
+            self.num_envs, self._proj_qd_stride
+        )
 
-        q_stride = self._proj_q_stride
-        qd_stride = self._proj_qd_stride
-        jq_off = self._proj_jq_offset
-        jqd_off = self._proj_jqd_offset
+        proj_q = joint_q[
+            :, self._proj_jq_offset : self._proj_jq_offset + self._proj_config.num_projectiles * 7
+        ].view(self.num_envs, self._proj_config.num_projectiles, 7)
+        proj_qd = joint_qd[
+            :, self._proj_jqd_offset : self._proj_jqd_offset + self._proj_config.num_projectiles * 6
+        ].view(self.num_envs, self._proj_config.num_projectiles, 6)
 
-        for i in range(len(env_ids)):
-            eid = env_ids[i].item()
-            pid = proj_indices[i].item()
-
-            qp = eid * q_stride + jq_off + pid * 7
-            joint_q[qp : qp + 3] = positions[i]
-            joint_q[qp + 3 : qp + 7] = rotations_xyzw[i]
-
-            qv = eid * qd_stride + jqd_off + pid * 6
-            joint_qd[qv : qv + 3] = velocities[i]
-            joint_qd[qv + 3 : qv + 6] = ang_velocities[i]
+        proj_q[env_ids, proj_indices, :3] = positions
+        proj_q[env_ids, proj_indices, 3:7] = rotations_xyzw
+        proj_qd[env_ids, proj_indices, :3] = velocities
+        proj_qd[env_ids, proj_indices, 3:6] = ang_velocities
 
         # Also update state_1 to match
         wp.copy(self.state_1.joint_q, self.state_0.joint_q)
@@ -2120,28 +2246,32 @@ class NewtonSimulator(Simulator):
         self._needs_state_sync = True
 
     # ===== Group 6: Rendering & Visualization =====
+    @staticmethod
+    def _compute_camera_angles(
+        camera_pos: torch.Tensor, target_pos: torch.Tensor
+    ) -> Tuple[float, float]:
+        """Compute viewer camera pitch/yaw from two 3D positions."""
+        vector_to_target = target_pos - camera_pos
+        norm = torch.linalg.vector_norm(vector_to_target).clamp_min(1e-8)
+        direction = vector_to_target / norm
+        pitch = math.degrees(torch.asin(direction[2]).item())
+        yaw = math.degrees(torch.atan2(direction[1], direction[0]).item())
+        return pitch, yaw
+
     def _init_camera(self) -> None:
         """Initializes camera."""
-        char_root_pos = (
-            self._get_simulator_root_state([self._camera_target["env"]])
-            .root_pos.flatten()
-            .cpu()
-            .numpy()
+        char_root_pos = self._get_simulator_root_state(
+            [self._camera_target["env"]]
+        ).root_pos.flatten()
+        cam_pos = char_root_pos + torch.tensor(
+            [0.0, -5.0, 1.0], device=char_root_pos.device, dtype=char_root_pos.dtype
         )
-
-        cam_pos = char_root_pos + np.array([0, -5.0, 1])
-
-        camera_target = char_root_pos + np.array([0, 0, 0.2])
-        vector_to_target = camera_target - cam_pos
-        normalized_vector_to_target = vector_to_target / np.linalg.norm(
-            vector_to_target
+        camera_target = char_root_pos + torch.tensor(
+            [0.0, 0.0, 0.2], device=char_root_pos.device, dtype=char_root_pos.dtype
         )
-        pitch = np.rad2deg(np.arcsin(normalized_vector_to_target[2]))
-        yaw = np.rad2deg(
-            np.arctan2(normalized_vector_to_target[1], normalized_vector_to_target[0])
-        )
+        pitch, yaw = self._compute_camera_angles(cam_pos, camera_target)
 
-        self.viewer.set_camera(wp.vec3(cam_pos.tolist()), pitch, yaw)
+        self.viewer.set_camera(wp.vec3(cam_pos.detach().cpu().tolist()), pitch, yaw)
         self._cam_prev_char_pos = char_root_pos
 
     def _init_keyboard(self) -> None:
@@ -2154,8 +2284,6 @@ class NewtonSimulator(Simulator):
             char_root_pos = (
                 self._get_simulator_root_state([self._camera_target["env"]])
                 .root_pos.flatten()
-                .cpu()
-                .numpy()
             )
             height_offset = 0.2
         else:
@@ -2164,32 +2292,35 @@ class NewtonSimulator(Simulator):
                 self._get_simulator_object_root_state(self._camera_target["env"])
                 .root_pos[in_scene_object_id]
                 .flatten()
-                .cpu()
-                .numpy()
             )
             height_offset = 0
 
         if hasattr(self.viewer, "camera") and hasattr(self.viewer.camera, "pos"):
-            cam_pos = np.array(self.viewer.camera.pos)
+            cam_pos = torch.tensor(
+                self.viewer.camera.pos, device=char_root_pos.device, dtype=torch.float32
+            )
         elif hasattr(self.viewer, "_camera_request") and self.viewer._camera_request:
-            cam_pos = np.array(self.viewer._camera_request[0], dtype=np.float64)
+            cam_pos = torch.tensor(
+                self.viewer._camera_request[0],
+                device=char_root_pos.device,
+                dtype=torch.float32,
+            )
         else:
             return
         cam_delta = cam_pos - self._cam_prev_char_pos
 
-        new_cam_target = char_root_pos + np.array([0, 0, height_offset])
+        new_cam_target = char_root_pos + torch.tensor(
+            [0.0, 0.0, height_offset],
+            device=char_root_pos.device,
+            dtype=char_root_pos.dtype,
+        )
         new_cam_pos = char_root_pos + cam_delta
 
-        vector_to_target = new_cam_target - new_cam_pos
-        normalized_vector_to_target = vector_to_target / np.linalg.norm(
-            vector_to_target
-        )
-        pitch = np.rad2deg(np.arcsin(normalized_vector_to_target[2]))
-        yaw = np.rad2deg(
-            np.arctan2(normalized_vector_to_target[1], normalized_vector_to_target[0])
-        )
+        pitch, yaw = self._compute_camera_angles(new_cam_pos, new_cam_target)
 
-        self.viewer.set_camera(wp.vec3(new_cam_pos.tolist()), pitch, yaw)
+        self.viewer.set_camera(
+            wp.vec3(new_cam_pos.detach().cpu().tolist()), pitch, yaw
+        )
         self._cam_prev_char_pos = char_root_pos
 
     def close(self) -> None:

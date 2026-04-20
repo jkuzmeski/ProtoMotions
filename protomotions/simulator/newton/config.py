@@ -82,6 +82,12 @@ class NewtonSimParams(SimParams):
             "help": "Raise immediately when MuJoCo emits a runtime warning during a Newton solver step. Enable this for bridge/debug investigations; it disables CUDA graph replay so warnings can fail fast at the offending step."
         },
     )
+    raise_on_nonfinite: bool = field(
+        default=False,
+        metadata={
+            "help": "Raise immediately when non-finite (NaN/Inf) values are detected in simulator state. Writes a diagnostic .pt dump to output/nonfinite_dumps/ before crashing. Use this to debug physics explosions instead of silently clamping and resetting."
+        },
+    )
 
 
 @dataclass

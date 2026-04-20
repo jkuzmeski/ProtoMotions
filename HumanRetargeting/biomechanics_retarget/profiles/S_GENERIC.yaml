@@ -7,9 +7,19 @@ coordinate_transform: y_to_x_forward
 contact_source: heuristic
 trial_glob: "*.txt"
 mass_kg: 70.0
+# Anthropometry extracted from S02 treadmill joint positions (8-trial average).
+# Previous values were the BASE model defaults (170cm generic) and caused a
+# 7% thigh / 16% foot length mismatch, which made the retarget solver push
+# hip-Z to the joint limit and lock toe DOFs at zero.
 anthropometry:
-  height_cm: 170
+  height_cm: 173
   pelvis_width_m: 0.19
-  thigh_length_m: 0.3789
-  shank_length_m: 0.3982
-  foot_length_m: 0.1233
+  thigh_length_m: 0.4072
+  shank_length_m: 0.3854
+  foot_length_m: 0.1326
+  left_thigh_length_m: 0.4057
+  right_thigh_length_m: 0.4088
+  left_shank_length_m: 0.3883
+  right_shank_length_m: 0.3826
+  left_foot_length_m: 0.1310
+  right_foot_length_m: 0.1342

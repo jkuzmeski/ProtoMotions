@@ -203,11 +203,17 @@ def _crossfade_foot_contacts(
     contacts: np.ndarray,
     window_size: int = 5,
 ) -> np.ndarray:
-    """Collapse ankle/toe contacts to a shared foot weight, like the G1 retargeter."""
+    """Collapse ankle/toe contacts to a shared foot weight.
+
+    The upstream keypoint extractor already promotes per-joint contacts to
+    a unified foot-level signal, so the extra smoothing window was adding
+    a 2-3 frame timing shift that caused foot-placement errors.  Now we
+    just unify the channels without the moving-average blur.
+    """
+    del window_size  # no longer applied
     contacts = np.asarray(contacts, dtype=np.float32)
-    averaged = contacts.mean(axis=1, keepdims=True)
-    smoothed = _smooth_contact_channels(averaged, window_size=window_size)
-    return np.repeat(smoothed, contacts.shape[1], axis=1)
+    unified = np.maximum(contacts[:, :1], contacts[:, 1:]) if contacts.shape[1] >= 2 else contacts
+    return np.repeat(unified, contacts.shape[1], axis=1)
 
 
 def _pad_or_trim(array: np.ndarray, target_len: int) -> np.ndarray:
@@ -1022,11 +1028,11 @@ def main() -> None:
     weights = RetargetingWeights(
         local_alignment=4.0,
         global_alignment=8.0,
-        orientation_alignment=0.0,
+        orientation_alignment=0.6,
         root_smoothness=1.0,
         joint_smoothness=0.75,
-        joint_reference=0.0,
-        root_reference=0.0,
+        joint_reference=0.03,
+        root_reference=0.02,
         joint_vel_limit=0.0,
         limit_cost=25.0,
         foot_contact=12.0,
