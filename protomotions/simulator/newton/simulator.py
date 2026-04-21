@@ -771,7 +771,6 @@ class NewtonSimulator(Simulator):
             "integrator": sim_params.integrator,
             "njmax": sim_params.njmax,
             "nconmax": sim_params.nconmax,
-            "nccdmax": sim_params.nccdmax,
             "naccdmax": sim_params.naccdmax,
             "iterations": sim_params.iterations,
             "ls_iterations": sim_params.ls_iterations,
@@ -779,6 +778,7 @@ class NewtonSimulator(Simulator):
             "impratio": sim_params.impratio,
             "cone": sim_params.cone,
             "ccd_iterations": sim_params.ccd_iterations,
+            "use_mujoco_contacts": sim_params.use_mujoco_contacts,
         }
         supported_solver_kwargs = inspect.signature(
             newton.solvers.SolverMuJoCo
@@ -798,6 +798,10 @@ class NewtonSimulator(Simulator):
                 "continuing with compatible solver kwargs only.",
                 ", ".join(dropped_solver_kwargs),
             )
+
+        self._use_mujoco_contacts = bool(
+            filtered_solver_kwargs.get("use_mujoco_contacts", True)
+        )
 
         self.solver = newton.solvers.SolverMuJoCo(
             self.model,
@@ -1124,6 +1128,15 @@ class NewtonSimulator(Simulator):
                 self._apply_torques_kernel_method()
             if self.viewer:
                 self.viewer.apply_forces(self.state_0)
+            if not self._use_mujoco_contacts:
+                try:
+                    self.model.collide(self.state_0, self.contacts)
+                except Exception as exc:
+                    self._raise_on_solver_failure(
+                        source="contact_generation",
+                        substep_idx=substep_idx,
+                        exc=exc,
+                    )
             try:
                 self.solver.step(
                     self.state_0, self.state_1, self.control, self.contacts, self.sim_dt
@@ -1498,7 +1511,10 @@ class NewtonSimulator(Simulator):
     def _update_contact_sensors(self) -> None:
         """Update contact sensors after physics step. Must be called outside CUDA graph."""
         if len(self._contact_sensors) > 0:
-            self.solver.update_contacts(self.contacts, self.state_0)
+            if self._use_mujoco_contacts:
+                self.solver.update_contacts(self.contacts, self.state_0)
+            else:
+                self.model.collide(self.state_0, self.contacts)
             self._rigid_body_contact_forces.zero_()
             for body_name, sensor in self._contact_sensors.items():
                 sensor.update(self.state_0, self.contacts)
@@ -1537,7 +1553,21 @@ class NewtonSimulator(Simulator):
         if reset_worlds is not None:
             reset_worlds(self.state_0, env_ids)
         else:
-            # Newton 1.0+: no per-world reset; re-notify solver of state change
+            # Older Newton builds may not expose a per-world solver reset API.
+            # Synchronize MuJoCo runtime state directly from the teleported Newton
+            # state instead of rebuilding all solver constants.
+            update_mjc_data = getattr(self.solver, "_update_mjc_data", None)
+            if callable(update_mjc_data):
+                mj_data = getattr(self.solver, "mjw_data", None)
+                if mj_data is None:
+                    mj_data = getattr(self.solver, "mj_data", None)
+                if mj_data is not None:
+                    with wp.ScopedDevice(self.model.device):
+                        update_mjc_data(mj_data, self.model, self.state_0)
+                    return
+
+            # Last-resort compatibility path for Newton variants that expose
+            # neither per-world reset nor direct MuJoCo data sync.
             self.solver.notify_model_changed(SolverNotifyFlags.ALL)
 
     def _get_nonfinite_env_ids(self, *tensors: torch.Tensor) -> torch.Tensor:

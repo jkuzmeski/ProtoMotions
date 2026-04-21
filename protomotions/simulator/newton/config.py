@@ -70,6 +70,12 @@ class NewtonSimParams(SimParams):
         default=200,
         metadata={"help": "CCD (continuous collision detection) iterations."}
     )
+    use_mujoco_contacts: bool = field(
+        default=False,
+        metadata={
+            "help": "Use MuJoCo-generated contacts inside SolverMuJoCo. Disable this to generate contacts via Newton's collision pipeline and feed them into step()."
+        },
+    )
     max_epa_workspace_iterations: Optional[int] = field(
         default=128,
         metadata={
