@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-import inspect
 import os
 import traceback
 import torch
@@ -44,7 +43,6 @@ import warp as wp
 import newton
 from newton import JointTargetMode
 from newton.selection import ArticulationView
-from newton import Contacts
 from newton.sensors import SensorContact
 from newton.solvers import SolverNotifyFlags
 import copy
@@ -246,20 +244,11 @@ class NewtonSimulator(Simulator):
         self.graph = None
         self.use_cuda_graph = False
 
-        fail_fast_warnings = bool(
-            getattr(self.config.sim, "raise_on_mujoco_warning", False)
-        )
         can_use_cuda_graph = (
             wp.get_device().is_cuda and wp.is_mempool_enabled(wp.get_device())
         )
 
-        if can_use_cuda_graph and fail_fast_warnings:
-            print(
-                "[INFO] CUDA graph disabled: fail-fast MuJoCo warning escalation "
-                "requires uncaptured Newton solver steps"
-            )
-
-        if can_use_cuda_graph and not fail_fast_warnings:
+        if can_use_cuda_graph:
             print(f"[INFO] Using CUDA graph ({self.control_type.name})")
             self.use_cuda_graph = True
             zeros = torch.zeros(
@@ -771,40 +760,22 @@ class NewtonSimulator(Simulator):
             "integrator": sim_params.integrator,
             "njmax": sim_params.njmax,
             "nconmax": sim_params.nconmax,
-            "naccdmax": sim_params.naccdmax,
             "iterations": sim_params.iterations,
             "ls_iterations": sim_params.ls_iterations,
             "ls_parallel": sim_params.ls_parallel,
             "impratio": sim_params.impratio,
             "cone": sim_params.cone,
             "ccd_iterations": sim_params.ccd_iterations,
-            "use_mujoco_contacts": sim_params.use_mujoco_contacts,
         }
-        supported_solver_kwargs = inspect.signature(
-            newton.solvers.SolverMuJoCo
-        ).parameters
         filtered_solver_kwargs = {
             key: value
             for key, value in solver_kwargs.items()
-            if key in supported_solver_kwargs and value is not None
+            if value is not None
         }
-        dropped_solver_kwargs = sorted(
-            key for key, value in solver_kwargs.items()
-            if value is not None and key not in supported_solver_kwargs
-        )
-        if dropped_solver_kwargs:
-            log.warning(
-                "Installed Newton SolverMuJoCo does not accept %s; "
-                "continuing with compatible solver kwargs only.",
-                ", ".join(dropped_solver_kwargs),
-            )
-
-        self._use_mujoco_contacts = bool(
-            filtered_solver_kwargs.get("use_mujoco_contacts", True)
-        )
 
         self.solver = newton.solvers.SolverMuJoCo(
             self.model,
+            use_mujoco_contacts=False,
             **filtered_solver_kwargs,
         )
 
@@ -888,13 +859,13 @@ class NewtonSimulator(Simulator):
     def _apply_domain_randomization_if_needed(self) -> None:
         """Apply friction and center of mass domain randomization.
 
-        Newton/MuJoCo uses:
+        The Newton solver backend uses:
         - shape_material_mu for friction coefficient (single value, not static/dynamic)
         - shape_material_restitution for restitution
         - body_com for center of mass offsets
 
         After modifying these, we must call solver.notify_model_changed() with
-        the appropriate flags so MuJoCo updates its internal model.
+        the appropriate flags so the backend updates its internal model.
         """
         if self._domain_randomization is None:
             return
@@ -987,7 +958,7 @@ class NewtonSimulator(Simulator):
                 f"[INFO] Applied center of mass domain randomization to {len(body_indices)} body types"
             )
 
-        # Notify solver of changes so MuJoCo updates its internal model
+        # Notify solver of changes so the backend updates its internal model.
         if notify_flags != 0:
             self.solver.notify_model_changed(notify_flags)
 
@@ -1103,20 +1074,13 @@ class NewtonSimulator(Simulator):
 
     def _create_contacts(self) -> None:
         """Create Contacts object via model.contacts() (Newton 1.0+ API)."""
-        # Ensure the model allocates enough contacts for the solver (e.g. MuJoCo naconmax).
+        # Ensure the model allocates enough contacts for the configured backend.
         solver_max = int(self.solver.get_max_contact_count())
         model_max = int(getattr(self.model, "rigid_contact_max", 0) or 0)
         if solver_max > model_max:
             self.model.rigid_contact_max = solver_max
 
-        if hasattr(self.model, "contacts") and callable(self.model.contacts):
-            self.contacts = self.model.contacts()
-        else:
-            self.contacts = Contacts(
-                self.solver.get_max_contact_count(),
-                0,
-                requested_attributes=self.model.get_requested_contact_attributes(),
-            )
+        self.contacts = self.model.contacts()
 
     def _simulate(self) -> None:
         """Run physics simulation for one frame (decimation substeps)."""
@@ -1128,15 +1092,14 @@ class NewtonSimulator(Simulator):
                 self._apply_torques_kernel_method()
             if self.viewer:
                 self.viewer.apply_forces(self.state_0)
-            if not self._use_mujoco_contacts:
-                try:
-                    self.model.collide(self.state_0, self.contacts)
-                except Exception as exc:
-                    self._raise_on_solver_failure(
-                        source="contact_generation",
-                        substep_idx=substep_idx,
-                        exc=exc,
-                    )
+            try:
+                self.model.collide(self.state_0, self.contacts)
+            except Exception as exc:
+                self._raise_on_solver_failure(
+                    source="contact_generation",
+                    substep_idx=substep_idx,
+                    exc=exc,
+                )
             try:
                 self.solver.step(
                     self.state_0, self.state_1, self.control, self.contacts, self.sim_dt
@@ -1316,7 +1279,7 @@ class NewtonSimulator(Simulator):
     def _write_solver_failure_debug_dump(
         self,
         source: str,
-        substep_idx: int,
+        substep_idx: Optional[int],
         exc: Exception,
     ) -> Path:
         """Write a fail-fast debug dump for solver-step failures and warnings."""
@@ -1377,7 +1340,7 @@ class NewtonSimulator(Simulator):
         debug_payload = {
             "timestamp_utc": datetime.utcnow().isoformat(),
             "source": source,
-            "substep_idx": int(substep_idx),
+            "substep_idx": None if substep_idx is None else int(substep_idx),
             "sim_time": float(self.sim_time),
             "frame_dt": float(self.frame_dt),
             "sim_dt": float(self.sim_dt),
@@ -1395,12 +1358,8 @@ class NewtonSimulator(Simulator):
                 "impratio": float(self.config.sim.impratio),
                 "njmax": int(self.config.sim.njmax),
                 "nconmax": int(self.config.sim.nconmax),
-                "nccdmax": None if self.config.sim.nccdmax is None else int(self.config.sim.nccdmax),
-                "naccdmax": None if self.config.sim.naccdmax is None else int(self.config.sim.naccdmax),
-                "max_epa_workspace_iterations": None if self.config.sim.max_epa_workspace_iterations is None else int(self.config.sim.max_epa_workspace_iterations),
                 "cone": self.config.sim.cone,
                 "ccd_iterations": int(self.config.sim.ccd_iterations),
-                "raise_on_mujoco_warning": bool(self.config.sim.raise_on_mujoco_warning),
             },
             "solver_runtime_options": self._get_solver_runtime_options(),
             "solver_capacity": solver_capacity,
@@ -1431,8 +1390,9 @@ class NewtonSimulator(Simulator):
         dump_dir = Path("output/sim_failure_dumps")
         dump_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+        substep_label = "na" if substep_idx is None else str(substep_idx)
         dump_path = dump_dir / (
-            f"newton_solver_failure_{timestamp}_substep{substep_idx}_src_{source}.pt"
+            f"newton_solver_failure_{timestamp}_substep{substep_label}_src_{source}.pt"
         )
         torch.save(debug_payload, dump_path)
         return dump_path
@@ -1440,7 +1400,7 @@ class NewtonSimulator(Simulator):
     def _raise_on_solver_failure(
         self,
         source: str,
-        substep_idx: int,
+        substep_idx: Optional[int],
         exc: Exception,
     ) -> None:
         """Crash immediately with a solver failure summary and state dump."""
@@ -1487,16 +1447,16 @@ class NewtonSimulator(Simulator):
             "Newton solver step failed.",
             f"source={source}",
             f"sim_time={self.sim_time:.6f}s frame_dt={self.frame_dt:.6f}s sim_dt={self.sim_dt:.6f}s",
-            f"substep={substep_idx + 1}/{self.decimation}",
             f"use_cuda_graph={self.use_cuda_graph}",
             (
                 f"solver_budget(nconmax={int(self.config.sim.nconmax)}, "
-                f"nccdmax={self.config.sim.nccdmax if self.config.sim.nccdmax is not None else 'auto'}, "
                 f"njmax={int(self.config.sim.njmax)}, "
                 f"ccd_iterations={int(self.config.sim.ccd_iterations)})"
             ),
             f"exception={type(exc).__name__}: {exc}",
         ]
+        if substep_idx is not None:
+            summary_lines.insert(3, f"substep={substep_idx + 1}/{self.decimation}")
         if candidate_summaries:
             summary_lines.append(f"candidate_envs={candidate_summaries}")
         if dump_path is not None:
@@ -1511,10 +1471,14 @@ class NewtonSimulator(Simulator):
     def _update_contact_sensors(self) -> None:
         """Update contact sensors after physics step. Must be called outside CUDA graph."""
         if len(self._contact_sensors) > 0:
-            if self._use_mujoco_contacts:
-                self.solver.update_contacts(self.contacts, self.state_0)
-            else:
+            try:
                 self.model.collide(self.state_0, self.contacts)
+            except Exception as exc:
+                self._raise_on_solver_failure(
+                    source="contact_sensor_refresh",
+                    substep_idx=None,
+                    exc=exc,
+                )
             self._rigid_body_contact_forces.zero_()
             for body_name, sensor in self._contact_sensors.items():
                 sensor.update(self.state_0, self.contacts)
@@ -1545,30 +1509,33 @@ class NewtonSimulator(Simulator):
             wp.synchronize()
         self._needs_state_sync = False
 
-    def _reset_solver_worlds_from_state(self, env_ids: torch.Tensor) -> None:
-        """Clear per-world MuJoCo runtime state after direct Newton state teleports."""
+    def _reset_solver_worlds_from_state(
+        self, env_ids: torch.Tensor, clear_runtime_caches: bool = True
+    ) -> None:
+        """Resynchronize solver runtime state after direct Newton state teleports."""
         if env_ids is None or env_ids.numel() == 0:
             return
         reset_worlds = getattr(self.solver, "reset_worlds", None)
-        if reset_worlds is not None:
+        if clear_runtime_caches and callable(reset_worlds):
             reset_worlds(self.state_0, env_ids)
-        else:
-            # Older Newton builds may not expose a per-world solver reset API.
-            # Synchronize MuJoCo runtime state directly from the teleported Newton
-            # state instead of rebuilding all solver constants.
-            update_mjc_data = getattr(self.solver, "_update_mjc_data", None)
-            if callable(update_mjc_data):
-                mj_data = getattr(self.solver, "mjw_data", None)
-                if mj_data is None:
-                    mj_data = getattr(self.solver, "mj_data", None)
-                if mj_data is not None:
-                    with wp.ScopedDevice(self.model.device):
-                        update_mjc_data(mj_data, self.model, self.state_0)
-                    return
+            return
 
-            # Last-resort compatibility path for Newton variants that expose
-            # neither per-world reset nor direct MuJoCo data sync.
-            self.solver.notify_model_changed(SolverNotifyFlags.ALL)
+        # Older Newton builds may not expose a solver-owned reset helper yet.
+        # Synchronize runtime state directly from the teleported Newton state
+        # instead of rebuilding all solver constants.
+        update_mjc_data = getattr(self.solver, "_update_mjc_data", None)
+        if callable(update_mjc_data):
+            mj_data = getattr(self.solver, "mjw_data", None)
+            if mj_data is None:
+                mj_data = getattr(self.solver, "mj_data", None)
+            if mj_data is not None:
+                with wp.ScopedDevice(self.model.device):
+                    update_mjc_data(mj_data, self.model, self.state_0)
+                return
+
+        # Last-resort compatibility path for Newton variants that expose
+        # neither a reset helper nor direct runtime-state sync.
+        self.solver.notify_model_changed(SolverNotifyFlags.ALL)
 
     def _get_nonfinite_env_ids(self, *tensors: torch.Tensor) -> torch.Tensor:
         """Return env IDs where any provided tensor contains non-finite values."""
@@ -2468,7 +2435,9 @@ class NewtonSimulator(Simulator):
         newton.eval_fk(
             self.model, self.state_1.joint_q, self.state_1.joint_qd, self.state_1
         )
-        self._reset_solver_worlds_from_state(env_ids)
+        # Projectile teleports are setup/runtime bookkeeping rather than fresh
+        # environment episodes. Keep this on the lightweight state-sync path.
+        self._reset_solver_worlds_from_state(env_ids, clear_runtime_caches=False)
         self._needs_state_sync = True
 
     # ===== Group 6: Rendering & Visualization =====

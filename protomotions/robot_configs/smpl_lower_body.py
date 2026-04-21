@@ -171,22 +171,16 @@ class SmplLowerBodyRobotConfig(RobotConfig):
                 ),
             ),
             genesis=GenesisSimParams(fps=60, decimation=2, substeps=2),
-            # Lower-body contact tracking is heavy on foot-ground contacts. The
-            # previous 64-contact budget is auto-raised by MjWarp to 78 and still
-            # overflows in normal 1024-env runs, which then cascades into CCD
-            # warnings and occasional bad worlds. Keep the budget comfortably above
-            # the observed overflow point (~80 contacts/world) without returning to
-            # the old 1000-contact setting that explodes global CCD workspace on a
-            # 12 GB card. Cluster runs can still override these per experiment.
+            # Lower-body contact tracking is heavy on foot-ground contacts, so
+            # keep the per-world contact budget comfortably above the observed
+            # steady-state load without returning to the old 1000-contact setting.
             newton=NewtonSimParams(
                 fps=120,
                 decimation=4,
                 iterations=100,
                 njmax=768,
                 nconmax=96,
-                nccdmax=8,
                 ccd_iterations=128,
-                max_epa_workspace_iterations=128,
             ),
         )
     )
