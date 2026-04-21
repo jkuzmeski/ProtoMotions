@@ -45,7 +45,8 @@ class MimicADD(AMP):
         ref_state_gt = ref_state.rigid_body_pos.reshape(self.num_envs, -1, 3)
         ref_state_gt += (
             self.env.get_spawn_to_ref_pose_offset_with_terrain_height_correction(
-                ref_state_gt
+                ref_state_gt,
+                target_rot=ref_state.rigid_body_rot.reshape(self.num_envs, -1, 4),
             )
         )
         ref_ground_heights = self.env.terrain.get_ground_heights(

@@ -139,6 +139,35 @@ def _scale_attr(
     element.set(attr_name, _format_float_list(values))
 
 
+def _quat_wxyz_to_matrix(quat: list[float]) -> list[list[float]]:
+    """Convert MuJoCo's wxyz quaternion attribute to a 3x3 rotation matrix."""
+    if len(quat) != 4:
+        return [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+
+    w, x, y, z = quat
+    norm = math.sqrt(w * w + x * x + y * y + z * z)
+    if norm == 0.0:
+        return [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+
+    w /= norm
+    x /= norm
+    y /= norm
+    z /= norm
+    return [
+        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+        [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+        [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+    ]
+
+
 def _compute_lowest_relative_z(root_body: ET.Element) -> float:
     """Compute the minimum geom z offset relative to the freejoint root."""
 
@@ -152,15 +181,38 @@ def _compute_lowest_relative_z(root_body: ET.Element) -> float:
             offset = [parent_offset[i] + body_pos[i] for i in range(3)]
 
         for geom in body.findall("geom"):
+            geom_type = geom.get("type", "sphere")
             size = _parse_float_list(geom.get("size"))
-            if geom.get("type") == "box" and len(size) == 3:
-                geom_pos = _parse_float_list(geom.get("pos"))
-                geom_z = offset[2] + (geom_pos[2] if len(geom_pos) == 3 else 0.0)
-                lowest = min(lowest, geom_z - size[2])
-            elif geom.get("type") == "capsule" and len(size) >= 1:
+            geom_pos = _parse_float_list(geom.get("pos"))
+            geom_center_z = offset[2] + (geom_pos[2] if len(geom_pos) == 3 else 0.0)
+            geom_rot = _quat_wxyz_to_matrix(_parse_float_list(geom.get("quat")))
+            support_extent_z = None
+
+            if geom_type == "box" and len(size) == 3:
+                support_extent_z = sum(abs(v) * half_extent for v, half_extent in zip(geom_rot[2], size))
+            elif geom_type == "ellipsoid" and len(size) == 3:
+                support_extent_z = math.sqrt(
+                    sum((v * axis_extent) ** 2 for v, axis_extent in zip(geom_rot[2], size))
+                )
+            elif geom_type == "sphere" and len(size) >= 1:
+                support_extent_z = size[0]
+            elif geom_type == "cylinder" and len(size) >= 2:
+                axis_z = abs(geom_rot[2][2])
+                radial_z = math.sqrt(max(0.0, 1.0 - axis_z * axis_z))
+                support_extent_z = size[0] * radial_z + size[1] * axis_z
+            elif geom_type == "capsule" and len(size) >= 1:
                 fromto = _parse_float_list(geom.get("fromto"))
                 if len(fromto) == 6:
-                    lowest = min(lowest, offset[2] + min(fromto[2], fromto[5]) - size[0])
+                    lowest = min(
+                        lowest, offset[2] + min(fromto[2], fromto[5]) - size[0]
+                    )
+                    continue
+                if len(size) >= 2:
+                    axis_z = abs(geom_rot[2][2])
+                    support_extent_z = size[1] * axis_z + size[0]
+
+            if support_extent_z is not None:
+                lowest = min(lowest, geom_center_z - support_extent_z)
 
         for child in body.findall("body"):
             visit(child, offset)

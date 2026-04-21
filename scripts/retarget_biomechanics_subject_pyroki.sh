@@ -75,14 +75,18 @@ if [ ! -f "$SUBJECT_PROFILE" ]; then
     exit 1
 fi
 
-mapfile -t PROFILE_INFO < <(
-    "$PROTO_PYTHON" - "$REPO_ROOT" "$SUBJECT_PROFILE" "$OUTPUT_DIR_OVERRIDE" <<'PY'
+PROFILE_JSON_FILE="$(mktemp)"
+trap 'rm -f "$PROFILE_JSON_FILE"' EXIT
+
+if ! "$PROTO_PYTHON" - "$REPO_ROOT" "$SUBJECT_PROFILE" "$OUTPUT_DIR_OVERRIDE" "$PROFILE_JSON_FILE" <<'PY'
+import json
 import sys
 from pathlib import Path
 
 repo_root = Path(sys.argv[1]).resolve()
 profile_path = Path(sys.argv[2]).resolve()
 output_override = sys.argv[3].strip()
+output_json_path = Path(sys.argv[4]).resolve()
 
 sys.path.insert(0, str(repo_root))
 
@@ -108,15 +112,37 @@ else:
         / profile.subject_id
     )
 
-for value in (
-    profile.subject_id,
-    str(profile.input_dir),
-    str(output_dir),
-    str(profile.output_fps),
-    str(assets.urdf_path),
-    str(assets.mjcf_path),
+payload = {
+    "subject_id": profile.subject_id,
+    "input_dir": str(profile.input_dir),
+    "output_dir": str(output_dir),
+    "output_fps": str(profile.output_fps),
+    "retarget_urdf": str(assets.urdf_path),
+    "model_xml": str(assets.mjcf_path),
+}
+output_json_path.write_text(json.dumps(payload), encoding="utf-8")
+PY
+then
+    echo "Error: failed to resolve subject profile metadata"
+    exit 1
+fi
+
+mapfile -t PROFILE_INFO < <(
+    "$PROTO_PYTHON" - "$PROFILE_JSON_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+for key in (
+    "subject_id",
+    "input_dir",
+    "output_dir",
+    "output_fps",
+    "retarget_urdf",
+    "model_xml",
 ):
-    print(value)
+    print(payload[key])
 PY
 )
 

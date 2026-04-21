@@ -171,20 +171,22 @@ class SmplLowerBodyRobotConfig(RobotConfig):
                 ),
             ),
             genesis=GenesisSimParams(fps=60, decimation=2, substeps=2),
-            # Lower-body treadmill/contact tracking is more contact-heavy than the
-            # default humanoid configs and can exhaust Newton/MuJoCo solver budgets,
-            # especially with many parallel environments. Use more conservative
-            # defaults here so single-GPU bootstrap training is less likely to enter
-            # unrecoverable foot-ground contact states. Cluster runs can still
-            # override these per experiment if needed.
+            # Lower-body contact tracking is heavy on foot-ground contacts. The
+            # previous 64-contact budget is auto-raised by MjWarp to 78 and still
+            # overflows in normal 1024-env runs, which then cascades into CCD
+            # warnings and occasional bad worlds. Keep the budget comfortably above
+            # the observed overflow point (~80 contacts/world) without returning to
+            # the old 1000-contact setting that explodes global CCD workspace on a
+            # 12 GB card. Cluster runs can still override these per experiment.
             newton=NewtonSimParams(
                 fps=120,
                 decimation=4,
-                iterations=200,
-                njmax=2000,
-                nconmax=1000,
-                nccdmax=16,
-                ccd_iterations=4000,
+                iterations=100,
+                njmax=768,
+                nconmax=96,
+                nccdmax=8,
+                ccd_iterations=128,
+                max_epa_workspace_iterations=128,
             ),
         )
     )

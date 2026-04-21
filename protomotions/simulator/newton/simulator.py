@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import inspect
 import os
 import traceback
 import torch
@@ -48,6 +49,8 @@ from newton.sensors import SensorContact
 from newton.solvers import SolverNotifyFlags
 import copy
 import logging
+
+from protomotions.utils import rotations
 
 log = logging.getLogger(__name__)
 
@@ -166,6 +169,8 @@ class NewtonSimulator(Simulator):
         self._last_reset_dof_pos: Optional[torch.Tensor] = None
         self._last_reset_dof_vel: Optional[torch.Tensor] = None
         self._last_reset_sim_time: Optional[torch.Tensor] = None
+        self._body_collision_support_points_local: Optional[torch.Tensor] = None
+        self._body_collision_support_points_mask: Optional[torch.Tensor] = None
 
     def _get_builder_joint_keys(self) -> list[str]:
         """Return builder joint names in the ProtoMotions matching format.
@@ -516,7 +521,176 @@ class NewtonSimulator(Simulator):
             .clone()
         )
 
+        self._cache_body_collision_support_points()
         self._setup_explicit_pd_arrays()
+
+    @staticmethod
+    def _aabb_corners(lower: torch.Tensor, upper: torch.Tensor) -> torch.Tensor:
+        """Return the 8 AABB corners for each [lower, upper] pair."""
+        x_lo, y_lo, z_lo = lower.unbind(-1)
+        x_hi, y_hi, z_hi = upper.unbind(-1)
+        return torch.stack(
+            (
+                torch.stack((x_lo, y_lo, z_lo), dim=-1),
+                torch.stack((x_lo, y_lo, z_hi), dim=-1),
+                torch.stack((x_lo, y_hi, z_lo), dim=-1),
+                torch.stack((x_lo, y_hi, z_hi), dim=-1),
+                torch.stack((x_hi, y_lo, z_lo), dim=-1),
+                torch.stack((x_hi, y_lo, z_hi), dim=-1),
+                torch.stack((x_hi, y_hi, z_lo), dim=-1),
+                torch.stack((x_hi, y_hi, z_hi), dim=-1),
+            ),
+            dim=1,
+        )
+
+    def _cache_body_collision_support_points(self) -> None:
+        """Cache per-body collision support points in body-local coordinates.
+
+        Height correction during reference resets previously used rigid-body origins,
+        which underestimates how far feet extend below their link frames. We instead
+        cache the corners of each body's shape AABBs in the body frame and later use
+        the lowest transformed corner as the terrain support point.
+        """
+        try:
+            shape_transform = wp.to_torch(
+                self.robot_view.get_attribute("shape_transform", self.model)
+            ).squeeze(1)
+            shape_aabb_lower = wp.to_torch(
+                self.robot_view.get_attribute("shape_collision_aabb_lower", self.model)
+            ).squeeze(1)
+            shape_aabb_upper = wp.to_torch(
+                self.robot_view.get_attribute("shape_collision_aabb_upper", self.model)
+            ).squeeze(1)
+        except Exception as exc:
+            log.warning(
+                "Failed to cache Newton collision support points; "
+                "terrain height correction will fall back to rigid-body origins. "
+                "reason=%s",
+                exc,
+            )
+            self._body_collision_support_points_local = None
+            self._body_collision_support_points_mask = None
+            return
+
+        # Shape properties are static across worlds, so the first articulation is enough.
+        if shape_transform.dim() == 3:
+            shape_transform = shape_transform[0]
+        if shape_aabb_lower.dim() == 3:
+            shape_aabb_lower = shape_aabb_lower[0]
+        if shape_aabb_upper.dim() == 3:
+            shape_aabb_upper = shape_aabb_upper[0]
+
+        shape_positions = shape_transform[:, :3].to(
+            device=self.device, dtype=torch.float32
+        )
+        shape_rotations = shape_transform[:, 3:7].to(
+            device=self.device, dtype=torch.float32
+        )
+        local_corners = self._aabb_corners(
+            shape_aabb_lower.to(device=self.device, dtype=torch.float32),
+            shape_aabb_upper.to(device=self.device, dtype=torch.float32),
+        )
+
+        num_bodies = len(self._body_names)
+        body_support_points: list[torch.Tensor] = []
+        max_points = 1
+
+        for local_body_idx, body_name in enumerate(self._body_names):
+            link_idx = self._link_name_to_idx.get(body_name)
+            if link_idx is None:
+                points = torch.zeros((1, 3), device=self.device, dtype=torch.float32)
+                body_support_points.append(points)
+                continue
+
+            local_shape_indices = self.robot_view.link_shapes[link_idx]
+            if not local_shape_indices:
+                points = torch.zeros((1, 3), device=self.device, dtype=torch.float32)
+                body_support_points.append(points)
+                continue
+
+            shape_ids = torch.tensor(
+                local_shape_indices, device=self.device, dtype=torch.long
+            )
+            shape_pos = shape_positions[shape_ids]
+            shape_rot = shape_rotations[shape_ids]
+            shape_corners = local_corners[shape_ids]
+
+            flat_shape_rot = shape_rot[:, None, :].expand(-1, 8, -1).reshape(-1, 4)
+            flat_shape_corners = shape_corners.reshape(-1, 3)
+            corners_in_body = rotations.quat_rotate(
+                flat_shape_rot, flat_shape_corners, w_last=True
+            ).view(-1, 8, 3)
+            corners_in_body = corners_in_body + shape_pos[:, None, :]
+            points = corners_in_body.reshape(-1, 3)
+            max_points = max(max_points, points.shape[0])
+            body_support_points.append(points)
+
+        self._body_collision_support_points_local = torch.zeros(
+            (num_bodies, max_points, 3),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self._body_collision_support_points_mask = torch.zeros(
+            (num_bodies, max_points),
+            device=self.device,
+            dtype=torch.bool,
+        )
+        for body_idx, points in enumerate(body_support_points):
+            point_count = points.shape[0]
+            self._body_collision_support_points_local[body_idx, :point_count] = points
+            self._body_collision_support_points_mask[body_idx, :point_count] = True
+
+    def get_body_collision_support_points(
+        self,
+        body_pos: torch.Tensor,
+        body_rot: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the lowest collision-support point for each body in world space."""
+        if (
+            self._body_collision_support_points_local is None
+            or self._body_collision_support_points_mask is None
+            or body_pos is None
+            or body_rot is None
+            or body_pos.dim() != 3
+            or body_rot.dim() != 3
+        ):
+            return body_pos
+
+        if body_pos.shape[:2] != body_rot.shape[:2]:
+            return body_pos
+
+        num_envs, num_bodies, _ = body_pos.shape
+        if self._body_collision_support_points_local.shape[0] != num_bodies:
+            return body_pos
+
+        local_points = self._body_collision_support_points_local.to(
+            device=body_pos.device, dtype=body_pos.dtype
+        )
+        point_mask = self._body_collision_support_points_mask.to(device=body_pos.device)
+        points_per_body = local_points.shape[1]
+
+        flat_body_rot = (
+            body_rot[:, :, None, :]
+            .expand(-1, -1, points_per_body, -1)
+            .reshape(-1, 4)
+        )
+        flat_local_points = (
+            local_points.unsqueeze(0)
+            .expand(num_envs, -1, -1, -1)
+            .reshape(-1, 3)
+        )
+        world_points = rotations.quat_rotate(
+            flat_body_rot, flat_local_points, w_last=True
+        ).view(num_envs, num_bodies, points_per_body, 3)
+        world_points = world_points + body_pos.unsqueeze(2)
+
+        masked_z = world_points[..., 2].masked_fill(
+            ~point_mask.unsqueeze(0), float("inf")
+        )
+        min_indices = masked_z.argmin(dim=2)
+        gather_indices = min_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 3)
+        support_points = torch.gather(world_points, dim=2, index=gather_indices).squeeze(2)
+        return support_points
 
     def _setup_explicit_pd_arrays(self) -> None:
         """Setup persistent Warp arrays for explicit PD control."""
@@ -592,20 +766,42 @@ class NewtonSimulator(Simulator):
     def _setup_sim(self) -> None:
         """Creates simulation using config parameters."""
         sim_params = self.config.sim
+        solver_kwargs = {
+            "solver": sim_params.solver,
+            "integrator": sim_params.integrator,
+            "njmax": sim_params.njmax,
+            "nconmax": sim_params.nconmax,
+            "nccdmax": sim_params.nccdmax,
+            "naccdmax": sim_params.naccdmax,
+            "iterations": sim_params.iterations,
+            "ls_iterations": sim_params.ls_iterations,
+            "ls_parallel": sim_params.ls_parallel,
+            "impratio": sim_params.impratio,
+            "cone": sim_params.cone,
+            "ccd_iterations": sim_params.ccd_iterations,
+        }
+        supported_solver_kwargs = inspect.signature(
+            newton.solvers.SolverMuJoCo
+        ).parameters
+        filtered_solver_kwargs = {
+            key: value
+            for key, value in solver_kwargs.items()
+            if key in supported_solver_kwargs and value is not None
+        }
+        dropped_solver_kwargs = sorted(
+            key for key, value in solver_kwargs.items()
+            if value is not None and key not in supported_solver_kwargs
+        )
+        if dropped_solver_kwargs:
+            log.warning(
+                "Installed Newton SolverMuJoCo does not accept %s; "
+                "continuing with compatible solver kwargs only.",
+                ", ".join(dropped_solver_kwargs),
+            )
+
         self.solver = newton.solvers.SolverMuJoCo(
             self.model,
-            solver=sim_params.solver,
-            integrator=sim_params.integrator,
-            njmax=sim_params.njmax,
-            nconmax=sim_params.nconmax,
-            nccdmax=sim_params.nccdmax,
-            naccdmax=sim_params.naccdmax,
-            iterations=sim_params.iterations,
-            ls_iterations=sim_params.ls_iterations,
-            ls_parallel=sim_params.ls_parallel,
-            impratio=sim_params.impratio,
-            cone=sim_params.cone,
-            ccd_iterations=sim_params.ccd_iterations,
+            **filtered_solver_kwargs,
         )
 
         self.viewer = None

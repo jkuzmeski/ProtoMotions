@@ -459,14 +459,14 @@ class MaskedMimicControl(MimicControl):
         masked_mimic_ref_pos = target_state.rigid_body_pos.view(
             num_envs, num_future_steps, num_bodies, 3
         ).clone()
-        offset = self.env.get_spawn_to_ref_pose_offset_with_terrain_height_correction(
-            masked_mimic_ref_pos[:, 0, :, :]  # Use first step for offset
-        )
-        masked_mimic_ref_pos += offset.unsqueeze(1)
-        
         masked_mimic_ref_rot = target_state.rigid_body_rot.view(
             num_envs, num_future_steps, num_bodies, 4
         )
+        offset = self.env.get_spawn_to_ref_pose_offset_with_terrain_height_correction(
+            masked_mimic_ref_pos[:, 0, :, :],  # Use first step for offset
+            target_rot=masked_mimic_ref_rot[:, 0, :, :],
+        )
+        masked_mimic_ref_pos += offset.unsqueeze(1)
         
         # Compute time offsets from current time
         masked_mimic_time_offsets = self.target_times - motion_times.unsqueeze(-1)
@@ -571,7 +571,8 @@ class MaskedMimicControl(MimicControl):
         target_pos = ref_state.rigid_body_pos.clone()
         target_pos += (
             self.env.get_spawn_to_ref_pose_offset_with_terrain_height_correction(
-                target_pos
+                target_pos,
+                target_rot=ref_state.rigid_body_rot,
             )
         )
         

@@ -553,8 +553,19 @@ class BaseEnv:
 
             if not self.skip_height_correction:
                 if ref_state is not None:
-                    rigid_body_pos = ref_state.rigid_body_pos[non_scene_mask].clone()
-                    rigid_body_pos_spawned = rigid_body_pos + respawn_offset[
+                    support_points = ref_state.rigid_body_pos[non_scene_mask].clone()
+                    get_support_points = getattr(
+                        self.simulator, "get_body_collision_support_points", None
+                    )
+                    if (
+                        ref_state.rigid_body_rot is not None
+                        and callable(get_support_points)
+                    ):
+                        support_points = get_support_points(
+                            support_points,
+                            ref_state.rigid_body_rot[non_scene_mask],
+                        )
+                    rigid_body_pos_spawned = support_points + respawn_offset[
                         non_scene_mask
                     ].unsqueeze(1)
                 else:
@@ -586,7 +597,10 @@ class BaseEnv:
         )
 
     def get_spawn_to_ref_pose_offset_with_terrain_height_correction(
-        self, target_pos: Tensor, env_ids: Optional[Tensor] = None
+        self,
+        target_pos: Tensor,
+        env_ids: Optional[Tensor] = None,
+        target_rot: Optional[Tensor] = None,
     ) -> Tensor:
         """Compute spawn offset with terrain height correction for reference poses.
 
@@ -597,6 +611,9 @@ class BaseEnv:
             target_pos: Reference body positions [num_envs, num_bodies, 3]
                        without spawning offset applied.
             env_ids: Environment indices [num_envs]. If None, uses all envs.
+            target_rot: Optional reference body rotations [num_envs, num_bodies, 4].
+                When provided, height correction uses collision support points
+                instead of rigid-body origins.
 
         Returns:
             Offset to add to target_pos [num_envs, num_bodies, 3].
@@ -614,7 +631,14 @@ class BaseEnv:
         new_offset[:, :, :2] = self.respawn_root_offset[env_ids, :2][:, None, :]
 
         if not self.skip_height_correction:
-            target_pos_spawned = target_pos.clone() + new_offset
+            support_points = target_pos
+            get_support_points = getattr(
+                self.simulator, "get_body_collision_support_points", None
+            )
+            if target_rot is not None and callable(get_support_points):
+                support_points = get_support_points(target_pos, target_rot)
+
+            target_pos_spawned = support_points.clone() + new_offset
             z_offset = self.terrain.find_terrain_height_for_max_below_body(
                 target_pos_spawned
             )

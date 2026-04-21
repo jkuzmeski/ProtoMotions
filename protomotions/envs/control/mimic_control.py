@@ -122,7 +122,8 @@ class MimicControl(ControlComponent):
         # Apply terrain height correction to reference state
         ref_gt = ref_state.rigid_body_pos.clone()
         ref_gt += self.env.get_spawn_to_ref_pose_offset_with_terrain_height_correction(
-            ref_gt
+            ref_gt,
+            target_rot=ref_state.rigid_body_rot,
         )
         ref_state.rigid_body_pos = ref_gt
         
@@ -158,15 +159,14 @@ class MimicControl(ControlComponent):
         future_pos = future_state.rigid_body_pos.view(
             num_envs, future_steps, num_bodies, 3
         ).clone()
-        offset = self.env.get_spawn_to_ref_pose_offset_with_terrain_height_correction(
-            future_pos[:, 0, :, :]  # Use first step for offset
-        )
-        future_pos += offset.unsqueeze(1)
-        
-        # Body rotations
         future_rot = future_state.rigid_body_rot.view(
             num_envs, future_steps, num_bodies, 4
         )
+        offset = self.env.get_spawn_to_ref_pose_offset_with_terrain_height_correction(
+            future_pos[:, 0, :, :],  # Use first step for offset
+            target_rot=future_rot[:, 0, :, :],
+        )
+        future_pos += offset.unsqueeze(1)
         
         # Body velocities
         future_vel = future_state.rigid_body_vel.view(
@@ -256,7 +256,8 @@ class MimicControl(ControlComponent):
         target_pos = ref_state.rigid_body_pos.clone()
         target_pos += (
             self.env.get_spawn_to_ref_pose_offset_with_terrain_height_correction(
-                target_pos
+                target_pos,
+                target_rot=ref_state.rigid_body_rot,
             )
         )
         
