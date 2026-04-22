@@ -224,3 +224,7 @@ def apply_inference_overrides(
     env_cfg.max_episode_length = 1000000
     env_cfg.motion_manager.resample_on_reset = True
     env_cfg.motion_manager.init_start_prob = 1.0
+
+    # Collect 20 foot steps per motion during evaluation
+    if hasattr(agent_cfg, "evaluator"):
+        agent_cfg.evaluator.max_foot_steps = 20

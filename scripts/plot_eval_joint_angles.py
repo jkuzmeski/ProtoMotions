@@ -237,6 +237,13 @@ def load_yaml_motion_manifest(path: Path) -> list[MotionSequence]:
 
 
 def load_motion_source(path: Path) -> list[MotionSequence]:
+    if path.is_dir():
+        sequences: list[MotionSequence] = []
+        for motion_file in sorted(path.glob("*.motion")):
+            sequences.append(load_single_motion_file(motion_file))
+        if not sequences:
+            raise ValueError(f"No .motion files found in directory {path}")
+        return sequences
     if path.suffix == ".pt":
         return load_packaged_motion_lib(path)
     if path.suffix == ".yaml":

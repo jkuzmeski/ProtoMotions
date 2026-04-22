@@ -85,6 +85,24 @@ class MimicEvaluatorConfig(EvaluatorConfig):
             "max": 1.0,
         }
     )
+    max_foot_steps: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Stop each episode after this many foot steps (left heel strikes). "
+                "None = disabled (run for max_eval_steps or motion length). "
+                "Useful for collecting a fixed number of gait cycles per motion."
+            ),
+            "min": 1,
+        }
+    )
+    left_strike_min_interval_sec: float = field(
+        default=0.20,
+        metadata={
+            "help": "Minimum time between accepted left-foot strikes to debounce contact chatter.",
+            "min": 0.0,
+        },
+    )
 
 
 @dataclass

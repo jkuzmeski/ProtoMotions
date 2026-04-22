@@ -1472,7 +1472,7 @@ class NewtonSimulator(Simulator):
         """Update contact sensors after physics step. Must be called outside CUDA graph."""
         if len(self._contact_sensors) > 0:
             try:
-                self.model.collide(self.state_0, self.contacts)
+                self.solver.update_contacts(self.contacts, self.state_0)
             except Exception as exc:
                 self._raise_on_solver_failure(
                     source="contact_sensor_refresh",

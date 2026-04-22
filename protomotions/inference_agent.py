@@ -115,6 +115,12 @@ def create_parser():
         default=[],
         help="Config overrides in format key=value (e.g., env.max_episode_length=5000 simulator.headless=True)",
     )
+    parser.add_argument(
+        "--max-foot-steps",
+        type=int,
+        default=None,
+        help="Stop each evaluation episode after this many left-foot heel strikes. Overrides evaluator config.",
+    )
 
     return parser
 
@@ -390,6 +396,12 @@ def main():
     try:
         if args.full_eval:
             agent.evaluator.eval_count = 0
+
+            # Apply --max-foot-steps CLI override
+            if args.max_foot_steps is not None:
+                agent.evaluator.config.max_foot_steps = args.max_foot_steps
+                log.info(f"CLI override: max_foot_steps = {args.max_foot_steps}")
+
             evaluation_log, evaluated_score = agent.evaluator.evaluate()
 
             predicted_motion_lib = (
