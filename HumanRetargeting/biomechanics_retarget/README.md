@@ -44,10 +44,12 @@ Non-production tooling is quarantined under `tools/`:
 Run the production pipeline from the repo root:
 
 ```bash
-python HumanRetargeting/biomechanics_retarget/pipeline.py \
+.venv/bin/python HumanRetargeting/biomechanics_retarget/pipeline.py \
     HumanRetargeting/biomechanics_retarget/treadmill_data/S_GENERIC \
     HumanRetargeting/biomechanics_retarget/processed_data/S_GENERIC \
-    --subject-profile HumanRetargeting/biomechanics_retarget/profiles/S_GENERIC.yaml
+    --subject-profile HumanRetargeting/biomechanics_retarget/profiles/S_GENERIC.yaml \
+    --step all \
+    --force
 ```
 
 Run the full production pipeline with a generated height-only subject:

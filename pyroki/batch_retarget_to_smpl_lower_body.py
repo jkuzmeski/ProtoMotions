@@ -1032,7 +1032,7 @@ def main() -> None:
         root_smoothness=1.0,
         joint_smoothness=0.75,
         joint_reference=0.03,
-        root_reference=0.02,
+        root_reference=20.0,
         joint_vel_limit=0.0,
         limit_cost=25.0,
         foot_contact=12.0,

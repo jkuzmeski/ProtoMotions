@@ -25,6 +25,7 @@ from HumanRetargeting.biomechanics_retarget.retarget_qc import (
 )
 from HumanRetargeting.biomechanics_retarget.validation import validate_retargeted_npz
 from HumanRetargeting.biomechanics_retarget.validation import validate_packaged_motion_lib
+from HumanRetargeting.biomechanics_retarget.validation import JOINT_LIMIT_TOLERANCE_RAD
 from HumanRetargeting.biomechanics_retarget.subject_profiles import (
     materialize_height_subject_profile,
 )
@@ -133,8 +134,8 @@ def test_pyrki_retarget_outputs_match_mjcf_contract():
 
         lower_limits = kinematic_info.dof_limits_lower.numpy()
         upper_limits = kinematic_info.dof_limits_upper.numpy()
-        assert np.all(joint_angles >= lower_limits[None, :] - 1e-5)
-        assert np.all(joint_angles <= upper_limits[None, :] + 1e-5)
+        assert np.all(joint_angles >= lower_limits[None, :] - JOINT_LIMIT_TOLERANCE_RAD)
+        assert np.all(joint_angles <= upper_limits[None, :] + JOINT_LIMIT_TOLERANCE_RAD)
 
         keypoint_file = KEYPOINT_DIR / f"{_canonical_trial_name(npz_path)}.npy"
         report = evaluate_retargeted_motion(

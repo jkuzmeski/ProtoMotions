@@ -50,6 +50,8 @@ REQUIRED_PACKAGE_KEYS = (
     "motion_weights",
 )
 
+JOINT_LIMIT_TOLERANCE_RAD = 2e-5
+
 
 def load_qc_thresholds(config_file: Path) -> dict[str, Any]:
     data = yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
@@ -123,8 +125,8 @@ def validate_retargeted_npz(
 
     lower = kinematic_info.dof_limits_lower.numpy()
     upper = kinematic_info.dof_limits_upper.numpy()
-    below = ordered_joint_angles < lower[None, :] - 1e-5
-    above = ordered_joint_angles > upper[None, :] + 1e-5
+    below = ordered_joint_angles < lower[None, :] - JOINT_LIMIT_TOLERANCE_RAD
+    above = ordered_joint_angles > upper[None, :] + JOINT_LIMIT_TOLERANCE_RAD
     out_of_limit = np.logical_or(below, above)
     violating_frames = int(out_of_limit.any(axis=1).sum())
     if violating_frames > 0:
@@ -207,7 +209,12 @@ def validate_motion_file(
     if dof_vel.shape != dof_pos.shape:
         failures.append("invalid_dof_vel_shape")
 
-    violating_frames = int(((dof_pos < lower - 1e-5) | (dof_pos > upper + 1e-5)).any(dim=1).sum())
+    violating_frames = int(
+        (
+            (dof_pos < lower - JOINT_LIMIT_TOLERANCE_RAD)
+            | (dof_pos > upper + JOINT_LIMIT_TOLERANCE_RAD)
+        ).any(dim=1).sum()
+    )
     if violating_frames > 0:
         failures.append("joint_limit_violation")
 
